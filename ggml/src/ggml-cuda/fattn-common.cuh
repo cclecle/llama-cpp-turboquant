@@ -1297,52 +1297,8 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-#ifdef GGML_USE_HIP
-    // HIP/ROCm: use stream-ordered async allocation for f16 temp buffers.
-    //
-    // Why not the legacy pool (ggml_cuda_pool_leg): it retains peak-sized allocations
-    // permanently. For long contexts (e.g. 256K) with dk=512 (Gemma 4), the f16 temp
-    // buffer can reach ~2 GB and would stay resident, consuming more VRAM than the
-    // quantized KV compression saves — causing OOM.
-    //
-    // Why not raw hipMalloc/hipFree: those are synchronous, non-stream operations that
-    // are forbidden during hipStreamBeginCapture. They crash with "operation not
-    // permitted when stream is capturing" when HIP graphs are enabled (e.g. the TILE
-    // path for dk=512 with quantized KV).
-    //
-    // Stream-ordered async alloc (hipMallocAsync / hipFreeAsync):
-    //   - Capture-safe: recorded as alloc/free graph nodes during stream capture.
-    //   - Stream-ordered: free executes after the preceding kernel, no explicit sync.
-    //   - Transient: memory is returned to the device pool after hipFreeAsync executes,
-    //     so it does not accumulate between calls.
-    //   - Unlimited scale: the device pool grows on demand; no hard context-length limit.
-    struct hip_f16_alloc {
-        half * ptr = nullptr;
-        cudaStream_t stream;
-        hip_f16_alloc(cudaStream_t s) : stream(s) {}
-        ~hip_f16_alloc() {
-            if (ptr) {
-                // Stream-ordered free: executes after the preceding kernel on the same
-                // stream, so no explicit sync is needed. Also capture-safe: recorded as
-                // a free node during hipStreamBeginCapture.
-                // Cast to void: hipFreeAsync is [[nodiscard]] under HIP's -Werror policy
-                // and we're in a destructor where we cannot propagate errors.
-                (void) hipFreeAsync(ptr, stream);
-                ptr = nullptr;
-            }
-        }
-        void alloc(size_t nelements) {
-            // Stream-ordered alloc: capture-safe (recorded as a graph node), transient
-            // (memory returned to device pool by the matching hipFreeAsync above).
-            CUDA_CHECK(hipMallocAsync(&ptr, nelements * sizeof(half), stream));
-        }
-    };
-    hip_f16_alloc K_f16(main_stream);
-    hip_f16_alloc V_f16(main_stream);
-#else
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);
-#endif
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
