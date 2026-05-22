@@ -43,7 +43,7 @@ static __global__ void flash_attn_ext_vec(
 #ifdef FLASH_ATTN_AVAILABLE
 
     // Skip unused kernel variants for faster compilation:
-    if (use_logit_softcap && !(D == 128 || D == 256)) {
+    if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
@@ -64,7 +64,9 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = 2;
+    // D=512 with nthreads_KQ=2 uses ~292 VGPRs on RDNA4 (wave32) — over 256 limit.
+    // Raise to 4 for D=512: halves Q_i32/Q_ds storage to ~196 VGPRs total.
+    constexpr int nthreads_KQ_q = (D >= 512) ? 4 : 2;
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif // RDNA
@@ -792,9 +794,28 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     }
 }
 
+template <ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_case_d512(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // D=512 VEC: decode only (ncols=1). Register pressure makes ncols=2
+    // infeasible on RDNA4 (Q_ds alone = 256 VGPRs at ncols=2).
+    // Prefill (ne[1] > 1) falls back to TILE via the caller's kernel selector.
+    const ggml_tensor * KQV = dst;
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    if (logit_softcap == 0.0f) {
+        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, type_K, type_V, false>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, type_K, type_V, true>(ctx, dst);
+    }
+}
+
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
     template void ggml_cuda_flash_attn_ext_vec_case                         \
     <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_VEC_CASE_D512(type_K, type_V)                                  \
+    template void ggml_cuda_flash_attn_ext_vec_case_d512                          \
+    <type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)          \
 
 #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F16);  \
@@ -924,3 +945,12 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
+
+// D=512 VEC decode-only instances: K=q8_0 + common V types (register-safe at ncols=1 on RDNA4).
+// K=turbo types excluded: nthreads_KQ=1 forces Q_reg=256 VGPRs at D=512.
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_BF16);
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
