@@ -1327,14 +1327,14 @@ void launch_fattn(
                 // a free node during hipStreamBeginCapture.
                 // Cast to void: hipFreeAsync is [[nodiscard]] under HIP's -Werror policy
                 // and we're in a destructor where we cannot propagate errors.
-                (void) cudaFreeAsync(ptr, stream);
+                (void) hipFreeAsync(ptr, stream);
                 ptr = nullptr;
             }
         }
         void alloc(size_t nelements) {
             // Stream-ordered alloc: capture-safe (recorded as a graph node), transient
             // (memory returned to device pool by the matching hipFreeAsync above).
-            CUDA_CHECK(cudaMallocAsync(&ptr, nelements * sizeof(half), stream));
+            CUDA_CHECK(hipMallocAsync(&ptr, nelements * sizeof(half), stream));
         }
     };
     hip_f16_alloc K_f16(main_stream);
