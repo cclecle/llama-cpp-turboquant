@@ -2630,14 +2630,26 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
-                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                const bool needs_full_seq_checkpoint = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                                if (needs_full_seq_checkpoint || pos_min >= pos_min_thold) {
+                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d, seq_rm_type = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa, (int) ctx_tgt_seq_rm_type);
 
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&, func_name = __func__](const auto & cur) {
+                                            if (needs_full_seq_checkpoint) {
+                                                // FULL-only memories cannot partially remove the obsolete suffix of the previous prompt.
+                                                // In that case, select the newest checkpoint whose token prefix is not beyond
+                                                // the common prefix, then replay only the remaining suffix. This keeps compact
+                                                // SWA/hybrid checkpoints useful without forcing --swa-full.
+                                                LOG_INF("slot %12.*s: id %2d | task %d | Checking FULL checkpoint with n_tokens = %" PRId64 " against n_past = %d...\n", 12,
+                                                    func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.n_tokens, n_past);
+                                                return cur.n_tokens <= n_past;
+                                            }
+
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
@@ -2653,8 +2665,14 @@ private:
                                         it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (needs_full_seq_checkpoint) {
+                                            n_past   = std::min<size_t>(n_past, (size_t) it->n_tokens);
+                                            pos_next = slot.prompt.tokens.pos_next(n_past);
+                                        } else {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        }
+
                                         SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
