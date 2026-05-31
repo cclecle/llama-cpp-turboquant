@@ -3348,12 +3348,23 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                const bool needs_full_seq_checkpoint = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                                if (needs_full_seq_checkpoint || pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
+                                            if (needs_full_seq_checkpoint) {
+                                                // FULL-only memories cannot partially remove the obsolete suffix of the previous prompt.
+                                                // In that case, select the newest checkpoint whose token prefix is not beyond
+                                                // the common prefix, then replay only the remaining suffix. This keeps compact
+                                                // SWA/hybrid checkpoints useful without forcing --swa-full.
+                                                SLT_TRC(slot, "checking FULL checkpoint with n_tokens = %" PRId64 " against n_past = %d...\n", cur.n_tokens, n_past);
+                                                return cur.n_tokens <= n_past;
+                                            }
+
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -3373,8 +3384,13 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (needs_full_seq_checkpoint) {
+                                            n_past   = std::min<size_t>(n_past, (size_t) it->n_tokens);
+                                            pos_next = slot.prompt.tokens.pos_next(n_past);
+                                        } else {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
