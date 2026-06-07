@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -2605,6 +2606,48 @@ private:
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // Append context checkpoints to the same file so they survive a
+                    // model swap + reload.  Models whose memory does not support partial
+                    // sequence removal (e.g. hybrid attention/recurrent like Qwen3) need
+                    // checkpoints to reuse the KV cache on the next turn after a restore.
+                    // Format: [version u32][n_ckpts u32][per-ckpt data...][section_offset u64][magic u64]
+                    // The 16-byte footer lets the reader locate the section without
+                    // scanning; old files without the footer load unchanged.
+                    if (nwrite > 0 && !slot->prompt.checkpoints.empty()) {
+                        // "SLTCKPT1" magic — chosen to be detectable at file end
+                        static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
+
+                        FILE * fcf = std::fopen(filepath.c_str(), "ab");
+                        if (fcf) {
+                            const uint64_t section_offset = static_cast<uint64_t>(nwrite);
+                            const uint32_t ckpt_version   = 1;
+                            const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
+
+                            std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+                            std::fwrite(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
+
+                            for (const auto & ckpt : slot->prompt.checkpoints) {
+                                std::fwrite(&ckpt.n_tokens, sizeof(ckpt.n_tokens), 1, fcf);
+                                std::fwrite(&ckpt.pos_min,  sizeof(ckpt.pos_min),  1, fcf);
+                                std::fwrite(&ckpt.pos_max,  sizeof(ckpt.pos_max),  1, fcf);
+
+                                const uint64_t tgt_sz = static_cast<uint64_t>(ckpt.data_tgt.size());
+                                std::fwrite(&tgt_sz,            sizeof(tgt_sz), 1,      fcf);
+                                if (tgt_sz > 0) { std::fwrite(ckpt.data_tgt.data(), 1, tgt_sz, fcf); }
+
+                                const uint64_t dft_sz = static_cast<uint64_t>(ckpt.data_dft.size());
+                                std::fwrite(&dft_sz,            sizeof(dft_sz), 1,      fcf);
+                                if (dft_sz > 0) { std::fwrite(ckpt.data_dft.data(), 1, dft_sz, fcf); }
+                            }
+
+                            std::fwrite(&section_offset, sizeof(section_offset), 1, fcf);
+                            std::fwrite(&SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC), 1, fcf);
+                            std::fclose(fcf);
+
+                            SRV_INF("slot %d: saved %u context checkpoints to %s\n", id_slot, n_ckpts, filename.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2650,6 +2693,76 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // Reload checkpoints saved by the corresponding SLOT_SAVE.
+                    // The footer (last 16 bytes) holds the byte offset of the section
+                    // start and a magic value.  Reading raw bytes into data_tgt/data_dft
+                    // is sufficient; the server's existing checkpoint-reuse logic calls
+                    // load_tgt/load_dft at the right moment without any changes here.
+                    slot->prompt.checkpoints.clear();
+                    {
+                        static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
+                        static constexpr long      FOOTER_SIZE     = 16; // section_offset u64 + magic u64
+
+                        FILE * fcf = std::fopen(filepath.c_str(), "rb");
+                        if (fcf) {
+                            if (std::fseek(fcf, 0, SEEK_END) == 0) {
+                                const long fsize = std::ftell(fcf);
+                                if (fsize >= FOOTER_SIZE) {
+                                    std::fseek(fcf, -FOOTER_SIZE, SEEK_END);
+                                    uint64_t section_offset = 0;
+                                    uint64_t magic          = 0;
+                                    std::fread(&section_offset, sizeof(section_offset), 1, fcf);
+                                    std::fread(&magic,          sizeof(magic),          1, fcf);
+
+                                    if (magic == SLOT_CKPT_MAGIC &&
+                                        static_cast<long>(section_offset) < fsize - FOOTER_SIZE) {
+
+                                        std::fseek(fcf, static_cast<long>(section_offset), SEEK_SET);
+
+                                        uint32_t ckpt_version = 0;
+                                        uint32_t n_ckpts      = 0;
+                                        std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+                                        std::fread(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
+
+                                        if (ckpt_version == 1) {
+                                            bool ok = true;
+                                            for (uint32_t ci = 0; ci < n_ckpts && ok; ++ci) {
+                                                common_prompt_checkpoint ckpt;
+                                                ok = ok && std::fread(&ckpt.n_tokens, sizeof(ckpt.n_tokens), 1, fcf) == 1;
+                                                ok = ok && std::fread(&ckpt.pos_min,  sizeof(ckpt.pos_min),  1, fcf) == 1;
+                                                ok = ok && std::fread(&ckpt.pos_max,  sizeof(ckpt.pos_max),  1, fcf) == 1;
+
+                                                uint64_t tgt_sz = 0;
+                                                ok = ok && std::fread(&tgt_sz, sizeof(tgt_sz), 1, fcf) == 1;
+                                                if (ok && tgt_sz > 0) {
+                                                    ckpt.data_tgt.resize(tgt_sz);
+                                                    ok = std::fread(ckpt.data_tgt.data(), 1, tgt_sz, fcf) == tgt_sz;
+                                                }
+
+                                                uint64_t dft_sz = 0;
+                                                ok = ok && std::fread(&dft_sz, sizeof(dft_sz), 1, fcf) == 1;
+                                                if (ok && dft_sz > 0) {
+                                                    ckpt.data_dft.resize(dft_sz);
+                                                    ok = std::fread(ckpt.data_dft.data(), 1, dft_sz, fcf) == dft_sz;
+                                                }
+
+                                                if (ok) {
+                                                    slot->prompt.checkpoints.push_back(std::move(ckpt));
+                                                }
+                                            }
+
+                                            if (!slot->prompt.checkpoints.empty()) {
+                                                SRV_INF("slot %d: loaded %zu context checkpoints from %s\n",
+                                                        id_slot, slot->prompt.checkpoints.size(), filename.c_str());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            std::fclose(fcf);
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
