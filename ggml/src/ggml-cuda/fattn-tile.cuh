@@ -831,9 +831,21 @@ static __global__ void flash_attn_tile(
 
     // Skip unused kernel variants for faster compilation:
 
+    constexpr bool tile_variant_has_no_wmma_equivalent =
+        (DKQ ==  40 && DV ==  40) ||
+        (DKQ ==  72 && DV ==  72) ||
+        (DKQ == 192 && DV == 128) ||
+        (DKQ == 320 && DV == 256) ||
+        (DKQ == 512 && DV == 512) ||
+        (DKQ == 576 && DV == 512) ||
+        (DKQ == 640 && DV == 512);
+
+    constexpr bool tile_variant_must_be_kept_with_wmma =
+        ncols2 == 1 || tile_variant_has_no_wmma_equivalent;
+
     if (
 #ifdef GGML_USE_WMMA_FATTN
-            (ncols2 != 1 && DV != 40 && DV != 72 && DV != 512) ||
+            !tile_variant_must_be_kept_with_wmma ||
 #endif // GGML_USE_WMMA_FATTN
             (use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))
     ) {
