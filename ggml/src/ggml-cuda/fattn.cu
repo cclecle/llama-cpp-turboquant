@@ -618,8 +618,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576 && Q->ne[0] != 640) {
+    // Use the WMMA kernel if possible.
+    const bool wmma_fattn_d_supported =
+        Q->ne[0] == 64  ||
+        Q->ne[0] == 80  ||
+        Q->ne[0] == 96  ||
+        Q->ne[0] == 112 ||
+        Q->ne[0] == 128 ||
+        Q->ne[0] == 256;
+
+    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && wmma_fattn_d_supported) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
