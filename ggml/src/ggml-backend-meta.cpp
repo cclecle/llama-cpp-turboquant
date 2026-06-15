@@ -553,6 +553,41 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+
+        auto split_state_to_string = [&](const ggml_backend_meta_split_state & ss) -> std::string {
+            std::string out = std::string("axis=") + ggml_backend_meta_split_axis_name(ss.axis) +
+                " n_segments=" + std::to_string(ss.n_segments) + " {";
+            for (size_t s = 0; s < ss.n_segments; ++s) {
+                if (s > 0) {
+                    out += "; ";
+                }
+                out += "seg" + std::to_string(s) + " nr=" + std::to_string(ss.nr[s]) + " ne=[";
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    if (j > 0) {
+                        out += ",";
+                    }
+                    out += std::to_string(ss.ne[s*n_bufs + j]);
+                }
+                out += "]";
+            }
+            out += "}";
+            return out;
+        };
+
+        const std::string ss0 = split_state_to_string(src_ss[0]);
+        const std::string ss1 = split_state_to_string(src_ss[1]);
+        GGML_LOG_ERROR(
+            "META MUL_MAT unsupported split: dst=%s[%s] ne=(%lld,%lld,%lld,%lld) "
+            "src0=%s[%s] ne=(%lld,%lld,%lld,%lld) %s "
+            "src1=%s[%s] ne=(%lld,%lld,%lld,%lld) %s\n",
+            tensor->name, ggml_op_name(tensor->op),
+            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+            tensor->src[0] ? tensor->src[0]->name : "<null>", tensor->src[0] ? ggml_op_name(tensor->src[0]->op) : "<null>",
+            (long long) (tensor->src[0] ? tensor->src[0]->ne[0] : 0), (long long) (tensor->src[0] ? tensor->src[0]->ne[1] : 0),
+            (long long) (tensor->src[0] ? tensor->src[0]->ne[2] : 0), (long long) (tensor->src[0] ? tensor->src[0]->ne[3] : 0), ss0.c_str(),
+            tensor->src[1] ? tensor->src[1]->name : "<null>", tensor->src[1] ? ggml_op_name(tensor->src[1]->op) : "<null>",
+            (long long) (tensor->src[1] ? tensor->src[1]->ne[0] : 0), (long long) (tensor->src[1] ? tensor->src[1]->ne[1] : 0),
+            (long long) (tensor->src[1] ? tensor->src[1]->ne[2] : 0), (long long) (tensor->src[1] ? tensor->src[1]->ne[3] : 0), ss1.c_str());
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
