@@ -2500,7 +2500,7 @@ private:
                         FILE * fcf = std::fopen(filepath.c_str(), "ab");
                         if (fcf) {
                             const uint64_t section_offset = static_cast<uint64_t>(nwrite);
-                            const uint32_t ckpt_version   = 1;
+                            const uint32_t ckpt_version   = 2;
                             const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
 
                             std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
@@ -2518,6 +2518,10 @@ private:
                                 const uint64_t dft_sz = static_cast<uint64_t>(ckpt.data_dft.size());
                                 std::fwrite(&dft_sz,            sizeof(dft_sz), 1,      fcf);
                                 if (dft_sz > 0) { std::fwrite(ckpt.data_dft.data(), 1, dft_sz, fcf); }
+
+                                const uint64_t spec_sz = static_cast<uint64_t>(ckpt.data_spec.size());
+                                std::fwrite(&spec_sz,           sizeof(spec_sz), 1,     fcf);
+                                if (spec_sz > 0) { std::fwrite(ckpt.data_spec.data(), 1, spec_sz, fcf); }
                             }
 
                             std::fwrite(&section_offset, sizeof(section_offset), 1, fcf);
@@ -2595,9 +2599,10 @@ private:
 
                     // Reload checkpoints saved by the corresponding SLOT_SAVE.
                     // The footer (last 16 bytes) holds the byte offset of the section
-                    // start and a magic value.  Reading raw bytes into data_tgt/data_dft
+                    // start and a magic value.  Reading raw bytes into data_tgt/data_dft/data_spec
                     // is sufficient; the server's existing checkpoint-reuse logic calls
-                    // load_tgt/load_dft at the right moment without any changes here.
+                    // load_tgt/load_dft/common_speculative_set_state at the right moment without
+                    // any changes here.
                     slot->prompt.checkpoints.clear();
                     {
                         static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
@@ -2624,7 +2629,7 @@ private:
                                         std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
                                         std::fread(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
 
-                                        if (ckpt_version == 1) {
+                                        if (ckpt_version == 2) {
                                             bool ok = true;
                                             for (uint32_t ci = 0; ci < n_ckpts && ok; ++ci) {
                                                 common_prompt_checkpoint ckpt;
@@ -2644,6 +2649,13 @@ private:
                                                 if (ok && dft_sz > 0) {
                                                     ckpt.data_dft.resize(dft_sz);
                                                     ok = std::fread(ckpt.data_dft.data(), 1, dft_sz, fcf) == dft_sz;
+                                                }
+
+                                                uint64_t spec_sz = 0;
+                                                ok = ok && std::fread(&spec_sz, sizeof(spec_sz), 1, fcf) == 1;
+                                                if (ok && spec_sz > 0) {
+                                                    ckpt.data_spec.resize(spec_sz);
+                                                    ok = std::fread(ckpt.data_spec.data(), 1, spec_sz, fcf) == spec_sz;
                                                 }
 
                                                 if (ok) {
