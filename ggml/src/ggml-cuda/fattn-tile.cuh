@@ -827,7 +827,11 @@ static __global__ void flash_attn_tile(
 
     if (
 #ifdef GGML_USE_WMMA_FATTN
-            (ncols2 != 1 && DV != 40 && DV != 72 && DV != 512) ||
+            // Keep ncols2 != 1 TILE variants that have no WMMA-f16 equivalent: the MLA shapes
+            // DKQ=192/DV=128 and DKQ=320/DV=256 are routed to TILE (WMMA lacks those head sizes),
+            // so they must not be compiled as NO_DEVICE_CODE here.
+            (ncols2 != 1 && DV != 40 && DV != 72 && DV != 512
+                && !(DKQ == 192 && DV == 128) && !(DKQ == 320 && DV == 256)) ||
 #endif // GGML_USE_WMMA_FATTN
             (use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))
     ) {
