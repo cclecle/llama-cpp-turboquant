@@ -590,6 +590,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+        // [DIAG] Unhandled MUL_MAT split-axis combination (see Gemma-4 + SPLIT_MODE_TENSOR crash).
+        // Dump enough to identify the offending matmul before aborting.
+        GGML_LOG_ERROR("%s: unhandled MUL_MAT split combo for '%s' [%s]: "
+                       "src0='%s' axis=%s ne=[%lld,%lld,%lld,%lld] | "
+                       "src1='%s' axis=%s ne=[%lld,%lld,%lld,%lld]\n",
+                       __func__, tensor->name, ggml_op_name(tensor->op),
+                       tensor->src[0]->name, ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                       (long long) tensor->src[0]->ne[0], (long long) tensor->src[0]->ne[1],
+                       (long long) tensor->src[0]->ne[2], (long long) tensor->src[0]->ne[3],
+                       tensor->src[1]->name, ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                       (long long) tensor->src[1]->ne[0], (long long) tensor->src[1]->ne[1],
+                       (long long) tensor->src[1]->ne[2], (long long) tensor->src[1]->ne[3]);
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
