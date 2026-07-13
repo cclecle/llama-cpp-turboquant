@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -485,8 +486,29 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// A tensor is "host" (from the meta backend's point of view) when it lives on a non-meta buffer:
+// CPU-offloaded MoE experts (-ncmoe/-cmoe/-ot), the --no-kv-offload KV cache, etc.
+// The meta backend only fans a graph out over N identical GPU devices; a host tensor carries the
+// same value on every device, so its split state is MIRRORED (replicated, not sliced).
+static bool ggml_backend_meta_tensor_is_host(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
+// Env-gated verbose tracing (GGML_META_DEBUG=1) for debugging the CPU/meta boundary. Zero cost when off.
+static bool ggml_backend_meta_debug_enabled() {
+    static const bool enabled = (std::getenv("GGML_META_DEBUG") != nullptr);
+    return enabled;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TP-CPU-BOUNDARY] A host-resident src (CPU-offloaded expert weight, --no-kv-offload KV cache)
+    // has no meta split state. Treat it as MIRRORED instead of asserting is_meta / casting a CPU
+    // device context (the historical silent-crash site). This is the backbone that lets the meta
+    // graph tolerate CPU tensors as inputs.
+    if (ggml_backend_meta_tensor_is_host(tensor)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
@@ -757,12 +779,42 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        // src layout: [0]=Q [1]=K [2]=V [3]=mask [4]=sinks(optional)
+        const bool q_head_split = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool q_mirrored   = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        const bool kv_head_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                                   src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool kv_mirrored   = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                                   src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+
+        // Case 1 (classic head-parallel): Q,K,V all split along the head axis.
+        // Case 2 (Q head-split / KV replicated): GQA whose KV heads cannot be split across the
+        //   devices, or --no-kv-offload KV that arrives MIRRORED. Each device runs FlashAttention
+        //   for its subset of Q heads against the full (replicated) KV; the output is still
+        //   head-split -> AXIS_1. Mask/sinks handling is identical to case 1.
+        if (q_head_split && (kv_head_split || kv_mirrored)) {
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+
+        // Case 3 (fully replicated): nothing splits (e.g. attention that cannot be head-parallel at
+        // all, or a single-device meta). The op runs identically on every device -> MIRRORED.
+        if (q_mirrored && kv_mirrored) {
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
+        if (ggml_backend_meta_debug_enabled()) {
+            GGML_LOG_ERROR("[META] handle_flash_attn_ext unsupported split: Q=%s K=%s V=%s mask=%s sinks=%s\n",
+                    ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[3].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[4].axis));
+        }
+        GGML_ABORT("handle_flash_attn_ext: unsupported Q/K/V split combination");
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -1123,6 +1175,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TP-CPU-BOUNDARY] host-resident tensors (CPU experts, --no-kv-offload KV cache) are MIRRORED.
+    if (ggml_backend_meta_tensor_is_host(tensor)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
@@ -1846,6 +1902,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
+            // [TP-CPU-BOUNDARY] A node "involves host" if it, or any of its srcs, lives on a non-meta
+            // (CPU) buffer. The delayed-AllReduce fusion below pattern-matches an *intact on-GPU* expert
+            // reduction chain; with CPU-offloaded experts (-ncmoe) that chain is broken, so absorbing a
+            // host-involved node would mis-place the subgraph cut and zero the wrong COMPUTE flags
+            // (the "1 token then silent death"). We never advance the delayed index across such a node.
+            auto involves_host = [](const ggml_tensor * t) -> bool {
+                if (ggml_backend_meta_tensor_is_host(t)) {
+                    return true;
+                }
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (t->src[s] != nullptr && ggml_backend_meta_tensor_is_host(t->src[s])) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             auto get_i_delayed = [&](const int i) -> int {
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
@@ -1853,10 +1926,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[id];
                 int32_t n_used = ggml_node_get_use_count(cgraph, id);
 
+                // Do not fuse across a CPU/meta boundary.
+                if (involves_host(node)) {
+                    return idr;
+                }
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (involves_host(next)) {
+                            break;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -1887,7 +1968,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                    if (next->op == GGML_OP_ADD_ID && !involves_host(next) && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                             ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
@@ -1903,7 +1984,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         return idr;
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                    if (next->op == GGML_OP_MUL && !involves_host(next) && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
@@ -1919,7 +2000,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 for (int32_t k = 0; k < n_used; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_VIEW || next->view_src != node || next->view_offs != k*node->nb[1] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_VIEW || next->view_src != node || next->view_offs != k*node->nb[1] ||
                             next->ne[0] != node->ne[0] || next->ne[1] != node->ne[2] || next->nb[1] != node->nb[2] ||
                             ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
@@ -1928,7 +2010,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id - (n_used-1)] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id - (n_used-1)] ||
                             next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
                     }
@@ -1936,7 +2019,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 for (int32_t k = 0; k < n_used - 2; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id] ||
                             next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
                     }
@@ -1963,6 +2047,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 const int i_delayed = get_i_delayed(i);
 
+                if (ggml_backend_meta_debug_enabled()) {
+                    GGML_LOG_ERROR("[META] subgraph %d: nodes [%d..%d] boundary op=%s axis=%s i_delayed=%d host=%d\n",
+                            (int) n_subgraphs, i_start, i_delayed, ggml_op_name(node->op),
+                            ggml_backend_meta_split_axis_name(split_state.axis), i_delayed,
+                            (int) involves_host(node));
+                }
+
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
                 //     its compute flag disabled and thus gets its data zeroed out.
@@ -1988,6 +2079,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+        }
+
+        if (ggml_backend_meta_debug_enabled()) {
+            GGML_LOG_ERROR("[META] graph uid=%lld n_nodes=%d n_subgraphs=%d\n",
+                    (long long) cgraph->uid, cgraph->n_nodes, (int) n_subgraphs);
         }
 
         backend_ctx->uid         = cgraph->uid;
