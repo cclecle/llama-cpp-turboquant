@@ -512,8 +512,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    // [TP-CPU-BOUNDARY] tensor->buffer may be null for an unallocated meta compute tensor reached via
+    // src-recursion during graph allocation. The device count is graph-global, so source it from stc
+    // (always valid) when the buffer is absent, and make buf_ctx optional (no cache in that case).
+    const size_t n_bufs = (tensor->buffer != nullptr)
+        ? ggml_backend_meta_buffer_n_bufs(tensor->buffer)
+        : stc.ctxs.size();
+    ggml_backend_meta_buffer_context * buf_ctx =
+        (tensor->buffer != nullptr) ? (ggml_backend_meta_buffer_context *) tensor->buffer->context : nullptr;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -850,7 +856,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        // [TP-CPU-BOUNDARY] tensor->buffer may be null for an unallocated compute node reached via
+        // src-recursion during graph allocation. Such a tensor is not a weight/leaf, so skip the
+        // device-callback (weight) branch and derive its split from its op/srcs below.
+        if (tensor->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
@@ -1073,7 +1083,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            // [TP-CPU-BOUNDARY] use the captured null-safe n_bufs (tensor->buffer may be null here)
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1113,6 +1123,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         return split_state;
     };
+
+    // [TP-CPU-BOUNDARY] no meta buffer to cache against (unallocated tensor during alloc-time
+    // src-recursion): compute directly, skip the buffer-keyed cache.
+    if (buf_ctx == nullptr) {
+        return calculate_split_state();
+    }
 
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
