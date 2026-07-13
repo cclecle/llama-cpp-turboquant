@@ -794,14 +794,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                                    src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
 
         // Case 1 (classic head-parallel): Q,K,V all split along the head axis.
-        // Case 2 (Q head-split / KV replicated): GQA whose KV heads cannot be split across the
-        //   devices, or --no-kv-offload KV that arrives MIRRORED. Each device runs FlashAttention
-        //   for its subset of Q heads against the full (replicated) KV; the output is still
-        //   head-split -> AXIS_1. Mask/sinks handling is identical to case 1.
-        if (q_head_split && (kv_head_split || kv_mirrored)) {
+        if (q_head_split && kv_head_split) {
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+
+        // Head-split Q against a MIRRORED (full) KV is NOT correct and must never silently proceed:
+        // FlashAttention derives the KV head from the Q head index *local to the tensor it is given*.
+        // With Q head-split but KV replicated in full, device j's local Q head 0 maps to KV head 0
+        // instead of its true global head, so every device but the first attends to the wrong KV
+        // heads (GQA) and the model emits garbage. Supporting this requires slicing the mirrored KV
+        // per device to match that device's Q-head range (not yet implemented).
+        // This is reached e.g. with --no-kv-offload under -sm tensor (KV cache lives on the host),
+        // or when an FA fallback (missing kernel for a mismatched K/V quant pair) mirrors the KV.
+        if (q_head_split && kv_mirrored) {
+            GGML_LOG_ERROR("%s: KV is MIRRORED while Q is head-split (K=%s V=%s). This is not supported "
+                           "and would produce incorrect results. Use a matched K/V cache quant type "
+                           "(so a fused FA kernel exists, e.g. -ctk q4_0 -ctv q4_0), build with "
+                           "GGML_CUDA_FA_ALL_QUANTS=ON, and do not use --no-kv-offload with -sm tensor.\n",
+                           __func__,
+                           ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                           ggml_backend_meta_split_axis_name(src_ss[2].axis));
+            GGML_ABORT("handle_flash_attn_ext: head-split Q with MIRRORED KV is unsupported");
         }
 
         // Case 3 (fully replicated): nothing splits (e.g. attention that cannot be head-parallel at
