@@ -97,8 +97,11 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // one slot per layer input, plus a trailing slot (index == n_layer) for the model's
+    // post-final-norm hidden state over *all* tokens - the input an EAGLE-1 draft consumes.
+    // (layer inputs alone cannot provide it: the last layer is pruned to the output rows.)
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -126,7 +129,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_EAGLE || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -1116,7 +1119,8 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    // lid == n_layer selects the post-final-norm hidden state (see the resize in the ctor)
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 

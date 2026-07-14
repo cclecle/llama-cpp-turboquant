@@ -1287,7 +1287,8 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FC: (
-            "model.fc", # dflash
+            "model.fc",     # dflash
+            "eagle_linear", # eagle (mistral)
         ),
 
         MODEL_TENSOR.CLS: (

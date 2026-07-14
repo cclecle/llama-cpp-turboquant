@@ -251,8 +251,13 @@ def main() -> None:
             from conversion.mistral import MistralMoeModel
             model_class = MistralMoeModel
         else:
-            from conversion.mistral import MistralModel
-            model_class = MistralModel
+            from conversion.mistral import MistralEagleModel, MistralModel
+            # an EAGLE draft head has the same params.json shape as a normal model;
+            # the `eagle_linear` fusion tensor is what tells them apart.
+            if MistralEagleModel.is_eagle_checkpoint(dir_model):
+                model_class = MistralEagleModel
+            else:
+                model_class = MistralModel
 
         if args.mtp and args.no_mtp:
             logger.error("--mtp and --no-mtp are mutually exclusive")

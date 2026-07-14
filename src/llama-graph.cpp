@@ -1195,7 +1195,8 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
 
-    t_layer_inp.resize(LLAMA_MAX_LAYERS);
+    // +1: the trailing slot holds the post-final-norm hidden state (see llama_context ctor)
+    t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_sampled.clear();
