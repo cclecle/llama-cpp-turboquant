@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -398,6 +399,14 @@ struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
+    // [TP-CPU-BOUNDARY] Set for every container of a meta buffer. Needed when the split-state
+    // recursion reaches a tensor that is NOT on a meta buffer (host/CPU) or is not yet allocated:
+    // the device count is graph-global, and dev_ctx lets us still ask the *meta* device what the
+    // real split of a host tensor is (e.g. the --no-kv-offload KV cache). Note stc_static is
+    // default-constructed with no ctxs, so ctxs.size() is NOT a reliable device count.
+    size_t n_bufs = 0;
+    const struct ggml_backend_meta_device_context * dev_ctx = nullptr;
+
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
         for (int i = 0; i < n_simple; i++) {
@@ -485,13 +494,71 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// A tensor is "host" (from the meta backend's point of view) when it lives on a non-meta buffer:
+// CPU-offloaded MoE experts (-ncmoe/-cmoe/-ot), the --no-kv-offload KV cache, etc.
+// The meta backend only fans a graph out over N identical GPU devices; a host tensor carries the
+// same value on every device, so its split state is MIRRORED (replicated, not sliced).
+static bool ggml_backend_meta_tensor_is_host(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
+// Env-gated verbose tracing (GGML_META_DEBUG=1) for debugging the CPU/meta boundary. Zero cost when off.
+static bool ggml_backend_meta_debug_enabled() {
+    static const bool enabled = (std::getenv("GGML_META_DEBUG") != nullptr);
+    return enabled;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    // [TP-CPU-BOUNDARY] tensor->buffer may be a host (CPU) buffer, or null for a not-yet-allocated meta
+    // compute tensor reached via src-recursion during graph allocation. Only read the buffer when it is
+    // actually a meta buffer; otherwise fall back to the device count recorded on stc.
+    const bool on_meta = (tensor->buffer != nullptr) && ggml_backend_buffer_is_meta(tensor->buffer);
+    const size_t n_bufs = on_meta ? ggml_backend_meta_buffer_n_bufs(tensor->buffer) : stc.n_bufs;
+    ggml_backend_meta_buffer_context * buf_ctx =
+        on_meta ? (ggml_backend_meta_buffer_context *) tensor->buffer->context : nullptr;
+
+    // [TP-CPU-BOUNDARY] Host-resident tensors. Two very different kinds, and conflating them was the bug:
+    //
+    //  - CPU-offloaded WEIGHTS (-ot '...exps.weight=CPU'): the matmul that consumes them is pinned to the
+    //    CPU backend and reads the whole tensor. From the meta backend's point of view the value is the
+    //    same everywhere -> MIRRORED. (This is what makes tensor-split + CPU-MoE work.)
+    //
+    //  - Everything else, notably the --no-kv-offload KV cache: consumed by a SPLIT GPU-side op
+    //    (FlashAttention with head-parallel Q). Marking it MIRRORED replicates the full KV to every
+    //    device, and FA then derives each Q head's KV head from the index *local to the tensor it is
+    //    given* -> under GQA every device but the first attends to the wrong KV heads (garbage output).
+    //    Instead ask the meta device for the tensor's real split, so set_tensor scatters only each
+    //    device's own KV-head slice, matching that device's Q heads.
+    if (ggml_backend_meta_tensor_is_host(tensor)) {
+        if (stc.dev_ctx == nullptr ||
+                ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        // Only a real (non-view) host tensor can be identified by name by the device callback.
+        // A *view* of the host KV cache (the K/V actually handed to FlashAttention) has a name like
+        // "k-0" which matches no pattern, so asking the callback would wrongly yield the MIRRORED
+        // default. Let views fall through to the op switch below, which derives their split from
+        // their view_src -- i.e. from the cache tensor, which the callback does resolve.
+        if (tensor->view_src == nullptr) {
+            ggml_backend_meta_split_state ret = stc.dev_ctx->get_split_state(tensor, stc.dev_ctx->get_split_state_ud);
+            if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+                const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
+                int64_t ne_sum = 0;
+                for (size_t s = 0; s < ret.n_segments; s++) {
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        GGML_ASSERT(ret.ne[s*n_bufs + j] % granularity == 0);
+                        ne_sum += ret.ne[s*n_bufs + j] * ret.nr[s];
+                    }
+                }
+                GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
+            }
+            return ret;
+        }
+    }
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -757,12 +824,57 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        // src layout: [0]=Q [1]=K [2]=V [3]=mask [4]=sinks(optional)
+        const bool q_head_split = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool q_mirrored   = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        const bool kv_head_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                                   src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool kv_mirrored   = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                                   src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+
+        // Case 1 (classic head-parallel): Q,K,V all split along the head axis.
+        if (q_head_split && kv_head_split) {
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+
+        // Head-split Q against a MIRRORED (full) KV is NOT correct and must never silently proceed:
+        // FlashAttention derives the KV head from the Q head index *local to the tensor it is given*.
+        // With Q head-split but KV replicated in full, device j's local Q head 0 maps to KV head 0
+        // instead of its true global head, so every device but the first attends to the wrong KV
+        // heads (GQA) and the model emits garbage. Supporting this requires slicing the mirrored KV
+        // per device to match that device's Q-head range (not yet implemented).
+        // This is reached e.g. with --no-kv-offload under -sm tensor (KV cache lives on the host),
+        // or when an FA fallback (missing kernel for a mismatched K/V quant pair) mirrors the KV.
+        if (q_head_split && kv_mirrored) {
+            GGML_LOG_ERROR("%s: KV is MIRRORED while Q is head-split (K=%s V=%s). This is not supported "
+                           "and would produce incorrect results. Use a matched K/V cache quant type "
+                           "(so a fused FA kernel exists, e.g. -ctk q4_0 -ctv q4_0), build with "
+                           "GGML_CUDA_FA_ALL_QUANTS=ON, and do not use --no-kv-offload with -sm tensor.\n",
+                           __func__,
+                           ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                           ggml_backend_meta_split_axis_name(src_ss[2].axis));
+            GGML_ABORT("handle_flash_attn_ext: head-split Q with MIRRORED KV is unsupported");
+        }
+
+        // Case 3 (fully replicated): nothing splits (e.g. attention that cannot be head-parallel at
+        // all, or a single-device meta). The op runs identically on every device -> MIRRORED.
+        if (q_mirrored && kv_mirrored) {
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
+        if (ggml_backend_meta_debug_enabled()) {
+            GGML_LOG_ERROR("[META] handle_flash_attn_ext unsupported split: Q=%s K=%s V=%s mask=%s sinks=%s\n",
+                    ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[3].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[4].axis));
+        }
+        GGML_ABORT("handle_flash_attn_ext: unsupported Q/K/V split combination");
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -798,7 +910,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        // [TP-CPU-BOUNDARY] tensor->buffer may be null for an unallocated compute node reached via
+        // src-recursion during graph allocation. Such a tensor is not a weight/leaf, so skip the
+        // device-callback (weight) branch and derive its split from its op/srcs below.
+        if (tensor->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
@@ -830,6 +946,32 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         switch (tensor->op) {
             case GGML_OP_NONE: {
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+
+                // [TP-CPU-BOUNDARY] ggml_backend_sched copies a src that lives on another backend into
+                // our buffer as an op=NONE leaf, named "<backend>#<original name>#<id>". Defaulting it
+                // to MIRRORED replicates it to every device -- correct for most inputs, but WRONG for the
+                // --no-kv-offload KV cache: FlashAttention needs each device to hold exactly the KV heads
+                // matching its slice of the head-parallel Q. If we replicate instead, FA derives the KV
+                // head from the Q head index *local to the tensor it is given*, so under GQA every device
+                // but the first attends to the wrong KV heads (garbage). Split such a copy by KV head.
+                //
+                // K/V reach FA permuted as [head_dim, n_tokens, n_head_kv], so the head axis is 2.
+                // Splitting it evenly keeps it aligned with the Q head split (the GQA ratio is preserved
+                // on every device), which makes each device's local head indices map correctly.
+                if (strstr(tensor->name, "cache_k_l") != nullptr ||
+                        strstr(tensor->name, "cache_v_l") != nullptr) {
+                    const int64_t n_head_kv = tensor->ne[2];
+                    if (n_bufs > 0 && n_head_kv > 0 && n_head_kv % (int64_t) n_bufs == 0) {
+                        ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            ss.ne[j] = n_head_kv / (int64_t) n_bufs;
+                        }
+                        // Return directly: this is a leaf, so there is no axis-split src to derive the
+                        // per-device ne from. The generic code after the switch requires one and would
+                        // trip GGML_ASSERT(!first_src_split_by_axis). We already know the exact split.
+                        return ss;
+                    }
+                }
             } break;
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -1026,7 +1168,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            // [TP-CPU-BOUNDARY] use the captured null-safe n_bufs (tensor->buffer may be null here)
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1066,6 +1208,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         return split_state;
     };
+
+    // [TP-CPU-BOUNDARY] no meta buffer to cache against (unallocated tensor during alloc-time
+    // src-recursion): compute directly, skip the buffer-keyed cache.
+    if (buf_ctx == nullptr) {
+        return calculate_split_state();
+    }
 
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
@@ -1128,6 +1276,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TP-CPU-BOUNDARY] host-resident tensors (CPU experts, --no-kv-offload KV cache) are MIRRORED.
+    if (ggml_backend_meta_tensor_is_host(tensor)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
@@ -1268,6 +1420,31 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    // [TP-CPU-BOUNDARY] Scatter a head-split tensor whose split dim is *interleaved*, i.e. the
+    // sched-copied --no-kv-offload KV cache. It arrives permuted as [head_dim, n_tokens, n_head_kv]
+    // with the heads INNER: nb[2] < nb[1] and ne[2]*nb[2] == nb[1], so each token's row holds all
+    // heads back to back. The generic chunk-splicing below assumes the split dim is an outer
+    // contiguous block and cannot slice this. Instead give each device its own contiguous run of
+    // heads out of every token row -- a plain strided 2D copy.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+            !ggml_is_contiguous(tensor) && tensor->ne[3] == 1 && offset == 0 &&
+            tensor->nb[2] != 0 && (size_t) tensor->ne[2] * tensor->nb[2] == tensor->nb[1]) {
+        size_t src_off = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
+            if (width == 0) {
+                continue;
+            }
+            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + src_off, /*offset =*/ 0,
+                width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            src_off += width;
+        }
+        GGML_ASSERT(src_off == tensor->nb[1]);
+        GGML_UNUSED(size);
+        return;
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -1382,6 +1559,31 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // [TP-CPU-BOUNDARY] Mirror of the head-interleaved scatter in set_tensor: gather a head-split
+    // tensor whose split dim is INNER ([head_dim, n_tokens, n_head_kv], nb[2] < nb[1] and
+    // ne[2]*nb[2] == nb[1]). Each device holds only its own run of KV heads; re-interleave them
+    // back into every token's row. Without this the K/V computed head-split on the devices are
+    // written back to the host KV cache in the wrong order and the cache is corrupt.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+            !ggml_is_contiguous(tensor) && tensor->ne[3] == 1 && offset == 0 &&
+            tensor->nb[2] != 0 && (size_t) tensor->ne[2] * tensor->nb[2] == tensor->nb[1]) {
+        size_t dst_off = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
+            if (width == 0) {
+                continue;
+            }
+            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + dst_off, /*offset =*/ 0,
+                width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            dst_off += width;
+        }
+        GGML_ASSERT(dst_off == tensor->nb[1]);
+        GGML_UNUSED(size);
+        return;
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -1523,6 +1725,18 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+
+    // [TP-CPU-BOUNDARY] record the device count and the meta device context on every container, so the
+    // split-state recursion can still resolve tensors that are host-resident or not yet allocated.
+    {
+        ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(buft);
+        const ggml_backend_meta_device_context * meta_dev_ctx =
+            (const ggml_backend_meta_device_context *) meta_dev->context;
+        for (ggml_backend_meta_simple_tensor_container * s : { &stc_static, &stc_compute_0, &stc_compute_1 }) {
+            s->n_bufs  = n_simple_bufts;
+            s->dev_ctx = meta_dev_ctx;
+        }
+    }
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1851,6 +2065,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
+            // [TP-CPU-BOUNDARY] A node "involves host" if it, or any of its srcs, lives on a non-meta
+            // (CPU) buffer. The delayed-AllReduce fusion below pattern-matches an *intact on-GPU* expert
+            // reduction chain; with CPU-offloaded experts (-ncmoe) that chain is broken, so absorbing a
+            // host-involved node would mis-place the subgraph cut and zero the wrong COMPUTE flags
+            // (the "1 token then silent death"). We never advance the delayed index across such a node.
+            auto involves_host = [](const ggml_tensor * t) -> bool {
+                if (ggml_backend_meta_tensor_is_host(t)) {
+                    return true;
+                }
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (t->src[s] != nullptr && ggml_backend_meta_tensor_is_host(t->src[s])) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             auto get_i_delayed = [&](const int i) -> int {
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
@@ -1858,10 +2089,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[id];
                 int32_t n_used = ggml_node_get_use_count(cgraph, id);
 
+                // Do not fuse across a CPU/meta boundary.
+                if (involves_host(node)) {
+                    return idr;
+                }
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (involves_host(next)) {
+                            break;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -1892,7 +2131,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                    if (next->op == GGML_OP_ADD_ID && !involves_host(next) && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                             ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
@@ -1908,7 +2147,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         return idr;
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                    if (next->op == GGML_OP_MUL && !involves_host(next) && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
@@ -1924,7 +2163,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 for (int32_t k = 0; k < n_used; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_VIEW || next->view_src != node || next->view_offs != k*node->nb[1] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_VIEW || next->view_src != node || next->view_offs != k*node->nb[1] ||
                             next->ne[0] != node->ne[0] || next->ne[1] != node->ne[2] || next->nb[1] != node->nb[2] ||
                             ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
@@ -1933,7 +2173,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id - (n_used-1)] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id - (n_used-1)] ||
                             next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
                     }
@@ -1941,7 +2182,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 for (int32_t k = 0; k < n_used - 2; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id] ||
+                    if (involves_host(next) ||
+                            next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id] ||
                             next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
                     }
@@ -1968,6 +2210,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 const int i_delayed = get_i_delayed(i);
 
+                if (ggml_backend_meta_debug_enabled()) {
+                    GGML_LOG_ERROR("[META] subgraph %d: nodes [%d..%d] boundary op=%s axis=%s i_delayed=%d host=%d\n",
+                            (int) n_subgraphs, i_start, i_delayed, ggml_op_name(node->op),
+                            ggml_backend_meta_split_axis_name(split_state.axis), i_delayed,
+                            (int) involves_host(node));
+                }
+
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
                 //     its compute flag disabled and thus gets its data zeroed out.
@@ -1993,6 +2242,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+        }
+
+        if (ggml_backend_meta_debug_enabled()) {
+            GGML_LOG_ERROR("[META] graph uid=%lld n_nodes=%d n_subgraphs=%d\n",
+                    (long long) cgraph->uid, cgraph->n_nodes, (int) n_subgraphs);
         }
 
         backend_ctx->uid         = cgraph->uid;
