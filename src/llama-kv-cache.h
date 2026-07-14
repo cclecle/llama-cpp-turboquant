@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // number of layers whose KV is kept in host RAM instead of VRAM (hybrid placement).
+        // 0 = all on device. `offload == false` (--no-kv-offload) still means "all layers".
+                     uint32_t   n_cpu_kv_layers = 0);
 
     ~llama_kv_cache() = default;
 
