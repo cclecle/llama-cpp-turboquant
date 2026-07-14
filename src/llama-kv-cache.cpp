@@ -218,9 +218,28 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        } else {
+            // The KV cache is kept in system RAM (--no-kv-offload), but it is still read by the
+            // device every decode step. Plain CPU (pageable) memory makes every one of those
+            // transfers go through a driver bounce buffer: it roughly halves H2D bandwidth and
+            // prevents cudaMemcpyAsync from actually being asynchronous. Prefer the device's
+            // pinned (page-locked) host buffer type when one is available; fall back to pageable.
+            auto * dev = model.dev_layer(il);
+            if (dev) {
+                auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (host_buft) {
+                    buft = host_buft;
+                    dev_name = "CPU (pinned)";
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+
+        if (il == 0) {
+            LLAMA_LOG_INFO("%s: KV cache buffer type = '%s' (offload = %d)\n",
+                    __func__, ggml_backend_buft_name(buft), (int) offload);
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
