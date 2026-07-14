@@ -1423,20 +1423,26 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // heads out of every token row -- a plain strided 2D copy.
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
             split_state.n_segments == 1 && split_state.nr[0] == 1 &&
-            !ggml_is_contiguous(tensor) && tensor->ne[3] == 1 && offset == 0 &&
+            !ggml_is_contiguous(tensor) && offset == 0 &&
             tensor->nb[2] != 0 && (size_t) tensor->ne[2] * tensor->nb[2] == tensor->nb[1]) {
-        size_t src_off = 0;
-        for (size_t j = 0; j < n_bufs; j++) {
-            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-            const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
-            if (width == 0) {
-                continue;
+        // ne[3] is the parallel-sequence dimension (n_seq > 1). The heads-inner layout holds within
+        // each sequence, so scatter each sequence's token rows independently: the sequence stride is
+        // nb[3] on both sides.
+        for (int64_t s = 0; s < tensor->ne[3]; s++) {
+            size_t src_off = (size_t) s * tensor->nb[3];
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
+                if (width == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + src_off,
+                    /*offset =*/ (size_t) s * simple_tensor->nb[3],
+                    width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                src_off += width;
             }
-            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + src_off, /*offset =*/ 0,
-                width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
-            src_off += width;
+            GGML_ASSERT(src_off == (size_t) s * tensor->nb[3] + tensor->nb[1]);
         }
-        GGML_ASSERT(src_off == tensor->nb[1]);
         GGML_UNUSED(size);
         return;
     }
@@ -1562,20 +1568,24 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // written back to the host KV cache in the wrong order and the cache is corrupt.
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
             split_state.n_segments == 1 && split_state.nr[0] == 1 &&
-            !ggml_is_contiguous(tensor) && tensor->ne[3] == 1 && offset == 0 &&
+            !ggml_is_contiguous(tensor) && offset == 0 &&
             tensor->nb[2] != 0 && (size_t) tensor->ne[2] * tensor->nb[2] == tensor->nb[1]) {
-        size_t dst_off = 0;
-        for (size_t j = 0; j < n_bufs; j++) {
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-            const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
-            if (width == 0) {
-                continue;
+        // mirror of set_tensor: loop over the parallel-sequence dim ne[3] (n_seq > 1)
+        for (int64_t s = 0; s < tensor->ne[3]; s++) {
+            size_t dst_off = (size_t) s * tensor->nb[3];
+            for (size_t j = 0; j < n_bufs; j++) {
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
+                if (width == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_get_2d(simple_tensor, (char *) data + dst_off,
+                    /*offset =*/ (size_t) s * simple_tensor->nb[3],
+                    width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                dst_off += width;
             }
-            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + dst_off, /*offset =*/ 0,
-                width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
-            dst_off += width;
+            GGML_ASSERT(dst_off == (size_t) s * tensor->nb[3] + tensor->nb[1]);
         }
-        GGML_ASSERT(dst_off == tensor->nb[1]);
         GGML_UNUSED(size);
         return;
     }
@@ -1983,24 +1993,27 @@ static bool ggml_backend_meta_cpy_tensor_async(
     // ([head_dim, n_tokens, n_head_kv], ne[2]*nb[2] == nb[1]). Give each device its own contiguous
     // run of heads out of every token row, asynchronously.
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 && !ggml_is_contiguous(dst) &&
-            dst->ne[3] == 1 && dst->nb[2] != 0 && (size_t) dst->ne[2] * dst->nb[2] == dst->nb[1]) {
-        size_t src_off = 0;
-        for (size_t j = 0; j < n_backends; j++) {
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend_dst, j);
-            ggml_tensor  * simple_tensor  = ggml_backend_meta_buffer_simple_tensor(dst, j);
-            if (simple_tensor == nullptr) {
-                return false;
+            dst->nb[2] != 0 && (size_t) dst->ne[2] * dst->nb[2] == dst->nb[1]) {
+        // ne[3] is the parallel-sequence dim (n_seq > 1); stream each sequence independently.
+        for (int64_t s = 0; s < dst->ne[3]; s++) {
+            size_t src_off = (size_t) s * dst->nb[3];
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend_dst, j);
+                ggml_tensor  * simple_tensor  = ggml_backend_meta_buffer_simple_tensor(dst, j);
+                if (simple_tensor == nullptr) {
+                    return false;
+                }
+                const size_t width = (size_t) split_state.ne[j] * dst->nb[2];
+                if (width == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor,
+                    (const char *) src->data + src_off, /*offset =*/ (size_t) s * simple_tensor->nb[3],
+                    width, dst->ne[1], simple_tensor->nb[1], dst->nb[1]);
+                src_off += width;
             }
-            const size_t width = (size_t) split_state.ne[j] * dst->nb[2];
-            if (width == 0) {
-                continue;
-            }
-            ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor,
-                (const char *) src->data + src_off, /*offset =*/ 0,
-                width, dst->ne[1], simple_tensor->nb[1], dst->nb[1]);
-            src_off += width;
+            GGML_ASSERT(src_off == (size_t) s * dst->nb[3] + dst->nb[1]);
         }
-        GGML_ASSERT(src_off == dst->nb[1]);
         return true;
     }
 
