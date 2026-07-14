@@ -2318,6 +2318,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
+
+            // [TP-CPU-BOUNDARY] The loop skips views of host-resident op=NONE tensors (the
+            // --no-kv-offload KV cache) before it can consider them a subgraph boundary. The rule
+            // that force-closes a subgraph on the final node therefore never fires when such a view
+            // happens to BE the final node -- which is exactly what n_seq > 1 produces. No subgraph
+            // was opened for the trailing nodes, so i_start never reached n_nodes and we aborted.
+            // Emit them as one last subgraph: nothing in it is PARTIAL, so it needs no AllReduce.
+            if (i_start < cgraph->n_nodes) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->backend_configs[j].cgraphs[n_subgraphs].offset = i_start;
+                }
+                n_subgraphs++;
+                i_start = cgraph->n_nodes;
+            }
+
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
