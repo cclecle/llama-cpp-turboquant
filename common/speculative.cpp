@@ -2701,7 +2701,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
     common_params result = params;
 
     if (has_draft) {
-        result.devices               = params_spec.devices;
+        // Only override the device list when the user actually gave one (-devd). Assigning an empty
+        // list would drop the main --device selection and silently fall back to *all* devices, which
+        // breaks --split-mode tensor: the draft's meta device would then span a different set of GPUs
+        // than the target's, so the draft's scheduler cannot resolve tensors it borrows from the
+        // target (an EAGLE draft has no lm_head of its own) and aborts with
+        //   "pre-allocated tensor (output.weight) in a buffer (Meta()) that cannot run the operation".
+        if (!params_spec.devices.empty()) {
+            result.devices = params_spec.devices;
+        }
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
