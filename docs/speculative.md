@@ -52,6 +52,42 @@ Supported EAGLE-3 draft models include:
 
 For the full and up-to-date list of supported models, see #18039.
 
+### EAGLE-1/2 (`draft-eagle`)
+
+EAGLE-1/2 is an earlier EAGLE variant with a **different graph** from EAGLE-3, so it uses its own
+architecture (`eagle`) and speculative type (`draft-eagle`). The draft is a small stack of ordinary
+transformer decoder layers whose input, at each position, is `fc(concat(token_embedding, h))` where
+`h` is the target model's **post-final-norm** hidden state for the previous token (EAGLE-3 instead
+fuses three extracted target layers through a separate encoder). The draft ships neither token
+embeddings nor an `lm_head`; both are shared from the target model at runtime, so the draft and
+target must use the same tokenizer and hidden size.
+
+The reference release is Mistral's, shipped in the Mistral consolidated format (`params.json` +
+`consolidated.safetensors`, FP8 weights, no `config.json`). Convert it with `--mistral-format`; the
+tokenizer and `lm_head` come from the target at load time, so a chat template is not needed:
+
+```bash
+python convert_hf_to_gguf.py mistralai/Mistral-Medium-3.5-128B-EAGLE \
+    --mistral-format --disable-mistral-community-chat-template \
+    --outtype f16 --outfile Mistral-Medium-3.5-128B-EAGLE-f16.gguf
+llama-quantize Mistral-Medium-3.5-128B-EAGLE-f16.gguf Mistral-Medium-3.5-128B-EAGLE-Q4_K_M.gguf Q4_K_M
+
+llama-server -m Mistral-Medium-3.5-128B.gguf \
+    -md Mistral-Medium-3.5-128B-EAGLE-Q4_K_M.gguf \
+    --spec-type draft-eagle --spec-draft-n-max 8
+```
+
+Notes:
+
+- A Q4_K_M draft head is ~1.8 GB and shares the target's embeddings/`lm_head`, so it fits alongside
+  a large target. Acceptance is best on predictable content (code); prose is the worst case.
+- Under `--split-mode tensor`, pass `--spec-draft-device` only if you want the draft on specific
+  GPUs — otherwise it inherits the target's `--device` and splits across the same GPUs.
+
+Supported EAGLE-1/2 draft models include:
+
+- [mistralai/Mistral-Medium-3.5-128B-EAGLE](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B-EAGLE)
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
