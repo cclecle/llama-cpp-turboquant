@@ -540,6 +540,7 @@ class MODEL_ARCH(IntEnum):
     KIMI_LINEAR      = auto()
     TALKIE           = auto()
     MELLUM           = auto()
+    EAGLE            = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1122,6 +1123,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
+    MODEL_ARCH.EAGLE:            "eagle",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -4220,6 +4222,24 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.D2T,
+    ],
+    MODEL_ARCH.EAGLE: [
+        # EAGLE-1/2 style draft head (e.g. Mistral-Medium-3.5-128B-EAGLE).
+        # token_embd and output are optional: they are normally shared with the target model.
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FC,
     ],
     MODEL_ARCH.DFLASH: [
         MODEL_TENSOR.OUTPUT_NORM,
