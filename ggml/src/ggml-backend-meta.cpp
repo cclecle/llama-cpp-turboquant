@@ -1564,6 +1564,31 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // [TP-CPU-BOUNDARY] Mirror of the head-interleaved scatter in set_tensor: gather a head-split
+    // tensor whose split dim is INNER ([head_dim, n_tokens, n_head_kv], nb[2] < nb[1] and
+    // ne[2]*nb[2] == nb[1]). Each device holds only its own run of KV heads; re-interleave them
+    // back into every token's row. Without this the K/V computed head-split on the devices are
+    // written back to the host KV cache in the wrong order and the cache is corrupt.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+            !ggml_is_contiguous(tensor) && tensor->ne[3] == 1 && offset == 0 &&
+            tensor->nb[2] != 0 && (size_t) tensor->ne[2] * tensor->nb[2] == tensor->nb[1]) {
+        size_t dst_off = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t width = (size_t) split_state.ne[j] * tensor->nb[2];
+            if (width == 0) {
+                continue;
+            }
+            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + dst_off, /*offset =*/ 0,
+                width, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            dst_off += width;
+        }
+        GGML_ASSERT(dst_off == tensor->nb[1]);
+        GGML_UNUSED(size);
+        return;
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
