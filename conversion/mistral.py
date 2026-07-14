@@ -110,6 +110,46 @@ class MistralModel(LlamaModel):
             gguf_writer.add_attn_temperature_scale(llama_4_scaling["beta"])
 
 
+class MistralEagleModel(MistralModel):
+    # EAGLE-1/2 draft head shipped in Mistral's consolidated format
+    # (e.g. mistralai/Mistral-Medium-3.5-128B-EAGLE).
+    #
+    # Layout (ref: vLLM `EagleMistralModel`, vllm/model_executor/models/mistral_eagle.py):
+    #   eagle_linear        fuses concat(token embedding, target hidden state) -> dim
+    #   layers.{0..n-1}.*   plain decoder layers (n_layers is 2 here, not 1 as in EAGLE-3)
+    #   norm                final RMSNorm
+    # The token embeddings and the lm_head are shared with the target model, so the checkpoint
+    # contains neither - llama.cpp borrows them from the target context at runtime.
+    model_arch = gguf.MODEL_ARCH.EAGLE
+    model_name = "Mistral-EAGLE"
+    hf_arch = ""
+    is_mistral_format = True
+    undo_permute = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # MistralModel.__init__ downgrades the arch to LLAMA for older checkpoints - undo that.
+        self.model_arch = gguf.MODEL_ARCH.EAGLE
+        self.gguf_writer.arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+        self.gguf_writer.add_architecture()
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        logger.info("Detected EAGLE draft model (Mistral format), using EAGLE architecture")
+
+    @staticmethod
+    def is_eagle_checkpoint(dir_model: Path) -> bool:
+        # the fusion layer is what distinguishes an EAGLE head from a normal Mistral model;
+        # params.json alone is identical in shape.
+        path = dir_model / "consolidated.safetensors"
+        if not path.is_file():
+            return False
+        import json as _json
+        import struct as _struct
+        with open(path, "rb") as f:
+            n = _struct.unpack("<Q", f.read(8))[0]
+            header = _json.loads(f.read(n))
+        return any(k.startswith("eagle_linear") for k in header)
+
+
 class MistralMoeModel(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK2
     model_name = "Mistral"

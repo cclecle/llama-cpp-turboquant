@@ -116,6 +116,10 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // see models/llama.cpp: slot n_layer exposes the post-final-norm hidden state for every token
+    // (an EAGLE-1 draft consumes it); keep the last layer at full width while it is enabled.
+    const bool need_h_full = cparams.embeddings_layer_inp[n_layer];
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -161,7 +165,7 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !need_h_full) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -221,6 +225,14 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
+
+    if (need_h_full) {
+        res->t_layer_inp[n_layer] = cur;
+
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

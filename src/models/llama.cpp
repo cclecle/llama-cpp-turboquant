@@ -123,6 +123,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // an EAGLE-1 draft needs this model's post-final-norm hidden state for *every* token, not just
+    // the output rows. When slot n_layer is enabled, keep the last layer at full width and prune to
+    // the output rows only after the final norm (RMSNorm is row-wise, so the result is unchanged).
+    const bool need_h_full = cparams.embeddings_layer_inp[n_layer];
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -171,7 +176,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !need_h_full) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -231,6 +236,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
+
+    if (need_h_full) {
+        // full-width post-final-norm hidden state, then subset for the lm_head
+        res->t_layer_inp[n_layer] = cur;
+
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
