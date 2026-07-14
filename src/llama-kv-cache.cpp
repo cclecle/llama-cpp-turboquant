@@ -77,7 +77,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                 uint32_t   n_cpu_kv_layers) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -211,17 +212,24 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        // Hybrid KV placement. Every layer's KV is read once per decode step, so a layer whose KV
+        // sits in host RAM costs bus bandwidth every token while a layer on the device costs none.
+        // Keeping the KV of as many layers as possible in VRAM and spilling only the remainder is
+        // therefore strictly better than the all-or-nothing choice:
+        //   offload == false (--no-kv-offload) : every layer in host RAM
+        //   n_cpu_kv_layers == N               : the first N layers in host RAM, the rest on device
+        const bool layer_in_host_ram = !offload || (il < n_cpu_kv_layers);
+
+        if (!layer_in_host_ram) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         } else {
-            // The KV cache is kept in system RAM (--no-kv-offload), but it is still read by the
-            // device every decode step. Plain CPU (pageable) memory makes every one of those
-            // transfers go through a driver bounce buffer: it roughly halves H2D bandwidth and
-            // prevents cudaMemcpyAsync from actually being asynchronous. Prefer the device's
-            // pinned (page-locked) host buffer type when one is available; fall back to pageable.
+            // The KV stays in system RAM but is still read by the device every decode step. Plain
+            // CPU (pageable) memory routes every one of those transfers through a driver bounce
+            // buffer: it roughly halves H2D bandwidth and prevents cudaMemcpyAsync from actually
+            // being asynchronous. Prefer the device's pinned (page-locked) host buffer type.
             auto * dev = model.dev_layer(il);
             if (dev) {
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -235,8 +243,11 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
         if (il == 0) {
-            LLAMA_LOG_INFO("%s: KV cache buffer type = '%s' (offload = %d)\n",
-                    __func__, ggml_backend_buft_name(buft), (int) offload);
+            const uint32_t n_layer_tot  = hparams.n_layer();
+            const uint32_t n_layer_host = offload ? std::min(n_cpu_kv_layers, n_layer_tot) : n_layer_tot;
+            LLAMA_LOG_INFO("%s: KV cache placement: %u/%u layers in host RAM ('%s'), %u on device\n",
+                    __func__, n_layer_host, n_layer_tot,
+                    ggml_backend_buft_name(buft), n_layer_tot - n_layer_host);
         }
 
         ggml_context * ctx = ctx_for_buft(buft);

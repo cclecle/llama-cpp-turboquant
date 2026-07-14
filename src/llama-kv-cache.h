@@ -112,7 +112,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // number of layers whose KV is kept in host RAM instead of VRAM (hybrid placement).
+        // 0 = all on device. `offload == false` (--no-kv-offload) still means "all layers".
+                     uint32_t   n_cpu_kv_layers = 0);
 
     ~llama_kv_cache() = default;
 
