@@ -848,16 +848,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // This is reached e.g. with --no-kv-offload under -sm tensor (KV cache lives on the host),
         // or when an FA fallback (missing kernel for a mismatched K/V quant pair) mirrors the KV.
         if (q_head_split && kv_mirrored) {
-            for (int s = 1; s <= 2; s++) {
-                const ggml_tensor * t = tensor->src[s];
-                const char * bufkind = t->buffer == nullptr ? "NULL"
-                                     : (ggml_backend_buffer_is_meta(t->buffer) ? "META" : "HOST");
-                GGML_LOG_ERROR("[TP-KV] src[%d] name='%s' op=%s buffer=%s usage=%d view_src='%s' ne=[%lld,%lld,%lld,%lld]\n",
-                        s, t->name, ggml_op_name(t->op), bufkind,
-                        t->buffer ? (int) ggml_backend_buffer_get_usage(t->buffer) : -1,
-                        t->view_src ? t->view_src->name : "(none)",
-                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
-            }
             GGML_LOG_ERROR("%s: KV is MIRRORED while Q is head-split (K=%s V=%s). This is not supported "
                            "and would produce incorrect results. Use a matched K/V cache quant type "
                            "(so a fused FA kernel exists, e.g. -ctk q4_0 -ctv q4_0), build with "
