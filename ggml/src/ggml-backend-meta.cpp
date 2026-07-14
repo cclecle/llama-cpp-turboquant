@@ -1951,6 +1951,81 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+// [TP-CPU-BOUNDARY] Asynchronous host -> meta copy.
+//
+// ggml_backend_sched copies a split's inputs right before computing that split. When the destination
+// backend does NOT implement cpy_tensor_async, sched takes a fallback path that calls
+// ggml_backend_synchronize() on BOTH backends and then does a blocking copy -- i.e. it fully drains
+// the GPU pipeline before every single transfer. With --no-kv-offload that happens once per layer per
+// token, so the GPU idles through the entire KV stream.
+//
+// Implementing this lets sched enqueue the transfer on each device's stream instead. Combined with a
+// pinned (page-locked) host KV buffer, the copy can actually overlap with work already queued, and the
+// per-layer device drain disappears. Returning false anywhere falls back to the old blocking path.
+static bool ggml_backend_meta_cpy_tensor_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_UNUSED(backend_src);
+
+    if (!ggml_backend_is_meta(backend_dst)) {
+        return false;
+    }
+    // we can only read src directly if it lives in host memory (CPU / pinned host buffer)
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) || src->data == nullptr) {
+        return false;
+    }
+    if (dst->buffer == nullptr || !ggml_backend_buffer_is_meta(dst->buffer)) {
+        return false;
+    }
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend_dst);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        return false;
+    }
+
+    // The --no-kv-offload KV cache: head-split, and permuted so the heads are INNER
+    // ([head_dim, n_tokens, n_head_kv], ne[2]*nb[2] == nb[1]). Give each device its own contiguous
+    // run of heads out of every token row, asynchronously.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 && !ggml_is_contiguous(dst) &&
+            dst->ne[3] == 1 && dst->nb[2] != 0 && (size_t) dst->ne[2] * dst->nb[2] == dst->nb[1]) {
+        size_t src_off = 0;
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend_dst, j);
+            ggml_tensor  * simple_tensor  = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            if (simple_tensor == nullptr) {
+                return false;
+            }
+            const size_t width = (size_t) split_state.ne[j] * dst->nb[2];
+            if (width == 0) {
+                continue;
+            }
+            ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor,
+                (const char *) src->data + src_off, /*offset =*/ 0,
+                width, dst->ne[1], simple_tensor->nb[1], dst->nb[1]);
+            src_off += width;
+        }
+        GGML_ASSERT(src_off == dst->nb[1]);
+        return true;
+    }
+
+    // Replicated input: broadcast the same bytes to every device, asynchronously.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ggml_is_contiguous(dst)) {
+        const size_t nbytes = ggml_nbytes(dst);
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            if (simple_tensor == nullptr) {
+                return false;
+            }
+            ggml_backend_tensor_set_async(ggml_backend_meta_simple_backend(backend_dst, j),
+                simple_tensor, src->data, /*offset =*/ 0, nbytes);
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);
@@ -2497,7 +2572,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ nullptr,
+    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
