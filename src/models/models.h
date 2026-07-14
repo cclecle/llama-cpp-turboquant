@@ -2229,6 +2229,22 @@ struct llama_model_qwen35moe : public llama_model_base {
 };
 
 
+// EAGLE-1/2 style draft head (e.g. Mistral-Medium-3.5-128B-EAGLE).
+// Decoder-only: the feature-fusion `fc` is applied inside the decoder graph, because its
+// input is concat(embd(t_{P+1}), h_P) and the token embedding varies per draft step.
+// (EAGLE3 differs: its `fc` fuses 3 target hidden states and lives in a separate encoder.)
+struct llama_model_eagle : public llama_model_base {
+    llama_model_eagle(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_mistral3 : public llama_model_base {
     llama_model_mistral3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

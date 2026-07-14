@@ -1302,8 +1302,9 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FC: (
-            "model.fc",   # dflash
-            "encoder.fc", # dflash (transformers MuseGlimmerAssistant)
+            "model.fc",     # dflash
+            "encoder.fc",   # dflash (transformers MuseGlimmerAssistant)
+            "eagle_linear", # eagle (mistral)
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
