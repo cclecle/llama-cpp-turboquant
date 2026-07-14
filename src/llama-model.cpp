@@ -328,6 +328,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
+        case LLM_ARCH_EAGLE:
+            return new llama_model_eagle(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
@@ -2938,6 +2940,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_EAGLE:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
