@@ -2716,6 +2716,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
 
+    // the draft's KV placement does not follow the target's (see common_params_speculative_draft)
+    result.no_kv_offload    = !params_spec.kv_offload;
+    result.n_cpu_kv_layers  = 0;
+
     return result;
 }
 

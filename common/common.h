@@ -341,6 +341,11 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // The draft's KV placement is deliberately independent of the target's. A draft head is tiny
+    // (an EAGLE head is ~8 kB/token) but runs several sequential decodes per target step, so it is
+    // latency-bound: keeping its KV in host RAM costs far more than the VRAM it saves.
+    bool kv_offload = true; // keep the draft's KV in VRAM even when the target's is in host RAM
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
