@@ -37,6 +37,9 @@ struct llama_cparams {
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
+
+    // number of layers whose KV cache is kept in host RAM instead of VRAM (0 = all on device)
+    uint32_t n_cpu_kv_layers;
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
