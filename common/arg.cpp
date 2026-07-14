@@ -4086,6 +4086,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-draft-kv-offload", "-kvod", "--kv-offload-draft"}, "<0|1>",
+        string_format(
+            "keep the draft model's KV cache in VRAM, independently of --no-kv-offload/-nckvl\n"
+            "a draft head is tiny but runs several sequential decodes per target step, so moving its\n"
+            "KV to host RAM costs far more latency than the VRAM it saves (default: %d)",
+            params.speculative.draft.kv_offload
+        ),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.kv_offload = std::stoi(value) != 0;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_KV_OFFLOAD"));
+    add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
