@@ -2421,6 +2421,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"-nckvl", "--n-cpu-kv-layers"}, "N",
+        string_format(
+            "keep the KV cache of the first N layers in host RAM instead of VRAM (default: %d)\n"
+            "every layer's KV is read once per token, so a layer in RAM costs bus bandwidth every token\n"
+            "while a layer on the device costs none. use this to fill whatever VRAM is left with KV and\n"
+            "spill only the remainder, instead of the all-or-nothing --no-kv-offload",
+            params.n_cpu_kv_layers),
+        [](common_params & params, int value) {
+            params.n_cpu_kv_layers = value;
+        }
+    ).set_env("LLAMA_ARG_N_CPU_KV_LAYERS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
