@@ -133,7 +133,37 @@ class MistralEagleModel(MistralModel):
         self.gguf_writer.arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
         self.gguf_writer.add_architecture()
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
-        logger.info("Detected EAGLE draft model (Mistral format), using EAGLE architecture")
+        # Some EAGLE heads use MLA (latent) attention because their target does
+        # (e.g. Mistral-Small-4-119B-EAGLE), others use plain attention (Mistral-Medium-128B-EAGLE).
+        self.is_mla_eagle = self.hparams.get("kv_lora_rank") is not None
+        logger.info("Detected EAGLE draft model (Mistral format, %s attention), using EAGLE architecture"
+                    % ("MLA" if self.is_mla_eagle else "plain"))
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if self.is_mla_eagle:
+            hp = self.hparams
+            # The draft runs the MLA weights via the decompressed-MHA path (see models/eagle.cpp):
+            # regular KV cache with full 128-dim heads, so we do NOT set key/value_length_mla
+            # (is_mla() stays false). We only need the low-rank projection sizes, the rope-only
+            # dimension, and the llama-4 attention-temperature parameters.
+            self.gguf_writer.add_q_lora_rank(hp["q_lora_rank"])
+            self.gguf_writer.add_kv_lora_rank(hp["kv_lora_rank"])
+            # only the qk_rope_head_dim slice is roped (override the base's head_dim value)
+            self.gguf_writer.add_rope_dimension_count(hp["qk_rope_head_dim"])
+            l4 = hp.get("llama_4_scaling")
+            if l4 is not None:
+                # set_mistral_config already emitted add_attn_temperature_scale(beta)
+                self.gguf_writer.add_attn_temperature_length(l4["original_max_position_embeddings"])
+            if "yarn" in hp:
+                # models/eagle.cpp reads the YaRN mscale via the deepseek2 convention (value / 0.1),
+                # so we must encode it the same way the mistral4/deepseek2 target does: 0.1 * mscale_all_dim.
+                # set_mistral_config wrote the bare mscale_all_dim; override it here.
+                mscale_all_dim = 1.0 if not hp["yarn"]["apply_scale"] else 0.0
+                self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * mscale_all_dim)
+            logger.info("EAGLE MLA: q_lora=%d kv_lora=%d qk_rope=%d qk_nope=%d v_head=%d" % (
+                hp["q_lora_rank"], hp["kv_lora_rank"], hp["qk_rope_head_dim"],
+                hp["qk_nope_head_dim"], hp["v_head_dim"]))
 
     @staticmethod
     def is_eagle_checkpoint(dir_model: Path) -> bool:
