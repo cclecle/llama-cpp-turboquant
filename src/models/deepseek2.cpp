@@ -467,6 +467,11 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // an EAGLE-1 draft (e.g. Mistral-Small-4-119B-EAGLE) needs this model's post-final-norm hidden
+    // state for *every* token, exposed at layer-input slot n_layer. Keep the last layer at full width
+    // and prune to the output rows only after the final norm (RMSNorm is row-wise, so unchanged).
+    const bool need_h_full = cparams.embeddings_layer_inp[n_layer];
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -641,7 +646,8 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+        if (il == n_layer - 1 && inp_out_ids && !need_h_full &&
+                (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -704,7 +710,13 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (need_h_full) {
+        // full-width post-final-norm hidden state, then subset for the lm_head below
+        res->t_layer_inp[n_layer] = cur;
+    }
+
+    // whichever of the two deferred the prune above, it happens exactly once here
+    if (inp_out_ids && (need_h_full || (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked))) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
