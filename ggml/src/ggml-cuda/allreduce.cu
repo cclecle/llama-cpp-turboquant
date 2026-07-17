@@ -952,13 +952,279 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#elif defined(GGML_USE_HIP)
 
-// HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and __nanosleep that this
-// implementation relies on, so the internal AllReduce is a CUDA-only feature.
-// The dispatcher in ggml-cuda.cu treats a nullptr pipeline as "init failed"
-// and silently falls back to the meta backend's generic AllReduce.
+// ---------------------------------------------------------------------------
+// HIP direct-P2P AllReduce for 2 RDNA GPUs over PCIe (no NVLink / RCCL).
+//
+// Each GPU publishes its (compute-gated) partial into its OWN peer-readable
+// VRAM buffer, then reads the peer's buffer DIRECTLY over PCIe (one traversal)
+// and sums in fp32 -- half the PCIe traffic of the host-staged CUDA path
+// (D2H + H2D = two traversals).
+//
+// Synchronisation is entirely device-side and built from per-block, device-
+// resident MONOTONIC generation counters plus two peer-written VRAM inboxes.
+// Two barriers per call give single-buffer safety without any host event sync:
+//
+//   * arrival   : peer has PUBLISHED gen g   -> safe to READ the peer's buffer.
+//   * departure : peer has finished READING our buffer at gen g-1
+//                 -> safe to OVERWRITE our buffer at gen g.
+//
+// Because the departure barrier makes buffer reuse explicit, ONE staging buffer
+// per device is correct -- no slot ring -- and it is correct whether the kernel
+// is launched eagerly (our case: the meta backend orchestrates the AR on the
+// host between per-subgraph graph replays) or is itself captured and replayed
+// (device-resident counters keep strictly increasing across replays). Signal
+// comparisons use signed wraparound, (int)(observed - target) < 0, valid for
+// the always-<=1 generation gap, so 32-bit counters never mis-order on wrap.
+//
+// Large (prefill-sized) reductions are handed back to the meta-backend butterfly
+// (ggml_cuda_ar_allreduce returns false): this kernel is latency-optimal but
+// does not overlap the peer transfer with compute, so butterfly wins there.
+// ---------------------------------------------------------------------------
+
+#include "convert.cuh"
+#include "ggml-impl.h"
+
+#include <cstddef>
+#include <cstdlib>
+#include <limits>
+
+// Blocks stripe the tensor so several CUs pump PCIe in parallel; each block runs
+// its own arrival/departure handshake on its own inbox slot. Kept small: the
+// decode-sized reductions this path handles are latency-bound, and every extra
+// block adds one more cross-GPU signal round-trip.
+static constexpr int GGML_CUDA_AR_HIP_BLOCKS  = 4;
+static constexpr int GGML_CUDA_AR_HIP_THREADS = 256;
+
+// Default size gate (bytes/device): tensors at or below this go through the
+// direct-P2P kernel; larger ones return false -> meta-backend butterfly. Also
+// sizes the single staging buffer per device. Covers batch=1 decode and typical
+// speculative-decode drafts (hidden x n_draft x 4B). Override via env.
+static constexpr size_t GGML_CUDA_AR_HIP_MAX_BYTES_DEFAULT = 1024 * 1024; // 1 MB
+
+static __device__ __forceinline__ void ggml_cuda_ar_hip_backoff() {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_s_sleep(2);
+#endif
+}
+
+template <typename T>
+static __global__ void ggml_cuda_ar_hip_kernel(
+        T       * __restrict__ data,          // in/out tensor shard (reduced in place)
+        T       * __restrict__ buf_mine,      // our peer-readable staging (published partial)
+        const T * __restrict__ buf_peer,      // peer's staging, read directly over P2P
+        int                    count,
+        int                    compute_mine,  // 1 = this shard contributed, 0 = contribute zeros
+        volatile int *         arrive_mine,   // our arrival inbox   [BLOCKS] (spin locally)
+        volatile int *         arrive_peer,   // peer's arrival inbox[BLOCKS] (signal over P2P)
+        volatile int *         depart_mine,   // our departure inbox [BLOCKS] (spin locally)
+        volatile int *         depart_peer,   // peer's departure inbox[BLOCKS] (signal over P2P)
+        int *                  gen) {         // our per-block device-resident counter [BLOCKS]
+
+    const int b    = blockIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gnt  = gridDim.x  * blockDim.x;
+
+    // This call's generation for this block. Only thread 0 of this block on this
+    // device ever touches gen[b], so the plain read-modify-write needs no atomic.
+    __shared__ int s_g;
+    if (threadIdx.x == 0) {
+        const int g = ++gen[b];
+        // (Departure) Do not overwrite buf_mine until the peer has finished
+        // reading it at gen g-1. depart_mine starts at 0, so gen 1 (waits >= 0)
+        // passes immediately.
+        while ((int)(depart_mine[b] - (g - 1)) < 0) {
+            ggml_cuda_ar_hip_backoff();
+        }
+        s_g = g;
+    }
+    __syncthreads();
+    const int g = s_g;
+
+    // Phase 1: publish our (compute-gated) partial into our own VRAM buffer.
+    for (int i = gtid; i < count; i += gnt) {
+        buf_mine[i] = compute_mine ? data[i] : (T) 0;
+    }
+    __threadfence_system();   // release: our writes are visible before we signal
+    __syncthreads();
+
+    // Phase 2 (arrival): publish gen g into the peer's inbox, then spin on our own
+    // inbox until the peer has likewise published gen g.
+    if (threadIdx.x == 0) {
+        arrive_peer[b] = g;
+        __threadfence_system();   // push our arrival signal system-wide
+        while ((int)(arrive_mine[b] - g) < 0) {
+            ggml_cuda_ar_hip_backoff();
+        }
+    }
+    __syncthreads();
+    __threadfence_system();   // acquire: observe the peer's published data
+
+    // Phase 3: read the peer buffer over P2P, sum in fp32, write back in place.
+    // Both operands come from the two staging buffers (already compute-gated), so
+    // both GPUs evaluate cast(float(a) + float(b)) with commutative operands and
+    // produce bit-identical results.
+    for (int i = gtid; i < count; i += gnt) {
+        const float mine = ggml_cuda_cast<float>(buf_mine[i]);
+        const float peer = ggml_cuda_cast<float>(buf_peer[i]);
+        data[i] = ggml_cuda_cast<T>(mine + peer);
+    }
+    __syncthreads();   // every thread has finished reading buf_peer
+
+    // Phase 4 (departure): tell the peer we are done reading its buffer at gen g,
+    // so it may overwrite that buffer on its next AllReduce.
+    if (threadIdx.x == 0) {
+        depart_peer[b] = g;
+        __threadfence_system();   // push our departure signal system-wide
+    }
+}
+
+struct ggml_cuda_ar_pipeline {
+    int    n_devices;
+    int    devices[2];
+    size_t max_bytes;    // size gate + staging-buffer size (bytes per device)
+    char * buf[2];       // peer-readable staging, max_bytes each
+    int  * arrive[2];    // [BLOCKS] arrival   inbox per device (peer writes, we spin)
+    int  * depart[2];    // [BLOCKS] departure inbox per device (peer writes, we spin)
+    int  * gen[2];       // [BLOCKS] device-resident monotonic counter per device
+};
+
+ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
+    if (n_devices != 2) {
+        return nullptr;
+    }
+
+    // Require working bidirectional P2P; otherwise let the caller fall back to
+    // the meta-backend butterfly.
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        int can = 0;
+        ggml_cuda_set_device(devices[i]);
+        if (hipDeviceCanAccessPeer(&can, devices[i], devices[peer]) != hipSuccess || !can) {
+            (void) hipGetLastError();
+            return nullptr;
+        }
+        const hipError_t e = hipDeviceEnablePeerAccess(devices[peer], 0);
+        if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+            (void) hipGetLastError();
+            return nullptr;
+        }
+        // hipDeviceEnablePeerAccess leaves a sticky last-error when peer access
+        // was already enabled; clear it so the next unrelated kernel launch's
+        // error check does not trip on it.
+        (void) hipGetLastError();
+    }
+
+    size_t max_bytes = GGML_CUDA_AR_HIP_MAX_BYTES_DEFAULT;
+    if (const char * e = getenv("GGML_CUDA_AR_HIP_MAX_BYTES")) {
+        const unsigned long long v = strtoull(e, nullptr, 10);
+        if (v > 0) {
+            max_bytes = (size_t) v;
+        }
+    }
+
+    auto * p = new ggml_cuda_ar_pipeline{};
+    p->n_devices  = 2;
+    p->devices[0] = devices[0];
+    p->devices[1] = devices[1];
+    p->max_bytes  = max_bytes;
+
+    const size_t inbox_bytes = (size_t) GGML_CUDA_AR_HIP_BLOCKS * sizeof(int);
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(devices[i]);
+        const bool ok =
+            hipMalloc((void **) &p->buf[i],    max_bytes)   == hipSuccess &&
+            hipMalloc((void **) &p->arrive[i], inbox_bytes) == hipSuccess &&
+            hipMalloc((void **) &p->depart[i], inbox_bytes) == hipSuccess &&
+            hipMalloc((void **) &p->gen[i],    inbox_bytes) == hipSuccess &&
+            hipMemset(p->arrive[i], 0, inbox_bytes) == hipSuccess &&
+            hipMemset(p->depart[i], 0, inbox_bytes) == hipSuccess &&
+            hipMemset(p->gen[i],    0, inbox_bytes) == hipSuccess;
+        if (!ok) {
+            GGML_LOG_ERROR("%s: HIP AllReduce buffer alloc failed on device %d\n",
+                           __func__, devices[i]);
+            (void) hipGetLastError();
+            ggml_cuda_ar_pipeline_free(p);   // frees whatever was allocated (null-safe)
+            return nullptr;
+        }
+    }
+
+    GGML_LOG_INFO("%s: HIP direct-P2P AllReduce ready (2 GPUs, %zu KB/device staging)\n",
+                  __func__, max_bytes >> 10);
+    return p;
+}
+
+void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
+    if (!p) {
+        return;
+    }
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        hipDeviceSynchronize();   // drain any in-flight kernel before freeing
+        if (p->buf[i])    { hipFree(p->buf[i]); }
+        if (p->arrive[i]) { hipFree(p->arrive[i]); }
+        if (p->depart[i]) { hipFree(p->depart[i]); }
+        if (p->gen[i])    { hipFree(p->gen[i]); }
+    }
+    delete p;
+}
+
+template <typename T>
+static void ggml_cuda_ar_hip_launch(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
+                                    ggml_tensor ** tensors, int64_t ne) {
+    // ne is bounded by max_bytes / sizeof(T) (checked in ggml_cuda_ar_allreduce),
+    // so a single launch covers the whole tensor -- no chunking.
+    const int count = (int) ne;
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        auto * ctx = (ggml_backend_cuda_context *) backends[i]->context;
+        ggml_cuda_set_device(p->devices[i]);
+
+        T * const       data     = (T *) tensors[i]->data;
+        T * const       buf_mine = (T *) p->buf[i];
+        const T * const buf_peer = (const T *) p->buf[peer];
+        const int       compute  = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+        ggml_cuda_ar_hip_kernel<T>
+            <<<GGML_CUDA_AR_HIP_BLOCKS, GGML_CUDA_AR_HIP_THREADS, 0, ctx->stream()>>>(
+                data, buf_mine, buf_peer, count, compute,
+                p->arrive[i], p->arrive[peer],
+                p->depart[i], p->depart[peer],
+                p->gen[i]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends,
+                            ggml_tensor ** tensors) {
+    GGML_ASSERT(p != nullptr && p->n_devices == 2);
+
+    // Type / contiguity / 16B-alignment / ne==0 are pre-checked by the CUDA comm
+    // dispatcher before this is called; here we only apply the size gate.
+    //
+    // Size gate: hand large (prefill) reductions back to the meta-backend
+    // butterfly, which overlaps the transfer with compute. The direct-P2P kernel
+    // is latency-optimal but does not overlap, so it regresses there.
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    if (nbytes > p->max_bytes) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    GGML_ASSERT(ne > 0 && ne <= (int64_t) std::numeric_limits<int>::max());
+
+    switch (tensors[0]->type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_hip_launch<float>      (p, backends, tensors, ne); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_hip_launch<half>       (p, backends, tensors, ne); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_hip_launch<nv_bfloat16>(p, backends, tensors, ne); break;
+        default: return false;
+    }
+    return true;
+}
+
+#else // MUSA: internal AllReduce stays CUDA/HIP-only; keep the stub.
+
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
     return nullptr;
 }
