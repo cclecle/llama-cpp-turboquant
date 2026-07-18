@@ -2536,24 +2536,39 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
-                    // Append context checkpoints to the same file so they survive a
-                    // model swap + reload.  Models whose memory does not support partial
-                    // sequence removal (e.g. hybrid attention/recurrent like Qwen3) need
-                    // checkpoints to reuse the KV cache on the next turn after a restore.
-                    // Format: [version u32][n_ckpts u32][per-ckpt data...][section_offset u64][magic u64]
-                    // The 16-byte footer lets the reader locate the section without
-                    // scanning; old files without the footer load unchanged.
-                    if (nwrite > 0 && !slot->prompt.checkpoints.empty()) {
+                    // Append a trailer to the same file so it survives a model swap + reload.
+                    // It carries (a) the FULL draft KV state and (b) context checkpoints.
+                    // llama_state_seq_save_file() above only persists the TARGET; the draft has
+                    // no equivalent, so without (a) a restore brings the target back full while
+                    // the draft comes back empty (ctx_dft pos_max=-1) and the drafter goes inert
+                    // on the continuation turn. Checkpoints (b) are still needed by models whose
+                    // memory does not support partial sequence removal (hybrid/recurrent, SWA).
+                    // Format: [version u32][draft_sz u64][draft data][n_ckpts u32][per-ckpt data...]
+                    //         [section_offset u64][magic u64]
+                    // The 16-byte footer lets the reader locate the section without scanning.
+                    if (nwrite > 0 && (ctx_dft != nullptr || !slot->prompt.checkpoints.empty())) {
                         // "SLTCKPT1" magic — chosen to be detectable at file end
                         static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
 
                         FILE * fcf = std::fopen(filepath.c_str(), "ab");
                         if (fcf) {
                             const uint64_t section_offset = static_cast<uint64_t>(nwrite);
-                            const uint32_t ckpt_version   = 2;
+                            const uint32_t ckpt_version   = 3; // v3: full draft-state blob precedes the checkpoints
                             const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
 
                             std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+
+                            // (a) full draft KV state (flags = 0), so the restored draft matches the target
+                            uint64_t draft_sz = 0;
+                            std::vector<uint8_t> draft_buf;
+                            if (ctx_dft) {
+                                const size_t cap = llama_state_seq_get_size_ext(ctx_dft, slot->id, 0);
+                                draft_buf.resize(cap);
+                                draft_sz = (uint64_t) llama_state_seq_get_data_ext(ctx_dft, draft_buf.data(), cap, slot->id, 0);
+                            }
+                            std::fwrite(&draft_sz, sizeof(draft_sz), 1, fcf);
+                            if (draft_sz > 0) { std::fwrite(draft_buf.data(), 1, draft_sz, fcf); }
+
                             std::fwrite(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
 
                             for (const auto & ckpt : slot->prompt.checkpoints) {
@@ -2578,7 +2593,8 @@ private:
                             std::fwrite(&SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC), 1, fcf);
                             std::fclose(fcf);
 
-                            SRV_INF("slot %d: saved %u context checkpoints to %s\n", id_slot, n_ckpts, filename.c_str());
+                            SRV_INF("slot %d: saved draft state (%.2f MiB) + %u context checkpoints to %s\n",
+                                    id_slot, draft_sz / (1024.0 * 1024.0), n_ckpts, filename.c_str());
                         }
                     }
 
@@ -2659,9 +2675,31 @@ private:
                                         uint32_t ckpt_version = 0;
                                         uint32_t n_ckpts      = 0;
                                         std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+
+                                        // v3: a full draft-state blob precedes the checkpoints. Restore it
+                                        // directly into ctx_dft here — the reuse path does not re-apply the
+                                        // draft on a clean continuation (n_past == full prompt), which is
+                                        // exactly when the drafter would otherwise start empty (pos_max=-1).
+                                        if (ckpt_version == 3) {
+                                            uint64_t draft_sz = 0;
+                                            if (std::fread(&draft_sz, sizeof(draft_sz), 1, fcf) == 1 && draft_sz > 0) {
+                                                std::vector<uint8_t> draft_buf(draft_sz);
+                                                if (std::fread(draft_buf.data(), 1, draft_sz, fcf) == draft_sz && ctx_dft) {
+                                                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, draft_buf.data(), draft_sz, slot->id, 0);
+                                                    if (n != draft_sz) {
+                                                        SRV_WRN("slot %d: draft state restore mismatch (%zu != %" PRIu64 ")\n",
+                                                                id_slot, n, draft_sz);
+                                                    } else {
+                                                        SRV_INF("slot %d: restored draft state (%.2f MiB) from %s\n",
+                                                                id_slot, draft_sz / (1024.0 * 1024.0), filename.c_str());
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         std::fread(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
 
-                                        if (ckpt_version == 2) {
+                                        if (ckpt_version == 2 || ckpt_version == 3) {
                                             bool ok = true;
                                             for (uint32_t ci = 0; ci < n_ckpts && ok; ++ci) {
                                                 common_prompt_checkpoint ckpt;
