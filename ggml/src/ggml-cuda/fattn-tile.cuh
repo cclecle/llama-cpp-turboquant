@@ -830,8 +830,14 @@ static __global__ void flash_attn_tile(
             // Keep ncols2 != 1 TILE variants that have no WMMA-f16 equivalent: the MLA shapes
             // DKQ=192/DV=128 and DKQ=320/DV=256 are routed to TILE (WMMA lacks those head sizes),
             // so they must not be compiled as NO_DEVICE_CODE here.
-            (ncols2 != 1 && DV != 40 && DV != 72 && DV != 512
-                && !(DKQ == 192 && DV == 128) && !(DKQ == 320 && DV == 256)) ||
+            // NOTE: pruning by "WMMA covers this shape" is only sound while WMMA is guaranteed to
+            // run. Since ggml_cuda_should_use_wmma_fattn can now be disabled at *runtime*
+            // (--rocwmma-fattn / GGML_HIP_ROCWMMA_FATTN), the dispatcher may legitimately route any
+            // of these shapes to TILE in a binary that was built with WMMA enabled. Compiling them
+            // as NO_DEVICE_CODE then traps at runtime, e.g. head 256 (Qwen3.6-27B, ncols2=2) hits
+            // "flash_attn_tile has no device code compatible with HIP arch 1300".
+            // Keep every variant; this only costs compile time.
+            false ||
 #endif // GGML_USE_WMMA_FATTN
             (use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))
     ) {
