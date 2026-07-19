@@ -1029,13 +1029,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // x_df and x_sc are indexed only by the row i and by k01, never by j0, yet the straightforward
+    // version reads both from SRAM once per accumulator element of every MMA tile. At J=128 that is
+    // 1024 SRAM loads per 64 MMAs, against the 256 the generic q8_1 path issues for the same 64 MMAs,
+    // and it is what makes q6_K roughly half the speed of q5_K here despite an identical tile config.
+    // Folding the row scale and the per-16-element scale together once per k01 leaves the innermost
+    // loop with no SRAM traffic at all, for ntx*ne extra registers.
+    //
+    // Two things here are load bearing, both measured on gfx1201:
+    //  - the k01 loop stays rolled. Forcing it to unroll lets the compiler pipeline all 64 MMAs at
+    //    once, which costs 256 VGPRs and 432 bytes/lane of scratch and is 8x slower than the original.
+    //  - the two K=4 tiles of a k01 pair are not fused. Sharing their B fragments and dB looks like a
+    //    free win but needs two live tile_C, and that spills for the same reason.
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
+        float scdA[ntx][tile_C::ne];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
+                scdA[n][l] = sc[k01/4] * x_df[i*sram_stride];
+            }
         }
 
 #pragma unroll
@@ -1053,9 +1073,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * scdA[n][l] * dB;
                 }
             }
         }
