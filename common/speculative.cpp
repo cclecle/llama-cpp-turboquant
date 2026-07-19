@@ -685,13 +685,27 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             //   2) pending_pos_last + 1 == pos[beg]
             //   3) pending_pos_last > dft_pos_max // TODO: is this check needed?
             const llama_pos pending_pos = pending_pos_last[seq_id];
-            if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {
-                const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-                if (pending_pos > dft_pos_max) {
-                    common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
-                                pending_g_last[seq_id].data(), row_bytes);
-                }
+            const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+            bool bridged = false;
+            if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg] && pending_pos > dft_pos_max) {
+                common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
+                            pending_g_last[seq_id].data(), row_bytes);
+                bridged = true;
+            }
+
+            // See the EAGLE-1 impl for the reasoning, including why "covered" has to account for the
+            // bridge row that is still only in the batch and not yet in ctx_dft's memory.
+            const llama_pos covered = bridged ? pending_pos : dft_pos_max;
+            if (covered >= 0 && covered + 1 < batch_in.pos[beg]) {
+                SPC_ERR("draft KV has an unbridgeable gap for seq %d (covered=%d, batch starts at %d); "
+                        "discarding the draft state for this sequence\n",
+                        (int) seq_id, (int) covered, (int) batch_in.pos[beg]);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                pending_pos_last[seq_id] = -1;
+                verify_g_rows[seq_id]    = 0;
+                continue;
             }
 
             for (int32_t k = beg; k < end; ++k) {
@@ -866,11 +880,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     (size_t) n_embd_dec * sizeof(float));
     }
 
-    // we only need to stash the deferred boundary's g_embd row for recurrent/hybrid targets:
-    // their single-position checkpoints drop it on restore
+    // See the identical note in the EAGLE-1 impl: the boundary row lives only in this object, so it
+    // has to be stashed for every target now that the draft KV survives a process restart in full.
     bool need_boundary_stash() const {
-        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
-        return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+        return true;
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
@@ -1109,13 +1122,36 @@ struct common_speculative_impl_draft_eagle : public common_speculative_impl {
             }
 
             const llama_pos pending_pos = pending_pos_last[seq_id];
-            if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {
-                const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-                if (pending_pos > dft_pos_max) {
-                    common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
-                                pending_h_last[seq_id].data(), row_bytes);
-                }
+            const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+            bool bridged = false;
+            if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg] && pending_pos > dft_pos_max) {
+                common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
+                            pending_h_last[seq_id].data(), row_bytes);
+                bridged = true;
+            }
+
+            // The bridge above is the only thing that can fill the deferred boundary, and it needs a
+            // stashed h row. If it did not fire and ctx_dft is still short of this batch, the draft
+            // KV has a hole we cannot fill: h for the missing position is not recoverable (it would
+            // need the target's hidden state for a token that is already behind us). Decoding anyway
+            // fails the Y == X+1 check and kills the whole request, so drop this sequence's draft KV
+            // and let it rebuild from here - speculation is lost for a turn, the request survives.
+            //
+            // "covered" must include the bridge row: it has only been added to the batch, which is
+            // not decoded until the end of this function, so seq_pos_max() still reports the value
+            // from before the bridge. Comparing against that directly reports a phantom gap on every
+            // successful bridge and throws away a draft state that was about to become valid.
+            const llama_pos covered = bridged ? pending_pos : dft_pos_max;
+            if (covered >= 0 && covered + 1 < batch_in.pos[beg]) {
+                SPC_ERR("draft KV has an unbridgeable gap for seq %d (covered=%d, batch starts at %d); "
+                        "discarding the draft state for this sequence\n",
+                        (int) seq_id, (int) covered, (int) batch_in.pos[beg]);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                pending_pos_last[seq_id] = -1;
+                verify_h_rows[seq_id]    = 0;
+                continue;
             }
 
             for (int32_t k = beg; k < end; ++k) {
@@ -1279,11 +1315,14 @@ struct common_speculative_impl_draft_eagle : public common_speculative_impl {
                     (size_t) n_embd_dec * sizeof(float));
     }
 
-    // we only need to stash the deferred boundary's h row for recurrent/hybrid targets:
-    // their single-position checkpoints drop it on restore
+    // The deferred boundary must be stashed for every target, not just recurrent/hybrid ones.
+    // It used to be needed only for those because the draft was persisted solely through context
+    // checkpoints, and a rollback on a normal transformer re-derived the boundary by replay. Once
+    // the draft KV started being saved and restored in full across a process restart there is no
+    // replay to re-derive it: the boundary row lives only in this object, so dropping it leaves
+    // ctx_dft one position short of the target and the next batch fails the Y == X+1 check.
     bool need_boundary_stash() const {
-        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
-        return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+        return true;
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
