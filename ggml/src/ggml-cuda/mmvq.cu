@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvk.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1431,6 +1432,17 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    // On RDNA4 the K-quants are faster dequantised to float than fed through the integer-dot path,
+    // and that route also skips the q8_1 activation quantisation below entirely. Every caller of
+    // this function, fused ones included, goes through here.
+    {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (ggml_cuda_should_use_mmvk(src0->type, cc, ids ? ne2 : ne1)) {
+            ggml_cuda_mul_mat_vec_k(ctx, src0, src1, ids, dst, fusion_local);
+            return;
         }
     }
 
