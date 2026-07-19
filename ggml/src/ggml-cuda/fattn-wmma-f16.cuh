@@ -2,6 +2,8 @@
 
 #include "common.cuh"
 
+#include <cstdlib>
+
 #if defined(GGML_USE_MUSA)
 #define GGML_USE_WMMA_FATTN
 #endif // defined(GGML_USE_MUSA)
@@ -23,7 +25,36 @@
 #endif // defined(GGML_HIP_ROCWMMA_FATTN)
 
 // WMMA flash attention requires FP16 matrix instructions to be available for ggml code.
+// Runtime override on top of the compile-time flag. The rocWMMA path preempts the native MMA path
+// below it in ggml_cuda_get_best_fattn_kernel, and which one wins is model dependent: measured on
+// gfx1201 at pp512 @ d32768, rocWMMA is 42% SLOWER on Mistral-family dense models (Devstral,
+// Magistral) but 36% FASTER on Qwen3.6-27B, while MLA models are unaffected. Until the dispatch
+// becomes shape-aware this lets it be selected per run/per model instead of per build.
+// 1/on/true forces it on (still requires the compile-time support), 0/off/false forces it off.
+static bool ggml_cuda_rocwmma_fattn_override(bool & out) {
+    static const int val = []() {
+        const char * s = getenv("GGML_HIP_ROCWMMA_FATTN");
+        if (!s || !*s) {
+            return -1;
+        }
+        if (s[0] == '0' || s[0] == 'f' || s[0] == 'F' || s[0] == 'n' || s[0] == 'N') {
+            return 0;
+        }
+        return 1;
+    }();
+    if (val < 0) {
+        return false;
+    }
+    out = val != 0;
+    return true;
+}
+
 static bool ggml_cuda_should_use_wmma_fattn(const int cc) {
+    bool forced = false;
+    if (ggml_cuda_rocwmma_fattn_override(forced) && !forced) {
+        return false; // forcing on can never enable a path that was not compiled in, so only
+                      // the disable direction is honoured unconditionally here
+    }
 #if defined(GGML_USE_HIP) && !defined(GGML_HIP_ROCWMMA_FATTN)
     return false;
 #else
