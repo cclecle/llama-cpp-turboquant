@@ -2177,6 +2177,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--rocwmma-fattn"}, "on|off",
+        "ROCm/HIP only: whether flash attention uses the rocWMMA path instead of the native MMA one.\n"
+        "Which is faster is model dependent - measured on gfx1201 at long context, rocWMMA is ~42%% slower\n"
+        "on Mistral-family dense models but ~36%% faster on Qwen3.6-27B; MLA models are unaffected.\n"
+        "Only takes effect if the backend was built with GGML_HIP_ROCWMMA_FATTN (default: build setting)",
+        [](common_params & params, const std::string & value) {
+            const bool on = value == "on" || value == "1" || value == "true";
+            if (!on && value != "off" && value != "0" && value != "false") {
+                throw std::invalid_argument("expected on|off");
+            }
+            // consumed by ggml_cuda_should_use_wmma_fattn in the CUDA/HIP backend
+            setenv("GGML_HIP_ROCWMMA_FATTN", on ? "1" : "0", 1);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_ROCWMMA_FATTN"));
+    add_opt(common_arg(
         {"-nckvl", "--n-cpu-kv-layers"}, "N",
         string_format(
             "keep the KV cache of the first N layers in host RAM instead of VRAM (default: %d)\n"

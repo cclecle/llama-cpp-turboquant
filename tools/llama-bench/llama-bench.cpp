@@ -458,6 +458,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
+    printf("  --rocwmma-fattn <0|1>                       ROCm only, rocWMMA vs native MMA flash attention (default: build setting)\n");
     printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
@@ -782,6 +783,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_kv_offload.insert(params.no_kv_offload.end(), p.begin(), p.end());
+            } else if (arg == "--rocwmma-fattn") {
+                // ROCm/HIP only: pick the rocWMMA flash-attention path over the native MMA one.
+                // Read by ggml_cuda_should_use_wmma_fattn; only meaningful if the backend was
+                // built with GGML_HIP_ROCWMMA_FATTN.
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                setenv("GGML_HIP_ROCWMMA_FATTN", argv[i], 1);
             } else if (arg == "--numa") {
                 if (++i >= argc) {
                     invalid_param = true;
