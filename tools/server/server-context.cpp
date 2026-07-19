@@ -2594,8 +2594,8 @@ private:
                     // the draft comes back empty (ctx_dft pos_max=-1) and the drafter goes inert
                     // on the continuation turn. Checkpoints (b) are still needed by models whose
                     // memory does not support partial sequence removal (hybrid/recurrent, SWA).
-                    // Format: [version u32][draft_sz u64][draft data][n_ckpts u32][per-ckpt data...]
-                    //         [section_offset u64][magic u64]
+                    // Format: [version u32][draft_sz u64][draft data][spec_sz u64][spec data]
+                    //         [n_ckpts u32][per-ckpt data...][section_offset u64][magic u64]
                     // The 16-byte footer lets the reader locate the section without scanning.
                     if (nwrite > 0 && (ctx_dft != nullptr || !slot->prompt.checkpoints.empty())) {
                         // "SLTCKPT1" magic — chosen to be detectable at file end
@@ -2604,7 +2604,7 @@ private:
                         FILE * fcf = std::fopen(filepath.c_str(), "ab");
                         if (fcf) {
                             const uint64_t section_offset = static_cast<uint64_t>(nwrite);
-                            const uint32_t ckpt_version   = 3; // v3: full draft-state blob precedes the checkpoints
+                            const uint32_t ckpt_version   = 4; // v4: draft blob + speculative boundary state
                             const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
 
                             std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
@@ -2619,6 +2619,18 @@ private:
                             }
                             std::fwrite(&draft_sz, sizeof(draft_sz), 1, fcf);
                             if (draft_sz > 0) { std::fwrite(draft_buf.data(), 1, draft_sz, fcf); }
+
+                            // (b) the drafter's deferred boundary. EAGLE writes draft memory pos P from
+                            // the pair (token[P+1], h[P]), so the last position of every batch cannot be
+                            // written yet and is held in the drafter object instead. The draft KV in (a)
+                            // is therefore always one position short of the target, and that row is not
+                            // recoverable by replay - without it the restored drafter cannot bridge the
+                            // gap and the next decode fails the Y == X+1 check.
+                            std::vector<uint8_t> spec_buf;
+                            common_speculative_get_state(spec.get(), slot->id, spec_buf);
+                            const uint64_t spec_sz = static_cast<uint64_t>(spec_buf.size());
+                            std::fwrite(&spec_sz, sizeof(spec_sz), 1, fcf);
+                            if (spec_sz > 0) { std::fwrite(spec_buf.data(), 1, spec_sz, fcf); }
 
                             std::fwrite(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
 
@@ -2644,8 +2656,8 @@ private:
                             std::fwrite(&SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC), 1, fcf);
                             std::fclose(fcf);
 
-                            SRV_INF("slot %d: saved draft state (%.2f MiB) + %u context checkpoints to %s\n",
-                                    id_slot, draft_sz / (1024.0 * 1024.0), n_ckpts, filename.c_str());
+                            SRV_INF("slot %d: saved draft state (%.2f MiB, boundary %" PRIu64 " B) + %u context checkpoints to %s\n",
+                                    id_slot, draft_sz / (1024.0 * 1024.0), spec_sz, n_ckpts, filename.c_str());
                         }
                     }
 
@@ -2745,11 +2757,20 @@ private:
                                         uint32_t n_ckpts      = 0;
                                         std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
 
-                                        // v3: a full draft-state blob precedes the checkpoints. Restore it
-                                        // directly into ctx_dft here — the reuse path does not re-apply the
-                                        // draft on a clean continuation (n_past == full prompt), which is
-                                        // exactly when the drafter would otherwise start empty (pos_max=-1).
-                                        if (ckpt_version == 3) {
+                                        // v4: a full draft-state blob and the drafter's deferred boundary
+                                        // precede the checkpoints. Restore both directly here — the reuse
+                                        // path does not re-apply the draft on a clean continuation
+                                        // (n_past == full prompt), which is exactly when the drafter would
+                                        // otherwise start empty (pos_max=-1).
+                                        //
+                                        // Anything other than v4 is not readable: the layout differs from
+                                        // this point on, so parsing further would misread the checkpoint
+                                        // table. Skip the section entirely and let the slot rebuild.
+                                        if (ckpt_version != 4) {
+                                            SRV_WRN("slot %d: ignoring checkpoint section of unsupported version %u in %s "
+                                                    "(delete stale slot cache files after a format change)\n",
+                                                    id_slot, ckpt_version, filename.c_str());
+                                        } else {
                                             uint64_t draft_sz = 0;
                                             if (std::fread(&draft_sz, sizeof(draft_sz), 1, fcf) == 1 && draft_sz > 0) {
                                                 std::vector<uint8_t> draft_buf(draft_sz);
@@ -2764,11 +2785,22 @@ private:
                                                     }
                                                 }
                                             }
+
+                                            // the deferred boundary that completes the draft KV above
+                                            uint64_t spec_sz = 0;
+                                            if (std::fread(&spec_sz, sizeof(spec_sz), 1, fcf) == 1 && spec_sz > 0) {
+                                                std::vector<uint8_t> spec_buf(spec_sz);
+                                                if (std::fread(spec_buf.data(), 1, spec_sz, fcf) == spec_sz) {
+                                                    common_speculative_set_state(spec.get(), slot->id, spec_buf);
+                                                    SRV_INF("slot %d: restored draft boundary (%" PRIu64 " B) from %s\n",
+                                                            id_slot, spec_sz, filename.c_str());
+                                                }
+                                            }
                                         }
 
-                                        std::fread(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
+                                        if (ckpt_version == 4) {
+                                            std::fread(&n_ckpts, sizeof(n_ckpts), 1, fcf);
 
-                                        if (ckpt_version == 2 || ckpt_version == 3) {
                                             bool ok = true;
                                             for (uint32_t ci = 0; ci < n_ckpts && ok; ++ci) {
                                                 common_prompt_checkpoint ckpt;
