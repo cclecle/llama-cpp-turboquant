@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-mla-decode.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -495,6 +496,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MLA_DECODE = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -606,6 +608,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // Decode-only MLA kernel: one block covers every Q head, so each KV row is fetched once and V,
+    // which aliases the first DV dims of K, costs no extra memory traffic. Restricted to q8_0
+    // because there it also consumes K natively and skips the f16 materialization of the whole KV
+    // cache that the tile kernel forces; for f16 K it measured slightly slower than tile.
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && K->ne[0] == 576 && V->ne[0] == 512 &&
+            Q->ne[1] == 1 && K->ne[2] == 1 && gqa_ratio == 20 && gqa_opt_applies &&
+            !dst->src[4] && K->ne[1] % MLA_DEC_KQ_TILE == 0 && K->type == GGML_TYPE_Q8_0) {
+        return BEST_FATTN_KERNEL_MLA_DECODE;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -708,6 +720,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MLA_DECODE:
+            // q8_0 is read natively; V is never read, it aliases the first DV dims of K.
+            need_f16_K = K->type != GGML_TYPE_Q8_0;
+            break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -736,6 +752,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MLA_DECODE:
+            ggml_cuda_flash_attn_ext_mla_decode(ctx, dst);
             break;
     }
 }
