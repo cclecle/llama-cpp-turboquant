@@ -805,6 +805,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    // hipMemcpy2DAsync H2D runs at ~21-26 GB/s when both pitches are multiples of 4 and at
+    // ~0.06 GB/s when either one is not; the width and the row count do not matter. The
+    // --split-mode tensor scatter hits the slow path with q6_K, whose 210-byte block leaves both
+    // pitches odd, and a 35B MoE then took 160 s to load against 2 s for --split-mode layer.
+    // When the destination rows are contiguous (stride_tensor == size) the whole write is one
+    // contiguous range, so gather the strided source host-side and issue a single transfer.
+    if (stride_tensor == size && n_copies > 1 && (stride_tensor % 4 != 0 || stride_data % 4 != 0)) {
+        std::vector<char> staging(size * n_copies);
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(staging.data() + i*size, (const char *) data + i*stride_data, size);
+        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, staging.data(),
+            size*n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
