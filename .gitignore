@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# validation harness output: derived from /opt at run time, environment-specific
+validation/presets/
+validation/reference.json

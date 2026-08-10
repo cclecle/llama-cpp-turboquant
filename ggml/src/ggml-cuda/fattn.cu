@@ -681,6 +681,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
+    // Do NOT raise this cap to 256 to recover the D=256 shapes that lost their matrix path when
+    // rocWMMA FlashAttention was removed (#26046). It was tried and it aborts: fattn-mma-f16.cuh
+    // prunes the kernel body itself with `DKQ > 128 -> NO_DEVICE_CODE` under AMD_WMMA_AVAILABLE
+    // (AMD_MFMA_AVAILABLE allows 256, RDNA does not), so the DKQ=256 instance links but has no
+    // device code for gfx1201 and the HSA queue faults. Recovering D=256 needs the kernel to
+    // support it, not the dispatch to allow it.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
