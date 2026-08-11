@@ -2422,8 +2422,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--rocwmma-fattn"}, "on|off",
         "ROCm/HIP only: whether flash attention uses the rocWMMA path instead of the native MMA one.\n"
-        "Which is faster is model dependent - measured on gfx1201 at long context, rocWMMA is ~42%% slower\n"
-        "on Mistral-family dense models but ~36%% faster on Qwen3.6-27B; MLA models are unaffected.\n"
+        "Which is faster is model dependent - measured on gfx1201 at long context, rocWMMA is ~42% slower\n"
+        "on Mistral-family dense models but ~36% faster on Qwen3.6-27B; MLA models are unaffected.\n"
         "Only takes effect if the backend was built with GGML_HIP_ROCWMMA_FATTN (default: build setting)",
         [](common_params & params, const std::string & value) {
             const bool on = value == "on" || value == "1" || value == "true";
@@ -2431,10 +2431,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("expected on|off");
             }
             // consumed by ggml_cuda_should_use_wmma_fattn in the CUDA/HIP backend
-            setenv("GGML_HIP_ROCWMMA_FATTN", on ? "1" : "0", 1);
+            common_set_env("GGML_HIP_ROCWMMA_FATTN", on ? "1" : "0");
             GGML_UNUSED(params);
         }
     ).set_env("LLAMA_ARG_ROCWMMA_FATTN"));
+    add_opt(common_arg(
+        {"--op-offload-min-batch"}, "N",
+        "minimum batch size for an op with host RAM weights to be offloaded to the GPU (default: 32)\n"
+        "only applies to weights kept on the CPU by -ot or a partial -ngl; below it the op runs on the CPU\n"
+        "measured on gfx1201 with MoE experts on the CPU, the CPU stays faster up to ~400 tokens\n"
+        "keep this at or below --ubatch-size, else all prompt processing for those weights runs on the CPU",
+        [](common_params & params, int value) {
+            // consumed by ggml_backend_*_device_offload_op in the GPU backends
+            common_set_env("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(value));
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_OP_OFFLOAD_MIN_BATCH"));
     add_opt(common_arg(
         {"-nckvl", "--n-cpu-kv-layers"}, "N",
         string_format(
