@@ -67,6 +67,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
 | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
 | `-nckvl, --n-cpu-kv-layers N` | keep the KV cache of the first N layers in host RAM instead of VRAM (default: 0). A hybrid alternative to the all-or-nothing `--no-kv-offload`: fill whatever VRAM is left with KV and spill only the remainder to host RAM.<br/>(env: LLAMA_ARG_N_CPU_KV_LAYERS) |
+| `--op-offload-min-batch N` | minimum batch size for an op with host RAM weights to be offloaded to the GPU (default: 32). Only applies to weights kept on the CPU by `-ot` or a partial `-ngl`; below it the op runs on the CPU. Measured on gfx1201 with MoE experts on the CPU, the CPU stays faster up to ~400 tokens. Keep this at or below `--ubatch-size`, else all prompt processing for those weights runs on the CPU.<br/>(env: LLAMA_ARG_OP_OFFLOAD_MIN_BATCH) |
 | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
