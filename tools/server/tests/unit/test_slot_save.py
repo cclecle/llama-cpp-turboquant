@@ -164,6 +164,11 @@ def test_slot_erase():
 # A pure-text slot on a multimodal server and a slot containing images must both support save/restore.
 # Erase remains gated on the slot's content.
 #
+# The media chunks travel in the state payload itself, via server_tokens::serialize().
+# The save file trailer adds an encoder fingerprint, so a file written under a different
+# mmproj - or different image token limits - is rejected instead of reusing KV that
+# another encoder produced.
+#
 
 IMG_URL_CAT = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
 IMG_URL_TRUCK = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
@@ -527,3 +532,49 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+def test_slot_restore_media_file_from_another_encoder(mmproj_server):
+    server = mmproj_server
+    server.start()
+
+    res = server.make_request("POST", "/completions", data={
+        "temperature": 0.0,
+        "top_k": 1,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "prompt": {
+            "prompt_string": "What is this: <__media__>\n",
+            "multimodal_data": [_get_img_base64(IMG_URL_CAT)],
+        },
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "mm_slot_fingerprint.bin",
+    })
+    assert res.status_code == 200
+
+    # the image token limits change how many tokens an image expands to, so the KV in the file
+    # no longer describes what this server would produce. the chunk ids hash the media bytes
+    # alone and would still match, so only the fingerprint can catch this.
+    server.stop()
+    server.image_min_tokens = 64
+    server.image_max_tokens = 64
+    server.start()
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "mm_slot_fingerprint.bin",
+    })
+    assert res.status_code == 400
+    assert "different multimodal projector" in res.body["error"]["message"]
+
+    # a rejected restore must leave the slot usable
+    res = server.make_request("POST", "/completions", data={
+        "temperature": 0.0,
+        "top_k": 1,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "prompt": "The quick brown fox",
+    })
+    assert res.status_code == 200

@@ -165,6 +165,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
+| `--mtmd-checkpoints, --no-mtmd-checkpoints` | allow context checkpoints on batches that processed image/audio chunks (default: disabled)<br/>without them, a restored multimodal prompt on an SWA or hybrid model finds no checkpoint to<br/>roll back to and falls back to re-processing the whole prompt. off by default because the<br/>checkpoint selection compares positions against token counts, which differ for M-RoPE models<br/>(env: LLAMA_ARG_MTMD_CHECKPOINTS) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
@@ -1145,6 +1146,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 *Options:*
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
+
+Slots holding image or audio tokens are saved as well. Only the media metadata is stored, not the pixels or samples: that is enough to match the restored prompt against a later request and to map tokens to positions, and the encoder output is already baked into the saved KV cache. Such a file is tied to the projector that produced it, so a restore is refused when the `--mmproj` file or the `--image-min-tokens` / `--image-max-tokens` limits have changed since the save.
 
 **Response format**
 
