@@ -2427,6 +2427,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--op-offload-min-batch"}, "N",
+        "minimum batch size for an op with host RAM weights to be offloaded to the GPU (default: 32)\n"
+        "only applies to weights kept on the CPU by -ot or a partial -ngl; below it the op runs on the CPU\n"
+        "measured on gfx1201 with MoE experts on the CPU, the CPU stays faster up to ~400 tokens\n"
+        "keep this at or below --ubatch-size, else all prompt processing for those weights runs on the CPU",
+        [](common_params & params, int value) {
+            // consumed by ggml_backend_*_device_offload_op in the GPU backends
+            common_set_env("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(value));
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_OP_OFFLOAD_MIN_BATCH"));
+    add_opt(common_arg(
         {"-nckvl", "--n-cpu-kv-layers"}, "N",
         string_format(
             "keep the KV cache of the first N layers in host RAM instead of VRAM (default: %d)\n"
