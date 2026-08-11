@@ -1710,6 +1710,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--mtmd-checkpoints"},
+        {"--no-mtmd-checkpoints"},
+        "allow context checkpoints on batches that processed image/audio chunks (default: disabled)\n"
+        "without them, a restored multimodal prompt on an SWA or hybrid model finds no checkpoint to\n"
+        "roll back to and falls back to re-processing the whole prompt. off by default because the\n"
+        "checkpoint selection compares positions against token counts, which differ for M-RoPE models",
+        [](common_params & params, bool value) {
+            params.mtmd_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_MTMD_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

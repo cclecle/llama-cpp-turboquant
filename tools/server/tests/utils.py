@@ -110,6 +110,8 @@ class ServerProcess:
     server_path: str | None = None
     mmproj_url: str | None = None
     no_mmproj: bool | None = None
+    image_min_tokens: int | None = None
+    image_max_tokens: int | None = None
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
@@ -272,6 +274,10 @@ class ServerProcess:
             server_args.extend(["--mmproj-url", self.mmproj_url])
         if self.no_mmproj:
             server_args.append("--no-mmproj")
+        if self.image_min_tokens is not None:
+            server_args.extend(["--image-min-tokens", self.image_min_tokens])
+        if self.image_max_tokens is not None:
+            server_args.extend(["--image-max-tokens", self.image_max_tokens])
         if self.media_path:
             server_args.extend(["--media-path", self.media_path])
         if self.sleep_idle_seconds is not None:
