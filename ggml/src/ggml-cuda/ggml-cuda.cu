@@ -5554,10 +5554,20 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
     }
 }
 
+// read lazily, not at ggml_backend_cuda_reg(): --op-offload-min-batch sets the env var while args
+// are parsed, and an earlier arg such as -ngl can already have built the backend registry by then
+static int ggml_cuda_op_offload_min_batch(int fallback) {
+    static const int val = []() {
+        const char * s = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return s && *s ? atoi(s) : -1;
+    }();
+    return val < 0 ? fallback : val;
+}
+
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+    return get_op_batch_size(op) >= ggml_cuda_op_offload_min_batch(dev_ctx->op_offload_min_batch_size);
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
