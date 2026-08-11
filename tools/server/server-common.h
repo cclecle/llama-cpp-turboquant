@@ -198,11 +198,20 @@ public:
     // appends server tokens, updates the media map. copies media chunks.
     void push_back(server_tokens & tokens);
 
+    // re-attach a media chunk whose LLAMA_TOKEN_NULL placeholders are already in the token list.
+    // takes ownership of the chunk. used by slot restore, where the tokens come back from the
+    // save file before the chunks do.
+    void set_media(size_t idx, mtmd_input_chunk * chunk);
+
     // for compatibility with context shift and prompt truncation
     void insert(const llama_tokens & inp_tokens);
 
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_tokens() const;
+
+    // full token list, media placeholders included. index-aligned with the memory cells,
+    // unlike get_text_tokens(), which drops them
+    const llama_tokens & get_tokens_raw() const { return tokens; }
 
     llama_tokens get_text_tokens() const;
 

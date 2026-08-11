@@ -399,6 +399,25 @@ void server_tokens::push_back(server_tokens & tokens) {
     }
 }
 
+void server_tokens::set_media(size_t idx, mtmd_input_chunk * chunk) {
+    GGML_ASSERT(has_mtmd);
+
+    mtmd::input_chunk_ptr owned(chunk);
+
+    const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    if (n_tokens == 0 || idx + n_tokens > tokens.size()) {
+        throw std::runtime_error("media chunk does not fit in the token list");
+    }
+
+    for (size_t i = 0; i < n_tokens; ++i) {
+        if (tokens[idx + i] != LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("media chunk does not match the token placeholders");
+        }
+    }
+
+    map_idx_to_media[idx] = std::move(owned);
+}
+
 void server_tokens::insert(const llama_tokens & inp_tokens) {
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
 }

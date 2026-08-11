@@ -103,11 +103,11 @@ def test_slot_erase():
 #
 # Multimodal server (mmproj loaded) slot save/restore.
 #
-# Regression coverage for issue #21133: slot save/restore/erase must be gated on
-# the slot's CONTENT (does it actually hold image/audio tokens) rather than the
-# model's CAPABILITY (is an mmproj loaded). A pure-text slot on a multimodal
-# server must save/restore/erase normally; a slot that actually holds an image
-# must be rejected with ERROR_TYPE_NOT_SUPPORTED (HTTP 501).
+# Slots that hold image/audio tokens are saved too. The token list keeps its
+# LLAMA_TOKEN_NULL placeholders and the matching media chunks are written to the
+# file trailer (metadata only, via mtmd_input_chunk_save). Without the chunks a
+# restored slot would throw in find_chunk() and miscount positions in pos_next()
+# for M-RoPE models, so a file whose chunks cannot be read is rejected outright.
 #
 
 IMG_URL_CAT = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
@@ -171,11 +171,61 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     assert res.status_code == 200
 
 
-def test_slot_save_rejected_when_slot_holds_image(mmproj_server):
+def test_slot_save_restore_with_image(mmproj_server):
     server = mmproj_server
     server.start()
 
+    img = _get_img_base64(IMG_URL_CAT)
+
     # Process a prompt that actually contains an image on slot 1.
+    res = server.make_request("POST", "/completions", data={
+        "temperature": 0.0,
+        "top_k": 1,
+        "id_slot": 1,
+        "cache_prompt": True,
+        "prompt": {
+            "prompt_string": "What is this: <__media__>\n",
+            "multimodal_data": [ img ],
+        },
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "mm_slot_image.bin",
+    })
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    assert n_saved > 0  # the image placeholders are part of the saved token list
+
+    # Restore into slot 0. The media chunks come back from the trailer, so the
+    # token list and the media map stay in sync.
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "mm_slot_image.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    # The restored slot is usable. This is the actual regression: a slot holding
+    # placeholders without their chunks throws as soon as the prompt is walked.
+    # We do NOT assert prefix reuse - tinygemma3 is a SWA model, which forces full
+    # re-processing after a restore unless --mtmd-checkpoints is on.
+    res = server.make_request("POST", "/completions", data={
+        "temperature": 0.0,
+        "top_k": 1,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "prompt": {
+            "prompt_string": "What is this: <__media__>\n",
+            "multimodal_data": [ img ],
+        },
+    })
+    assert res.status_code == 200
+
+
+def test_slot_erase_with_image(mmproj_server):
+    server = mmproj_server
+    server.start()
+
     res = server.make_request("POST", "/completions", data={
         "temperature": 0.0,
         "top_k": 1,
@@ -188,13 +238,9 @@ def test_slot_save_rejected_when_slot_holds_image(mmproj_server):
     })
     assert res.status_code == 200
 
-    # Saving a slot that holds image tokens must be rejected (HTTP 501,
-    # not_supported_error).
-    res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "mm_slot_image.bin",
-    })
-    assert res.status_code != 200
-    assert res.body["error"]["type"] == "not_supported_error"
+    # Erase writes nothing, so a slot holding image tokens can be erased.
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
 
 
 def test_slot_erase_text_only_on_multimodal(mmproj_server):

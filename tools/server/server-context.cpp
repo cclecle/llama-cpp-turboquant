@@ -2082,15 +2082,53 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // Gate slot save/restore/erase on slot content (does it hold media),
-    // not model capability: a multimodal model may hold a pure-text slot.
-    bool check_slot_no_media(const server_slot & slot, const int id_task) {
-        if (slot.prompt.tokens.has_media()) {
-            send_error(id_task,
-                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
-                ERROR_TYPE_NOT_SUPPORTED);
-            return false;
+    // Identity of the media encoder, stored in the slot save file.
+    // The chunk ids that get_common_prefix() matches on are a hash of the media bytes alone, so
+    // without this a file saved under a different mmproj - or different image token limits, which
+    // change how many tokens an image expands to - would still match and reuse KV that another
+    // encoder produced.
+    std::string mtmd_fingerprint() const {
+        if (!mctx) {
+            return "";
         }
+
+        long mmproj_size = -1;
+        if (FILE * f = std::fopen(params_base.mmproj.path.c_str(), "rb")) {
+            if (std::fseek(f, 0, SEEK_END) == 0) {
+                mmproj_size = std::ftell(f);
+            }
+            std::fclose(f);
+        }
+
+        return params_base.mmproj.path + "|" + std::to_string(mmproj_size)
+             + "|" + std::to_string(params_base.image_min_tokens)
+             + "|" + std::to_string(params_base.image_max_tokens);
+    }
+
+    // Media chunks of a slot, paired with their start index in the token list.
+    // Returns false if the token list and the media map disagree, in which case the caller must
+    // not write a trailer - a restore would then rebuild a slot that cannot be prefix-matched.
+    bool slot_media_chunks(const server_slot & slot, std::vector<std::pair<uint64_t, const mtmd_input_chunk *>> & out) const {
+        const auto & toks = slot.prompt.tokens;
+
+        out.clear();
+
+        for (size_t i = 0; i < toks.size(); ) {
+            if (toks[i] != LLAMA_TOKEN_NULL) {
+                i++;
+                continue;
+            }
+
+            try {
+                const mtmd_input_chunk * chunk = toks.find_chunk(i).get();
+                out.emplace_back(i, chunk);
+                i += mtmd_input_chunk_get_n_tokens(chunk);
+            } catch (const std::exception & e) {
+                SRV_ERR("slot %d: no media chunk at token index %zu (%s)\n", slot.id, i, e.what());
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -2594,13 +2632,16 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (!check_slot_no_media(*slot, task.id)) {
-                        break;
-                    }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    std::vector<std::pair<uint64_t, const mtmd_input_chunk *>> media;
+                    if (!slot_media_chunks(*slot, media)) {
+                        send_error(task, "Unable to save slot, the media chunks are out of sync with the token list", ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -2609,28 +2650,35 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
+                    // keep the media placeholders, so the token list stays index-aligned with the
+                    // memory cells and with the chunks written in the trailer below
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens_raw();
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
                     // Append a trailer to the same file so it survives a model swap + reload.
-                    // It carries (a) the FULL draft KV state and (b) context checkpoints.
+                    // It carries (a) the FULL draft KV state, (b) the media chunks and (c) context
+                    // checkpoints.
                     // llama_state_seq_save_file() above only persists the TARGET; the draft has
                     // no equivalent, so without (a) a restore brings the target back full while
                     // the draft comes back empty (ctx_dft pos_max=-1) and the drafter goes inert
-                    // on the continuation turn. Checkpoints (b) are still needed by models whose
-                    // memory does not support partial sequence removal (hybrid/recurrent, SWA).
+                    // on the continuation turn. The token list holds only LLAMA_TOKEN_NULL
+                    // placeholders for media, so without (b) a restored prompt cannot be
+                    // prefix-matched and, for M-RoPE models, pos_next() cannot map tokens to
+                    // positions. Checkpoints (c) are still needed by models whose memory does not
+                    // support partial sequence removal (hybrid/recurrent, SWA).
                     // Format: [version u32][draft_sz u64][draft data][spec_sz u64][spec data]
+                    //         [fp_len u64][fp data][n_media u32][per-media data...]
                     //         [n_ckpts u32][per-ckpt data...][section_offset u64][magic u64]
                     // The 16-byte footer lets the reader locate the section without scanning.
-                    if (nwrite > 0 && (ctx_dft != nullptr || !slot->prompt.checkpoints.empty())) {
+                    if (nwrite > 0 && (ctx_dft != nullptr || !media.empty() || !slot->prompt.checkpoints.empty())) {
                         // "SLTCKPT1" magic — chosen to be detectable at file end
                         static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
 
                         FILE * fcf = std::fopen(filepath.c_str(), "ab");
                         if (fcf) {
                             const uint64_t section_offset = static_cast<uint64_t>(nwrite);
-                            const uint32_t ckpt_version   = 4; // v4: draft blob + speculative boundary state
+                            const uint32_t ckpt_version   = 5; // v5: media chunks + encoder fingerprint
                             const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
 
                             std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
@@ -2658,6 +2706,41 @@ private:
                             std::fwrite(&spec_sz, sizeof(spec_sz), 1, fcf);
                             if (spec_sz > 0) { std::fwrite(spec_buf.data(), 1, spec_sz, fcf); }
 
+                            // the media chunks, keyed by their start index in the token list, behind
+                            // a fingerprint of the encoder that produced them.
+                            // mtmd_input_chunk_save() stores metadata only - the restored chunk is a
+                            // placeholder, which is all the prefix match and the position bookkeeping
+                            // need. Re-encoding always works from the client's copy of the media.
+                            const std::string fp     = mtmd_fingerprint();
+                            const uint64_t    fp_len = static_cast<uint64_t>(fp.size());
+                            std::fwrite(&fp_len, sizeof(fp_len), 1, fcf);
+                            if (fp_len > 0) { std::fwrite(fp.data(), 1, fp_len, fcf); }
+
+                            const uint32_t n_media = static_cast<uint32_t>(media.size());
+                            std::fwrite(&n_media, sizeof(n_media), 1, fcf);
+
+                            for (const auto & [start_idx, chunk] : media) {
+                                size_t blob_len = 0;
+                                std::vector<char> blob;
+                                if (mtmd_input_chunk_save(chunk, nullptr, 0, &blob_len) == 0) {
+                                    blob.resize(blob_len);
+                                    if (mtmd_input_chunk_save(chunk, blob.data(), blob.size(), &blob_len) != 0) {
+                                        blob.clear();
+                                    }
+                                }
+                                if (blob.empty()) {
+                                    // restore will reject the file rather than rebuild a slot that
+                                    // cannot be prefix-matched
+                                    SRV_ERR("slot %d: failed to serialize the media chunk at token index %" PRIu64 "\n", id_slot, start_idx);
+                                }
+
+                                const uint64_t idx     = start_idx;
+                                const uint64_t blob_sz = static_cast<uint64_t>(blob.size());
+                                std::fwrite(&idx,     sizeof(idx),     1, fcf);
+                                std::fwrite(&blob_sz, sizeof(blob_sz), 1, fcf);
+                                if (blob_sz > 0) { std::fwrite(blob.data(), 1, blob_sz, fcf); }
+                            }
+
                             std::fwrite(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
 
                             for (const auto & ckpt : slot->prompt.checkpoints) {
@@ -2682,8 +2765,8 @@ private:
                             std::fwrite(&SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC), 1, fcf);
                             std::fclose(fcf);
 
-                            SRV_INF("slot %d: saved draft state (%.2f MiB, boundary %" PRIu64 " B) + %u context checkpoints to %s\n",
-                                    id_slot, draft_sz / (1024.0 * 1024.0), spec_sz, n_ckpts, filename.c_str());
+                            SRV_INF("slot %d: saved draft state (%.2f MiB, boundary %" PRIu64 " B) + %u media chunks + %u context checkpoints to %s\n",
+                                    id_slot, draft_sz / (1024.0 * 1024.0), spec_sz, n_media, n_ckpts, filename.c_str());
                         }
                     }
 
@@ -2733,6 +2816,14 @@ private:
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // The token list carries LLAMA_TOKEN_NULL placeholders for media; the matching
+                    // chunks come from the trailer below. A slot left with placeholders but no
+                    // chunks would throw in find_chunk() and miscount positions in pos_next(), so
+                    // the restore is rejected rather than half-applied.
+                    const bool  has_media      = std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end();
+                    uint32_t    n_media_loaded = 0;
+                    std::string restore_err;
+
                     // Reload checkpoints saved by the corresponding SLOT_SAVE.
                     // The footer (last 16 bytes) holds the byte offset of the section
                     // start and a magic value.  Reading raw bytes into data_tgt/data_dft/data_spec
@@ -2764,16 +2855,16 @@ private:
                                         uint32_t n_ckpts      = 0;
                                         std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
 
-                                        // v4: a full draft-state blob and the drafter's deferred boundary
-                                        // precede the checkpoints. Restore both directly here — the reuse
-                                        // path does not re-apply the draft on a clean continuation
-                                        // (n_past == full prompt), which is exactly when the drafter would
-                                        // otherwise start empty (pos_max=-1).
+                                        // v5: a full draft-state blob, the drafter's deferred boundary and
+                                        // the media chunks precede the checkpoints. Restore the draft
+                                        // directly here — the reuse path does not re-apply it on a clean
+                                        // continuation (n_past == full prompt), which is exactly when the
+                                        // drafter would otherwise start empty (pos_max=-1).
                                         //
-                                        // Anything other than v4 is not readable: the layout differs from
+                                        // Anything other than v5 is not readable: the layout differs from
                                         // this point on, so parsing further would misread the checkpoint
                                         // table. Skip the section entirely and let the slot rebuild.
-                                        if (ckpt_version != 4) {
+                                        if (ckpt_version != 5) {
                                             SRV_WRN("slot %d: ignoring checkpoint section of unsupported version %u in %s "
                                                     "(delete stale slot cache files after a format change)\n",
                                                     id_slot, ckpt_version, filename.c_str());
@@ -2803,9 +2894,69 @@ private:
                                                             id_slot, spec_sz, filename.c_str());
                                                 }
                                             }
+
+                                            // the media chunks that the placeholders in the token list refer to.
+                                            // lengths are bounded by the file size, so a corrupted field
+                                            // cannot force a huge allocation
+                                            const uint64_t max_len = static_cast<uint64_t>(fsize);
+
+                                            uint64_t    fp_len = 0;
+                                            std::string fp_file;
+                                            if (std::fread(&fp_len, sizeof(fp_len), 1, fcf) == 1 && fp_len > 0 && fp_len <= max_len) {
+                                                fp_file.resize(fp_len);
+                                                if (std::fread(&fp_file[0], 1, fp_len, fcf) != fp_len) {
+                                                    fp_file.clear();
+                                                }
+                                            }
+
+                                            uint32_t n_media_file = 0;
+                                            if (std::fread(&n_media_file, sizeof(n_media_file), 1, fcf) != 1) {
+                                                n_media_file = 0;
+                                            }
+
+                                            // only enforced when the file actually carries media, so a
+                                            // text-only slot still restores on a server without an mmproj
+                                            const std::string fp_cur = mtmd_fingerprint();
+                                            if (n_media_file > 0 && fp_file != fp_cur) {
+                                                restore_err = "Unable to restore slot, the file was saved with a different multimodal projector or different image token limits";
+                                                SRV_ERR("slot %d: media fingerprint mismatch in %s (file '%s', current '%s')\n",
+                                                        id_slot, filename.c_str(), fp_file.c_str(), fp_cur.c_str());
+                                            }
+
+                                            for (uint32_t mi = 0; mi < n_media_file && restore_err.empty(); ++mi) {
+                                                uint64_t idx     = 0;
+                                                uint64_t blob_sz = 0;
+                                                if (std::fread(&idx,     sizeof(idx),     1, fcf) != 1 ||
+                                                    std::fread(&blob_sz, sizeof(blob_sz), 1, fcf) != 1 ||
+                                                    blob_sz == 0 || blob_sz > max_len) {
+                                                    restore_err = "Unable to restore slot, truncated media section";
+                                                    break;
+                                                }
+
+                                                std::vector<char> blob(blob_sz);
+                                                if (std::fread(blob.data(), 1, blob_sz, fcf) != blob_sz) {
+                                                    restore_err = "Unable to restore slot, truncated media section";
+                                                    break;
+                                                }
+
+                                                mtmd::input_chunk_ptr loaded(mtmd_input_chunk_load(blob.data(), blob.size()));
+                                                if (!loaded) {
+                                                    restore_err = "Unable to restore slot, unreadable media chunk";
+                                                    break;
+                                                }
+
+                                                try {
+                                                    // set_media() takes ownership, including when it throws
+                                                    slot->prompt.tokens.set_media(idx, loaded.release());
+                                                    n_media_loaded++;
+                                                } catch (const std::exception & e) {
+                                                    restore_err = std::string("Unable to restore slot, media chunk does not match the token list: ") + e.what();
+                                                    break;
+                                                }
+                                            }
                                         }
 
-                                        if (ckpt_version == 4) {
+                                        if (ckpt_version == 5 && restore_err.empty()) {
                                             std::fread(&n_ckpts, sizeof(n_ckpts), 1, fcf);
 
                                             bool ok = true;
@@ -2853,6 +3004,20 @@ private:
                         }
                     }
 
+                    if (restore_err.empty() && has_media && n_media_loaded == 0) {
+                        restore_err = "Unable to restore slot, the file has media placeholders but no media chunks (saved by an older build - delete stale slot cache files)";
+                    }
+
+                    if (!restore_err.empty()) {
+                        slot->prompt_clear();
+                        send_error(task, restore_err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    if (n_media_loaded > 0) {
+                        SRV_INF("slot %d: restored %u media chunks from %s\n", id_slot, n_media_loaded, filename.c_str());
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2872,10 +3037,6 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    // Gate on slot content, consistent with save/restore.
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -3827,8 +3988,9 @@ private:
                         do_checkpoint = false;
                     }
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    // do not checkpoint after mtmd chunks, unless asked to. a restored multimodal
+                    // prompt on an SWA or hybrid model needs one to avoid full re-processing
+                    do_checkpoint = do_checkpoint && (!has_mtmd || params_base.mtmd_checkpoints);
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
