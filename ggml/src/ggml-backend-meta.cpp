@@ -659,6 +659,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+        // batched matmul with the batch dim split the same way on both sides, e.g. the MLA absorption
+        // matmuls wk_b x q_nope and wv_b x kqv, which are batched over the attention heads
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+        }
         // [DIAG] Unhandled MUL_MAT split-axis combination (see Gemma-4 + SPLIT_MODE_TENSOR crash).
         // Dump enough to identify the offending matmul before aborting.
         GGML_LOG_ERROR("%s: unhandled MUL_MAT split combo for '%s' [%s]: "
@@ -838,6 +844,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (q_head_split && kv_head_split) {
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+
+        // Case 2 (MLA): K and V have a single head that every Q head attends to. The KV latent is
+        // mirrored, so device-local Q head h maps to KV head 0 on every device - the same head it
+        // maps to without the split. Head-parallel Q is therefore exact here.
+        if (q_head_split && kv_mirrored && tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1) {
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr); // sinks are per head, they would need a split
             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
         }
 

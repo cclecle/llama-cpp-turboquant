@@ -89,6 +89,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+
+    const bool is_mla_arch = arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_GLM_DSA
+            || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_BAILINGMOE3
+            || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_MISTRAL4;
+
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -101,15 +110,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
-    } else if (arch == LLM_ARCH_DEEPSEEK2
-            || arch == LLM_ARCH_DEEPSEEK32
-            || arch == LLM_ARCH_GLM_DSA
-            || arch == LLM_ARCH_KIMI_LINEAR
-            || arch == LLM_ARCH_BAILINGMOE3
-            || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+    } else if (is_mla_arch) {
         n_embd = 128;
-        n_head = 1;
+        // mistral4 is the MLA arch enabled for --split-mode tensor, it needs enough heads to split
+        n_head = arch == LLM_ARCH_MISTRAL4 ? 32 : 1;
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -159,17 +163,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head);
+        // MLA keeps one compressed KV latent no matter how many query heads there are
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, is_mla_arch ? uint32_t(1) : n_head);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK2
-            || arch == LLM_ARCH_DEEPSEEK32
-            || arch == LLM_ARCH_GLM_DSA
-            || arch == LLM_ARCH_KIMI_LINEAR
-            || arch == LLM_ARCH_BAILINGMOE3
-            || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+    if (is_mla_arch) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
