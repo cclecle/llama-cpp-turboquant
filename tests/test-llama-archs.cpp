@@ -89,6 +89,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+
+    const bool is_mla_arch = arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_GLM_DSA
+            || arch == LLM_ARCH_DOTS3NOTE
+            || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_BAILINGMOE3
+            || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_HY_V4;
+
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -111,17 +122,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
-    } else if (arch == LLM_ARCH_DEEPSEEK2
-            || arch == LLM_ARCH_DEEPSEEK32
-            || arch == LLM_ARCH_GLM_DSA
-            || arch == LLM_ARCH_DOTS3NOTE
-            || arch == LLM_ARCH_KIMI_LINEAR
-            || arch == LLM_ARCH_BAILINGMOE3
-            || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4) {
+    } else if (is_mla_arch) {
         n_embd = 128;
-        n_head = 1;
+        // mistral4 is the MLA arch enabled for --split-mode tensor, it needs enough heads to split
+        n_head = arch == LLM_ARCH_MISTRAL4 ? 32 : 1;
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -177,7 +181,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
+        // MLA keeps one compressed KV latent no matter how many query heads there are
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,
+                (arch == LLM_ARCH_DEEPSEEK4 || is_mla_arch) ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
@@ -185,15 +191,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
-    } else if (arch == LLM_ARCH_DEEPSEEK2
-            || arch == LLM_ARCH_DEEPSEEK32
-            || arch == LLM_ARCH_GLM_DSA
-            || arch == LLM_ARCH_DOTS3NOTE
-            || arch == LLM_ARCH_KIMI_LINEAR
-            || arch == LLM_ARCH_BAILINGMOE3
-            || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4) {
+    } else if (is_mla_arch) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
