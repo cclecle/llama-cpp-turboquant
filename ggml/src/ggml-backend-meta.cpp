@@ -879,6 +879,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // is given*. With Q head-split but KV replicated in full, device j local Q head 0 maps to KV
         // head 0 instead of its true global head, so every device but the first attends to the wrong
         // KV heads (GQA) and the model emits garbage. Only a single KV head (case 2 above) is exact.
+        // Supporting the general case requires slicing the mirrored KV per device to match that
+        // device Q-head range (not yet implemented).
         // This is reached e.g. with --no-kv-offload under -sm tensor (KV cache lives on the host),
         // or when an FA fallback (missing kernel for a mismatched K/V quant pair) mirrors the KV.
         if (q_head_split && kv_mirrored) {

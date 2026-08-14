@@ -88,7 +88,7 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
-  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
+  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Kimi-Linear, Jamba, Falcon-H1
   - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
   - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
 
