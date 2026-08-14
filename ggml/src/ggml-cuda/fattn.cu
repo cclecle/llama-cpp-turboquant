@@ -578,9 +578,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != 256 || !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+            // --split-mode tensor spreads the heads over the devices, so the ratio seen here is the
+            // per-device head count. AMD serves this shape from the tile kernel, which has a ncols=16
+            // config; the mma kernel used elsewhere only has ncols 32/64 configs for 320/256.
+#ifdef GGML_USE_HIP
+            if (gqa_ratio % 16 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+#else
             if (gqa_ratio % 32 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+#endif // GGML_USE_HIP
             break;
         case 512:
             if (V->ne[0] != K->ne[0]) {

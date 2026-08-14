@@ -377,6 +377,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
+    // same condition the deepseek2 graph uses to take the absorbed MLA path: the OCR variant shares
+    // the loader but builds plain MHA attention
+    const bool is_mla = hparams.is_mla() && ud->model->arch != LLM_ARCH_DEEPSEEK2OCR;
+
+    // An EAGLE draft of an MLA target runs *decompressed* MHA out of attn_q_a/q_b/kv_a_mqa/kv_b.
+    // Those match no split pattern and stay mirrored, and is_mla() is false here because EAGLE never
+    // reads the *_MLA keys, so the rules above do not apply either. Keep the rest of the attention
+    // mirrored to match them - splitting attn_output or the KV cache alone makes set_rows write a
+    // mirrored K into a split cache. An EAGLE draft is two layers, so the duplicated work is noise.
+    const bool is_mla_eagle = ud->model->arch == LLM_ARCH_EAGLE && hparams.n_lora_kv > 0;
+
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
@@ -394,6 +405,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+
+    static const std::regex pattern_attn_q_b        ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_attn_k_b        ("blk\\.\\d*\\.attn_k_b\\.weight");
+    static const std::regex pattern_attn_v_b        ("blk\\.\\d*\\.attn_v_b\\.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -507,6 +522,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
         if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // MLA (absorbed) attention. After the absorption this is MQA: the compressed KV latent has a
+        // single head that every query head reads, so the latent - and everything that produces it,
+        // attn_q_a / attn_kv_a_mqa and their norms - stays mirrored and only the per-head tensors split.
+        if (is_mla) {
+            if (std::regex_match(tensor_name, pattern_attn_q_b) || std::regex_match(tensor_name, pattern_q_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_k_b) || std::regex_match(tensor_name, pattern_attn_v_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+
+        if (is_mla_eagle) {
+            if (std::regex_match(tensor_name, pattern_q_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                    std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
         }
 
         // standard attention
@@ -693,6 +731,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+        } else if (is_mla) {
+            // MLA attention. attn_q_b, attn_k_b, attn_v_b and attn_output must all be cut at the same
+            // head boundaries, so derive one head granularity and scale it per tensor. Taking the lcm
+            // per tensor instead would desync attn_q_b from attn_output for quants whose block size
+            // is larger than the head dim.
+            const int64_t n_embd_head_k = hparams.n_embd_head_k_mla();
+            const int64_t n_embd_head_v = hparams.n_embd_head_v_mla();
+
+            // 16 is the smallest GQA ratio for which a DKQ=320 FlashAttention kernel is instantiated,
+            // and the GQA ratio a kernel sees here is the per-device head count
+            const int64_t g_head = std::lcm(std::lcm(blck_size, n_embd_head_v) / n_embd_head_v, int64_t(16));
+
+            if (std::regex_match(tensor_name, pattern_attn_q_b) || std::regex_match(tensor_name, pattern_q_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_head * n_embd_head_k};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_head * n_embd_head_v};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_k_b) || std::regex_match(tensor_name, pattern_attn_v_b)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_head};
             }
         } else {
             // regular attention
