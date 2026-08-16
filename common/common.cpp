@@ -1326,6 +1326,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // The facade-slots 'auto' sizing happens inside model load, where the context parameters are
+    // not visible - hand the ones the estimate needs down the same env channel the other
+    // moe-hybrid knobs already use. Bytes per element for the KV cache types (block size folded
+    // in), the real context length, and the draft model's file size if one is configured.
+    {
+        const char * fs = getenv("GGML_MOE_HYBRID_FACADE_SLOTS");
+        if (fs != nullptr && strcmp(fs, "auto") == 0) {
+            common_set_env("GGML_MOE_HYBRID_AUTO_CTX", std::to_string(cparams.n_ctx));
+            const double bpe_k = (double) ggml_type_size(cparams.type_k) / ggml_blck_size(cparams.type_k);
+            const double bpe_v = (double) ggml_type_size(cparams.type_v) / ggml_blck_size(cparams.type_v);
+            common_set_env("GGML_MOE_HYBRID_AUTO_KV_BPE_K", std::to_string(bpe_k));
+            common_set_env("GGML_MOE_HYBRID_AUTO_KV_BPE_V", std::to_string(bpe_v));
+            int64_t draft_bytes = 0;
+            if (!params.speculative.draft.mparams.empty()) {
+                FILE * f = fopen(params.speculative.draft.mparams.path.c_str(), "rb");
+                if (f != nullptr) {
+                    fseek(f, 0, SEEK_END);
+                    draft_bytes = (int64_t) ftell(f);
+                    fclose(f);
+                }
+                // the draft also carries its own KV cache and buffers; a flat margin covers them
+                draft_bytes += 512ll*1024*1024;
+            }
+            common_set_env("GGML_MOE_HYBRID_AUTO_DRAFT_BYTES", std::to_string(draft_bytes));
+            // recurrent-state rows for hybrid-memory models (delta-net etc.): the rs cache
+            // allocates r/s tensors of mem_size*(1+n_rs_seq) rows per recurrent layer
+            const int64_t rs_rows = (int64_t) cparams.n_seq_max * (1 + params.speculative.need_n_rs_seq());
+            common_set_env("GGML_MOE_HYBRID_AUTO_RS_ROWS", std::to_string(rs_rows));
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;

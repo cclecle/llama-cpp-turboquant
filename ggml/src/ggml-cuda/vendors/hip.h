@@ -58,11 +58,15 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorNotReady hipErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDisableTiming hipEventDisableTiming
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventRecord hipEventRecord
+#define cudaEventQuery hipEventQuery
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
@@ -76,6 +80,8 @@
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
+#define cudaHostRegisterMapped hipHostRegisterMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
@@ -139,6 +145,7 @@
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess

@@ -13,6 +13,7 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
+#include "mul-mat-id-hybrid.h"
 #include "ggml.h"
 #include "common.h"
 
@@ -1463,12 +1464,7 @@ UseGgmlGemm2:;
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
-static void ggml_compute_forward_mul_mat_id_one_chunk(
+void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
@@ -1864,7 +1860,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                if (ggml_mul_mat_id_hybrid_enabled()) {
+                    ggml_compute_forward_mul_mat_id_hybrid(params, tensor);
+                } else {
+                    ggml_compute_forward_mul_mat_id(params, tensor);
+                }
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2911,6 +2911,8 @@ struct ggml_cplan ggml_graph_plan(
                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
                         }
+                        // cpu_row_end, used only by the hybrid kernel
+                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
