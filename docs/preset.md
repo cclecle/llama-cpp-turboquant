@@ -94,6 +94,55 @@ llama-server -hf user/repo:gpt-oss-120b-hf
 
 Please make sure to provide the correct `hf-repo` for each child preset. Otherwise, you may get error: `The specified tag is not a valid quantization scheme.`
 
+### Splitting a preset file with `include`
+
+A large preset file can be split into several files, for example one per model family. Use the
+`include` key to pull another file in:
+
+```ini
+; models.ini
+include = families/qwen.ini
+include = families/gemma.ini
+
+[*]
+temp = 0.5
+
+[MyModel]
+model = /models/my-model.gguf
+```
+
+Rules:
+
+- `include` is a file-level directive. It is only valid before the first section header or inside
+  `[*]`; using it inside a named preset is an error.
+- Relative paths resolve against the directory of the file that contains the `include`.
+- Repeat `include` to pull in several files. They are read in the order written.
+- Included files are **defaults**: the including file wins on a conflict, and a later `include`
+  wins over an earlier one.
+- Merging is per key, not per section. `[*]` blocks from several files combine, and a named
+  section can override single keys without restating the whole section:
+
+```ini
+; families/qwen.ini
+[*]
+top-k = 20
+
+[Qwen]
+model = /models/qwen.gguf
+c     = 4096
+```
+
+```ini
+; models.ini - Qwen keeps its model path, only c changes
+include = families/qwen.ini
+
+[Qwen]
+c = 8192
+```
+
+- Include cycles are detected and reported with the full chain.
+- Errors name the file a bad key came from, which matters once the keys live in several files.
+
 ## System-level config
 
 The system-level config, added in PR [#26118](https://github.com/ggml-org/llama.cpp/pull/26118), allows sharing the same set of options among multiple tools and examples. Unlike the sections above, it is not limited to the server.
@@ -108,3 +157,4 @@ Note:
 - Only the `[*]` and default sections are used; options written before any section header belong to "default. Named sections are ignored
 - Tool-specific options can be specified, but will be ignored (with a warning) if the example doesn't support it<br/>Example: if you specify `port = 1234`, only `llama-server` will use it, other examples will ignore it
 - `model` or `hf-repo` are not recommended to be configured system-level, because it may introduce conflicts<br/>Example: a `hf-repo` in the config file still takes effect when you pass `-m` on the command line, so you may load a different model than expected
+- `include` works here too: the config file is read by the same INI loader, so a system-level config can pull in shared fragments. Precedence is unchanged - the whole config file, includes and all, still sits below ENV, CLI and model presets
