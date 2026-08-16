@@ -2439,6 +2439,121 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OP_OFFLOAD_MIN_BATCH"));
     add_opt(common_arg(
+        {"--moe-hybrid"}, "on|off",
+        "keep the hottest MoE experts in VRAM and compute them on the GPU while the CPU computes the\n"
+        "rest of the same op (default: off). only affects experts kept in host RAM by -ot, -cmoe or\n"
+        "-ncmoe. the split is per expert and per output row, so both sides write disjoint rows",
+        [](common_params & params, const std::string & value) {
+            // consumed by the hybrid MUL_MAT_ID kernel in the CPU backend and by the GPU pool
+            common_set_env("GGML_MOE_HYBRID", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID"));
+    add_opt(common_arg(
+        {"--moe-hybrid-vram"}, "auto|MiB",
+        "VRAM the class-1 experts may use, in total across devices (default: auto = every free byte\n"
+        "beyond --moe-hybrid-reserve). prefer --moe-hybrid-experts, which says the same thing in the\n"
+        "units the placement actually works in. only used with --moe-hybrid",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_VRAM", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_VRAM"));
+    add_opt(common_arg(
+        {"--moe-hybrid-experts"}, "N|auto",
+        "how many experts PER TENSOR are held in VRAM and computed on the GPU (class 1). the rest\n"
+        "stay in host RAM and are computed by the CPU (class 3), except the share handed to the GPU\n"
+        "by --moe-hybrid-stream (class 2). auto (default) fills the VRAM left by --moe-hybrid-reserve.\n"
+        "which experts are resident is decided by measured demand and revisited every\n"
+        "--moe-hybrid-migrate tokens, so N is the size of the resident set, not a fixed list",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_EXPERTS", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-hybrid-reserve"}, "MiB",
+        "VRAM per device left free for the KV cache and compute buffers when sizing the expert set\n"
+        "automatically (default: 512). everything above this is used for experts, so raise it if the\n"
+        "context is long enough that the KV cache needs the room",
+        [](common_params & params, int value) {
+            common_set_env("GGML_MOE_HYBRID_RESERVE_MB", std::to_string(value));
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_RESERVE"));
+    add_opt(common_arg(
+        {"--moe-hybrid-stream"}, "FRAC",
+        "AT DECODE, the share of a non-resident expert's output rows the GPU takes, reading those\n"
+        "weights from host RAM over PCIe while the CPU computes the rest of the same expert\n"
+        "(default: 0, off). both readers share one memory controller, so this buys less than its\n"
+        "face value. requires --moe-hybrid-dma on",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_STREAM", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_STREAM"));
+    add_opt(common_arg(
+        {"--moe-hybrid-stream-prefill"}, "FRAC",
+        "the same share AT PREFILL (default: 0). prefill and decode want different answers: at decode\n"
+        "the GPU has capacity to spare and reading host weights adds bandwidth, while at prefill it is\n"
+        "already busy with attention and the dense layers and the same work displaces the critical\n"
+        "path. measured on Mistral-119B, 0.30 moved decode 16.5 -> 21.9 and prefill 373 -> 300",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_STREAM_PREFILL", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_STREAM_PREFILL"));
+    add_opt(common_arg(
+        {"--moe-hybrid-stream-batch"}, "N",
+        "tokens in a node at or below which it counts as decode for the two shares above\n"
+        "(default: 32). a speculative verify batch is a dozen or so tokens and is still bandwidth\n"
+        "bound, so it belongs on the decode side of this line",
+        [](common_params & params, int value) {
+            common_set_env("GGML_MOE_HYBRID_STREAM_BATCH", std::to_string(value));
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_STREAM_BATCH"));
+    add_opt(common_arg(
+        {"--moe-hybrid-dma"}, "on|off",
+        "register the host expert weights so the GPU can read them directly (default: off)\n"
+        "needed by --moe-hybrid-stream. pinning the pages was measured to cost ~11% of CPU-side\n"
+        "decode on gfx1201, so check the census before leaving it on",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_DMA", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_DMA"));
+    add_opt(common_arg(
+        {"--moe-hybrid-migrate"}, "N",
+        "tokens between expert re-placement passes (default: 512). demand is scored every token but\n"
+        "the resident set is only rewritten every N, so admission never churns inside a step",
+        [](common_params & params, int value) {
+            common_set_env("GGML_MOE_HYBRID_MIGRATE", std::to_string(value));
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_MIGRATE"));
+    add_opt(common_arg(
+        {"--moe-hybrid-decode"}, "on|off",
+        "whether the per-expert slots serve decode-sized nodes (default: on). with block promotion\n"
+        "carrying decode, 'off' leaves non-promoted blocks purely on the CPU at decode - the\n"
+        "~0.3 ms/node dispatch overhead exceeds what the slots save at batch 1 - while the slots\n"
+        "still serve prefill, where batched MMQ amortizes everything",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_DECODE", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_DECODE"));
+    add_opt(common_arg(
+        {"--moe-hybrid-hysteresis"}, "F",
+        "score multiplier a resident expert defends its slot with (default: 1.5). a challenger must\n"
+        "beat the incumbent by this factor before the swap is paid for; measured on Mistral-119B,\n"
+        "2.5 halved evictions and refill traffic at equal throughput against 1.5",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_MOE_HYBRID_HYSTERESIS", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID_HYSTERESIS"));
+    add_opt(common_arg(
         {"-nckvl", "--n-cpu-kv-layers"}, "N",
         string_format(
             "keep the KV cache of the first N layers in host RAM instead of VRAM (default: %d)\n"
