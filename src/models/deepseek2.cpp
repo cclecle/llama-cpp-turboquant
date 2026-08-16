@@ -665,7 +665,6 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
-            // MoE branch
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,

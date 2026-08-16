@@ -1337,6 +1337,19 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// Reach the MoE hybrid registry that lives in ggml-base without adding the private include path.
+// Layout must match ggml/src/ggml-moe-hybrid.h.
+extern "C" {
+struct llama_moe_hybrid_api_view {
+    void * supports;
+    void * dispatch;
+    void * launch;
+    void * join;
+    void (*note_origin)(const struct ggml_tensor * src0);
+};
+const struct llama_moe_hybrid_api_view * ggml_moe_hybrid_get(void);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1622,6 +1635,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             output->type == GGML_TYPE_NVFP4 &&
             (output_s || output_in_s)));
     // populate tensors_by_name
+
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
@@ -1762,6 +1776,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
 
     return true;
 }
@@ -2961,6 +2976,7 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
+
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();

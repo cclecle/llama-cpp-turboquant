@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "moe-hybrid.cuh"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -32,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-hybrid.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2443,11 +2445,34 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// GGML_CUDA_H2D_STATS=1 accounts the weight traffic the scheduler pushes to the GPU. For a model
+// with experts kept in host RAM this is the prefill cost: above the offload batch threshold the
+// whole MUL_MAT_ID runs on the GPU, so the used experts are copied again for every ubatch.
+struct ggml_cuda_h2d_stats {
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> calls{0};
+    bool enabled = getenv("GGML_CUDA_H2D_STATS") != nullptr;
+
+    ~ggml_cuda_h2d_stats() {
+        if (enabled && calls > 0) {
+            fprintf(stderr, "[h2d] %.2f GiB pushed to the GPU over %llu async copies\n",
+                    bytes/1073741824.0, (unsigned long long) calls);
+            fflush(stderr);
+        }
+    }
+};
+static ggml_cuda_h2d_stats g_h2d_stats;
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    if (g_h2d_stats.enabled) {
+        g_h2d_stats.bytes += size;
+        g_h2d_stats.calls++;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -5564,6 +5589,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 /* .iface       = */ ggml_backend_cuda_reg_interface,
                 /* .context     = */ ctx
             };
+
+            // lets the CPU backend hand us the hot experts of a host-resident MUL_MAT_ID
+            ggml_moe_hybrid_cuda_register();
         }
 
         initialized = true;

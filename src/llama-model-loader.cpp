@@ -1075,6 +1075,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            // MoE promotion holes and facade twins: up to 4 facade tensors per layer (fused or
+            // split expert layouts) plus the promotion hole pairs. Qwen3.5's 49 layers x 3
+            // tensors overflowed the old flat 128 and the null tensor crashed the load.
+            max_n_tensors += hparams.n_layer()*4 + 128;
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }

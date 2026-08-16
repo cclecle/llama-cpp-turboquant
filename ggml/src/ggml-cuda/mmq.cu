@@ -201,9 +201,19 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
+    // diagnosis probes for the moe-hybrid illegal-access hunt; zero cost unless the env is set
+    static const bool mmq_sync_dbg = getenv("GGML_MOE_HYBRID_SYNC") != nullptr;
+    if (mmq_sync_dbg && cudaDeviceSynchronize() != cudaSuccess) {
+        GGML_ABORT("[SYNCDBG] fault after mm_ids_helper: ne02=%lld ne12=%lld", (long long) ne02, (long long) ne12);
+    }
 
+    // Pad for the kernel's final partial column tile using the FLATTENED column count it actually
+    // tiles over. ne11 here can be 1 (broadcast activations, or synthetic one-expert-per-row
+    // callers), and J_max(1) floors to ZERO pad - the last tile then reads past the buffer, an
+    // overread that faults or not depending on what the pool mapped after it (measured: stable
+    // for hours on one allocation history, illegal memory access on another).
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, std::max<int64_t>(ne_get_rows, 8)) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -237,6 +247,9 @@ void ggml_cuda_mul_mat_q(
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
+    }
+    if (mmq_sync_dbg && cudaDeviceSynchronize() != cudaSuccess) {
+        GGML_ABORT("[SYNCDBG] fault after mmq quantize: ne10=%lld ne11_flat=%lld", (long long) ne10, (long long) ne11_flat);
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
