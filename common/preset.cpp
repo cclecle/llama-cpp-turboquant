@@ -167,13 +167,11 @@ void common_preset::apply_to_params(common_params & params, const std::set<std::
     }
 }
 
-static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_file(const std::string & path) {
-    std::map<std::string, std::map<std::string, std::string>> parsed;
-
-    if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("preset file does not exist: " + path);
-    }
-
+// parse one file. "include" is collected separately: it is a file-level directive, not an option,
+// and repeating it must add a file rather than overwrite the previous value.
+static void parse_ini_text(const std::string & path,
+                           std::map<std::string, std::map<std::string, std::string>> & parsed,
+                           std::vector<std::string> & includes) {
     std::ifstream file(path);
     if (!file.good()) {
         throw std::runtime_error("failed to open server preset file: " + path);
@@ -240,11 +238,79 @@ static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_
             const std::string key = std::string(node.text);
             current_key = key;
         } else if (node.tag == "value" && !current_key.empty() && !current_section.empty()) {
-            parsed[current_section][current_key] = std::string(node.text);
+            if (current_key == "include") {
+                if (current_section != COMMON_PRESET_DEFAULT_NAME && current_section != "*") {
+                    throw std::runtime_error(string_format(
+                        "'include' is a file-level directive and cannot be used inside preset '%s' (%s)",
+                        current_section.c_str(), path.c_str()
+                    ));
+                }
+                includes.push_back(std::string(node.text));
+            } else {
+                parsed[current_section][current_key] = std::string(node.text);
+            }
             current_key.clear();
         }
     });
+}
 
+// load a file and everything it includes. included files are defaults: the including file wins,
+// and a later include wins over an earlier one. merging is per key, so the [*] blocks of several
+// files combine instead of replacing each other.
+static void load_ini_recursive(const std::string & path,
+                               std::map<std::string, std::map<std::string, std::string>> & out,
+                               std::map<std::string, std::map<std::string, std::string>> & origin,
+                               std::vector<std::string> & chain) {
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("preset file does not exist: " + path
+            + (chain.empty() ? "" : " (included from " + chain.back() + ")"));
+    }
+
+    const std::string canon = std::filesystem::canonical(path).string();
+    for (const auto & seen : chain) {
+        if (seen == canon) {
+            std::string cycle;
+            for (const auto & c : chain) {
+                cycle += c + " -> ";
+            }
+            throw std::runtime_error("include cycle in preset files: " + cycle + canon);
+        }
+    }
+    if (chain.size() >= 16) {
+        throw std::runtime_error("preset include nesting too deep at: " + canon);
+    }
+    chain.push_back(canon);
+
+    std::map<std::string, std::map<std::string, std::string>> own;
+    std::vector<std::string> includes;
+    parse_ini_text(canon, own, includes);
+
+    // includes are resolved first so that this file's own keys override them
+    for (const auto & inc : includes) {
+        std::filesystem::path inc_path(inc);
+        if (inc_path.is_relative()) {
+            inc_path = std::filesystem::path(canon).parent_path() / inc_path;
+        }
+        load_ini_recursive(inc_path.string(), out, origin, chain);
+    }
+
+    for (const auto & [section, kvs] : own) {
+        out[section]; // keep sections that declare no keys
+        for (const auto & [key, value] : kvs) {
+            out[section][key]    = value;
+            origin[section][key] = canon;
+        }
+    }
+
+    chain.pop_back();
+}
+
+static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_file(
+        const std::string & path,
+        std::map<std::string, std::map<std::string, std::string>> & origin) {
+    std::map<std::string, std::map<std::string, std::string>> parsed;
+    std::vector<std::string> chain;
+    load_ini_recursive(path, parsed, origin, chain);
     return parsed;
 }
 
@@ -284,7 +350,8 @@ common_preset_context::common_preset_context(llama_example ex)
 
 common_presets common_preset_context::load_from_ini(const std::string & path, common_preset & global) const {
     common_presets out;
-    auto ini_data = parse_ini_from_file(path);
+    std::map<std::string, std::map<std::string, std::string>> origin;
+    auto ini_data = parse_ini_from_file(path, origin);
 
     for (auto section : ini_data) {
         common_preset preset;
@@ -325,9 +392,10 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
             } else if (ignore_unknown_keys) {
                 LOG_WRN("ignoring option '%s' from %s: not supported by this program\n", key.c_str(), path.c_str());
             } else {
+                const auto & src = origin[section.first][key];
                 throw std::runtime_error(string_format(
-                    "option '%s' not recognized in preset '%s'",
-                    key.c_str(), preset.name.c_str()
+                    "option '%s' not recognized in preset '%s' (%s)",
+                    key.c_str(), preset.name.c_str(), src.c_str()
                 ));
             }
         }
