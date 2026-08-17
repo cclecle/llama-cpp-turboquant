@@ -1171,11 +1171,19 @@ Slots holding image or audio tokens are saved as well. Only the media metadata i
 }
 ```
 
+`n_written` is the size of the file on disk, including the trailer that carries the draft state, the media metadata and the context checkpoints.
+
+The response is sent once the file has been written and fsynced, so a subsequent restore - including one from another process sharing the same `--slot-save-path` - is guaranteed to see the complete file. Save and restore take an advisory lock on `<filename>.lock` for the duration. Only the KV transfer itself runs on the inference thread; the file I/O happens on a worker, so saving or restoring one slot does not stall the others.
+
 ### POST `/slots/{id_slot}?action=restore`: Restore the prompt cache of the specified slot from a file.
 
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+
+A state file is portable across `--ctx-size` and across `--parallel`: a slot saved by one server can be restored by another running the same model with a different number of slots or a different context size, as long as the state fits in the destination slot's per-sequence context (`n_ctx / --parallel`). This is what lets a conversation be promoted from a small high-concurrency server entry to a larger one without reprocessing the prompt.
+
+The state does **not** record which weights produced it. Two servers running different GGUFs of the same architecture - a different quantisation, or a finetune - accept each other's files and would restore a KV cache computed from different weights. When several servers share a `--slot-save-path`, make the filename identify the model.
 
 **Response format**
 
@@ -1190,6 +1198,16 @@ Slots holding image or audio tokens are saved as well. Only the media metadata i
     }
 }
 ```
+
+**Errors**
+
+A failed restore returns HTTP 400 with a distinct `error.type`, so a caller that caches state files can tell a permanently unusable file from one that is merely wrong for this server:
+
+| `error.type` | meaning | keep the file? |
+|---|---|---|
+| `slot_state_too_large_error` | valid state, larger than this slot's per-sequence context | yes - it will still restore into a larger slot |
+| `slot_state_incompatible_error` | different KV cache type, layer count or embedding size | yes - it is still valid for the server that wrote it |
+| `slot_state_corrupt_error` | unreadable, truncated, or missing | no |
 
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
 
