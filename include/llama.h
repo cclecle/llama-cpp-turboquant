@@ -940,6 +940,63 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Why a sequence state could not be restored.
+    // Callers that cache state files need to tell a permanently unusable file (CORRUPT,
+    // INCOMPATIBLE) from one that is valid but does not fit this particular context
+    // (NO_SPACE) - the first is worth deleting, the second is not.
+    enum llama_state_seq_status {
+        LLAMA_STATE_SEQ_STATUS_OK           = 0,
+        LLAMA_STATE_SEQ_STATUS_CORRUPT      = 1, // bad magic/version, truncated, or short read
+        LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE = 2, // layer count, KV type, row size or V transposition differ
+        LLAMA_STATE_SEQ_STATUS_NO_SPACE     = 3, // valid, but larger than this sequence's context
+        LLAMA_STATE_SEQ_STATUS_IO_ERROR     = 4, // the file could not be opened or read
+    };
+
+    // As llama_state_seq_load_file, but reports why it failed.
+    // status may be NULL. On success it is set to LLAMA_STATE_SEQ_STATUS_OK.
+    LLAMA_API size_t llama_state_seq_load_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+     enum llama_state_seq_status * status);
+
+    // Sequence state to/from a host buffer, byte-identical to the file produced by
+    // llama_state_seq_save_file. Unlike the *_file calls these touch no file, so the file I/O
+    // can be done on another thread while only the (fast) device transfer stays on the caller's.
+    //
+    // llama_state_seq_get_file_size returns an upper bound for the llama_state_seq_save_buffer
+    // destination; llama_state_seq_save_buffer returns the number of bytes actually written, or
+    // 0 on failure.
+    //
+    // llama_state_seq_load_buffer with tokens_out == NULL reads the header only: it fills
+    // n_token_count_out and leaves the memory untouched, so a caller can size its token buffer
+    // before the real load. Same convention as llama_state_seq_load_file.
+    LLAMA_API size_t llama_state_seq_get_file_size(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                          size_t   n_token_count);
+
+    LLAMA_API size_t llama_state_seq_save_buffer(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
+    LLAMA_API size_t llama_state_seq_load_buffer(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+     enum llama_state_seq_status * status);
+
     //
     // Decoding
     //

@@ -1353,10 +1353,6 @@ struct common_speculative_impl_draft_eagle : public common_speculative_impl {
         pending_h_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_h_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
     }
-
-    bool need_embd() const override {
-        return false;
-    }
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection

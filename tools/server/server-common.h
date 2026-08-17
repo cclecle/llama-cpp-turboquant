@@ -64,6 +64,16 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+
+    // Why a slot restore failed. These stay HTTP 400 and differ only in the "type" field, so a
+    // caller that caches state files can react without matching on message text:
+    //   TOO_LARGE    - the file is fine, this slot is just too small for it. Keep the file.
+    //   INCOMPATIBLE - wrong KV type, layer count or row size for this instance. Keep the file,
+    //                  it may still be valid for the instance that wrote it.
+    //   CORRUPT      - unreadable or truncated. This one is worth deleting.
+    ERROR_TYPE_SLOT_STATE_TOO_LARGE,    // custom error
+    ERROR_TYPE_SLOT_STATE_INCOMPATIBLE, // custom error
+    ERROR_TYPE_SLOT_STATE_CORRUPT,      // custom error
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

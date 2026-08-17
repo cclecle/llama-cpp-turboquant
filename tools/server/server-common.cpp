@@ -67,6 +67,18 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_SLOT_STATE_TOO_LARGE:
+            type_str = "slot_state_too_large_error";
+            code = 400;
+            break;
+        case ERROR_TYPE_SLOT_STATE_INCOMPATIBLE:
+            type_str = "slot_state_incompatible_error";
+            code = 400;
+            break;
+        case ERROR_TYPE_SLOT_STATE_CORRUPT:
+            type_str = "slot_state_corrupt_error";
+            code = 400;
+            break;
     }
     return json {
         {"code", code},
