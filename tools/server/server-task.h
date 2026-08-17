@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -24,6 +26,10 @@ enum server_task_type {
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
+    // internal: the second half of a SLOT_RESTORE, posted by an I/O worker once the file has been
+    // read into memory. Carries the same task id, so the waiting client gets its result from here.
+    // [TAG_SLOT_IO_ASYNC]
+    SERVER_TASK_TYPE_SLOT_RESTORE_APPLY,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
@@ -168,6 +174,17 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_SLOT_RESTORE_APPLY [TAG_SLOT_IO_ASYNC]
+    // bytes is the whole state file as read by the worker, or err describes why it could not be
+    // read. shared_ptr because server_task is copied in a few scheduling paths and the image can
+    // be hundreds of MB.
+    std::shared_ptr<std::vector<uint8_t>> slot_state_bytes;
+    std::string                           slot_state_err;
+    int64_t                               slot_state_t_start = 0;
+    // the model generation this restore was started under - a restore that spans a model swap
+    // must be dropped rather than applied to whatever is loaded now
+    uint64_t                              slot_state_gen = 0;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;

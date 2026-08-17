@@ -534,6 +534,287 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.body["content"] == content
 
 
+#
+# Slot state portability across --parallel. [TAG_STATE_SEQ_N_STREAM]
+#
+# The per-sequence state used to record the source instance's stream count and demand an exact
+# match on restore. Since a non-unified KV cache has one stream per sequence, that count IS
+# --parallel, so a state saved by a 1-slot server was rejected by a 4-slot one even when it fit
+# comfortably - which is exactly the promotion path (a chat outgrowing a small high-concurrency
+# entry) that the feature exists for.
+#
+# Note these all run non-unified (no --kv-unified), which is the only configuration in scope.
+#
+
+PROMPT_FR = "What is the capital of France?"
+PROMPT_DE = "What is the capital of Germany?"
+
+
+def _parallel_server(n_slots: int, n_ctx: int = 2048, **kwargs) -> ServerProcess:
+    sp = ServerPreset.tinyllama2()
+    sp.slot_save_path = "./tmp"
+    sp.temperature = 0.0
+    sp.n_slots = n_slots
+    sp.n_ctx = n_ctx
+    for k, v in kwargs.items():
+        setattr(sp, k, v)
+    return sp
+
+
+def _seed_and_save(sp: ServerProcess, filename: str, prompt: str = PROMPT_FR, id_slot: int = 0) -> int:
+    """Put a real conversation in a slot, save it, and return n_saved."""
+    res = sp.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": id_slot,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = sp.make_request("POST", f"/slots/{id_slot}?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_saved"] > 0
+    return res.body["n_saved"]
+
+
+@pytest.mark.parametrize("n_slots_src,n_slots_dst", [
+    (1, 1),  # passed before the fix
+    (1, 4),  # failed before the fix - the promotion that matters
+    (4, 1),  # failed before the fix - the demotion
+    (2, 4),  # neither side is 1, so the stream count really does differ
+])
+def test_slot_state_portable_across_parallel(n_slots_src, n_slots_dst):
+    filename = f"xparallel_{n_slots_src}_{n_slots_dst}.bin"
+
+    src = _parallel_server(n_slots_src)
+    src.start()
+    try:
+        n_saved = _seed_and_save(src, filename)
+    finally:
+        src.stop()
+
+    dst = _parallel_server(n_slots_dst)
+    dst.start()
+    try:
+        res = dst.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 200, res.body
+        assert res.body["n_restored"] == n_saved
+    finally:
+        dst.stop()
+
+
+def test_slot_state_portable_across_ctx_size():
+    """--ctx-size was already portable; keep it that way while the framing changes."""
+    filename = "xctx.bin"
+
+    src = _parallel_server(1, n_ctx=1024)
+    src.start()
+    try:
+        n_saved = _seed_and_save(src, filename)
+    finally:
+        src.stop()
+
+    dst = _parallel_server(1, n_ctx=4096)
+    dst.start()
+    try:
+        res = dst.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 200, res.body
+        assert res.body["n_restored"] == n_saved
+    finally:
+        dst.stop()
+
+
+def test_restored_state_is_actually_used_across_parallel():
+    """A 200 with zero cache hits would be worse than the old failure: we would stop
+    reprocessing AND stop noticing. So check the restored KV really is reused."""
+    filename = "xparallel_reuse.bin"
+
+    src = _parallel_server(1)
+    src.start()
+    try:
+        n_saved = _seed_and_save(src, filename, prompt=PROMPT_FR)
+    finally:
+        src.stop()
+
+    dst = _parallel_server(4)
+    dst.start()
+    try:
+        res = dst.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 200, res.body
+        assert res.body["n_restored"] == n_saved
+
+        # continuing the same prompt must hit the restored cache. The two prompts share every
+        # token but the country, so only the tail should be processed.
+        res = dst.make_request("POST", "/completion", data={
+            "prompt": PROMPT_DE,
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        prompt_n = res.body["timings"]["prompt_n"]
+        assert prompt_n < 10, f"restored state was not reused, reprocessed {prompt_n} tokens"
+    finally:
+        dst.stop()
+
+
+#
+# The rejections that must survive the fix, each with its own error type so a caller can tell a
+# file worth deleting from one that is simply wrong for this instance. [TAG_STATE_SEQ_STATUS]
+#
+
+def test_restore_rejects_state_larger_than_slot():
+    filename = "xtoobig.bin"
+
+    # one slot with the whole 2048-token context, filled well past 256 tokens
+    src = _parallel_server(1, n_ctx=2048)
+    src.start()
+    try:
+        long_prompt = "The quick brown fox jumps over the lazy dog. " * 60
+        n_saved = _seed_and_save(src, filename, prompt=long_prompt)
+        assert n_saved > 256
+    finally:
+        src.stop()
+
+    # 8 slots over the same 2048 tokens leaves 256 per slot, so the state cannot fit
+    dst = _parallel_server(8, n_ctx=2048)
+    dst.start()
+    try:
+        res = dst.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 400
+        assert res.body["error"]["type"] == "slot_state_too_large_error", res.body
+    finally:
+        dst.stop()
+
+
+def test_restore_rejects_different_kv_type():
+    filename = "xkvtype.bin"
+
+    src = _parallel_server(1, ctk="f16")
+    src.start()
+    try:
+        _seed_and_save(src, filename)
+    finally:
+        src.stop()
+
+    # a different K cache type changes the row size recorded per layer
+    dst = _parallel_server(1, ctk="q8_0")
+    dst.start()
+    try:
+        res = dst.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 400
+        assert res.body["error"]["type"] == "slot_state_incompatible_error", res.body
+    finally:
+        dst.stop()
+
+
+def test_restore_rejects_truncated_file():
+    filename = "xtruncated.bin"
+
+    sp = _parallel_server(1)
+    sp.start()
+    try:
+        _seed_and_save(sp, filename)
+    finally:
+        sp.stop()
+
+    # lop off the tail - the header still parses, the state does not
+    path = os.path.join(TMP_DIR, filename)
+    size = os.path.getsize(path)
+    with open(path, "r+b") as f:
+        f.truncate(size // 2)
+
+    sp = _parallel_server(1)
+    sp.start()
+    try:
+        res = sp.make_request("POST", "/slots/0?action=restore", data={"filename": filename})
+        assert res.status_code == 400
+        assert res.body["error"]["type"] == "slot_state_corrupt_error", res.body
+    finally:
+        sp.stop()
+
+
+def test_restore_rejects_missing_file():
+    sp = _parallel_server(1)
+    sp.start()
+    try:
+        res = sp.make_request("POST", "/slots/0?action=restore", data={"filename": "does_not_exist.bin"})
+        assert res.status_code == 400
+        assert res.body["error"]["type"] == "slot_state_corrupt_error", res.body
+    finally:
+        sp.stop()
+
+
+#
+# Slot state I/O runs off the inference thread. [TAG_SLOT_IO_ASYNC]
+#
+# This asserts the functional half only - that other slots keep serving correct results while a
+# save and a restore are in flight, and that the transferred state still lands intact. The
+# latency half of the property needs a real model on a real --slot-save-path, because a
+# stories260K state is far too small for the old inline write to show up as a stall.
+#
+
+def test_slot_io_does_not_disturb_other_slots():
+    from concurrent.futures import ThreadPoolExecutor
+
+    filename = "xconcurrent.bin"
+
+    sp = _parallel_server(4)
+    sp.start()
+    try:
+        n_saved = _seed_and_save(sp, filename, id_slot=0)
+
+        def busy(id_slot):
+            res = sp.make_request("POST", "/completion", data={
+                "prompt": PROMPT_DE,
+                "id_slot": id_slot,
+                "n_predict": 32,
+                "cache_prompt": True,
+            })
+            return res
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            others = [ex.submit(busy, i) for i in (1, 2, 3)]
+            io = ex.submit(lambda: sp.make_request(
+                "POST", "/slots/0?action=restore", data={"filename": filename}))
+
+            for f in others:
+                r = f.result()
+                assert r.status_code == 200, r.body
+                assert len(r.body["content"]) > 0
+
+            r = io.result()
+            assert r.status_code == 200, r.body
+            assert r.body["n_restored"] == n_saved
+    finally:
+        sp.stop()
+
+
+def test_slot_erase_text_only_on_multimodal(mmproj_server):
+    server = mmproj_server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n = res.body["timings"]["prompt_n"]
+    assert prompt_n > 0  # all tokens are processed
+
+    # Erasing a pure-text slot must succeed even though an mmproj is loaded.
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+
+    # Re-running the same prompt should process all tokens again.
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == prompt_n  # all tokens are processed again
+
+
 def test_slot_restore_media_file_from_another_encoder(mmproj_server):
     server = mmproj_server
     server.start()

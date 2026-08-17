@@ -1994,6 +1994,15 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+// [TAG_STATE_SEQ_STATUS]
+// Abort a restore with both the log line (wording unchanged, so existing log greps keep working)
+// and a machine-readable reason, so a caller that caches state files can tell a permanently
+// unusable file from one that merely does not fit this context.
+[[noreturn]] static void state_read_fail(llama_state_seq_status status, const std::string & msg) {
+    LLAMA_LOG_ERROR("%s\n", msg.c_str());
+    throw llama_state_seq_error(status, msg);
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2002,9 +2011,28 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     GGML_UNUSED(flags);
 
-    io.write(&n_stream, sizeof(n_stream));
+    GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    // [TAG_STATE_SEQ_N_STREAM]
+    // A single-sequence state can only ever carry cells from one stream - the one the sequence
+    // is mapped to - so it is framed as exactly one stream, whatever n_stream this instance has.
+    // That is what makes such a state portable across --parallel: n_seq_max is no longer baked
+    // into the framing, and the cell data below never depended on it (state_write_meta records
+    // pos + seq ids, which the reader remaps to dest_seq_id, and state_write_data records only
+    // types and row sizes - never kv_size or the stream count).
+    //
+    // A whole-context state (seq_id == -1) is a snapshot of every stream and stays geometry
+    // bound, so it keeps writing the real n_stream.
+    const bool single_seq = seq_id != -1;
+
+    const uint32_t strm_first = single_seq ? seq_to_stream[seq_id] : 0;
+    const uint32_t strm_last  = single_seq ? strm_first + 1 : n_stream;
+
+    const uint32_t n_stream_w = single_seq ? 1 : n_stream;
+
+    io.write(&n_stream_w, sizeof(n_stream_w));
+
+    for (uint32_t s = strm_first; s < strm_last; ++s) {
         cell_ranges_t cr { s, {} };
 
         uint32_t cell_count = 0;
@@ -2074,13 +2102,26 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    // [TAG_STATE_SEQ_N_STREAM]
+    // For a single-sequence restore the stream count in the state is framing only - the cells
+    // land in this instance's own stream for dest_seq_id, and capacity is checked against that
+    // stream. So accept whatever the source instance wrote and iterate that many entries, which
+    // keeps states written by a differently-configured --parallel readable (including files
+    // written before this was fixed, which carry one entry per source stream with all but one
+    // empty).
+    //
+    // A whole-context restore still requires an exact match: it is a snapshot of every stream
+    // and there is nowhere to put the extras.
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
-        throw std::runtime_error("n_stream mismatch");
+    if (seq_id == -1 && n_stream_cur != n_stream) {
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                format("%s: n_stream mismatch (%u != %u)", __func__, n_stream_cur, n_stream));
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    bool found_seq = false;
+
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
@@ -2088,26 +2129,41 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             continue;
         }
 
+        if (seq_id != -1) {
+            // only one stream can hold a given sequence - a state claiming otherwise is malformed
+            // and restoring it would silently concatenate unrelated cells into one sequence
+            if (found_seq) {
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                        format("%s: multiple non-empty streams in a single-sequence state", __func__));
+            }
+            found_seq = true;
+        }
+
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
 
-        bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
-
+        // state_read_meta/state_read_data throw llama_state_seq_error on a rejected state, and
+        // the io layer throws plain exceptions on a short read - both leave the cells partially
+        // written, so roll back before propagating. [TAG_STATE_SEQ_STATUS]
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
-        } catch (...) {
-            res = false;
-        }
-
-        if (!res) {
+            state_read_meta(io, strm, cell_count, sinfo, seq_id);
+            state_read_data(io, strm, cell_count, sinfo);
+        } catch (const llama_state_seq_error &) {
             if (seq_id == -1) {
                 clear(true);
             } else {
                 seq_rm(seq_id, -1, -1);
             }
-            throw std::runtime_error("failed to restore kv cache");
+            throw;
+        } catch (const std::exception & err) {
+            if (seq_id == -1) {
+                clear(true);
+            } else {
+                seq_rm(seq_id, -1, -1);
+            }
+            throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                    format("failed to restore kv cache: %s", err.what()));
         }
     }
 }
@@ -2244,7 +2300,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
+void llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2266,8 +2322,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id != 1) {
-                LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                        format("%s: invalid seq_id-agnostic kv cell", __func__));
             }
 
             if (hparams.n_pos_per_embd() > 1) {
@@ -2291,8 +2347,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         sinfo = find_slot(ubatch, false);
         if (sinfo.empty()) {
-            LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
-            return false;
+            // the sequence was emptied above, so this is a capacity limit, not contention:
+            // the state simply does not fit this instance's per-sequence context
+            state_read_fail(LLAMA_STATE_SEQ_STATUS_NO_SPACE,
+                    format("%s: failed to find %d available cells in kv cache (n_ctx_seq = %u)",
+                        __func__, cell_count, cells.size()));
         }
 
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
@@ -2313,8 +2372,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // whole KV cache restore
 
         if (cell_count > cells.size()) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-            return false;
+            state_read_fail(LLAMA_STATE_SEQ_STATUS_NO_SPACE,
+                    format("%s: not enough cells in kv cache (%u > %u)", __func__, cell_count, cells.size()));
         }
 
         clear(true);
@@ -2339,8 +2398,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 io.read(&seq_id, sizeof(seq_id));
 
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
-                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
-                    return false;
+                    // a whole-context state from an instance with more sequences than this one
+                    state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                            format("%s: invalid seq_id, %d is out of range [0, %u)", __func__, seq_id, n_seq_max));
                 }
 
                 cells.seq_add(i, seq_id);
@@ -2359,11 +2419,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         head = 0;
     }
-
-    return true;
 }
 
-bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+void llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
     uint32_t v_trans;
@@ -2373,18 +2431,18 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&n_layer, sizeof(n_layer));
 
     if (n_layer != layers.size()) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
-        return false;
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                format("%s: mismatched layer count (%u instead of %u)", __func__, n_layer, (uint32_t) layers.size()));
     }
 
     if (cell_count > cells.size()) {
-        LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size());
-        return false;
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_NO_SPACE,
+                format("%s: not enough cells in kv cache to restore state (%u > %u)", __func__, cell_count, cells.size()));
     }
 
     if (this->v_trans != (bool) v_trans) {
-        LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
-        return false;
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                format("%s: incompatible V transposition", __func__));
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -2400,8 +2458,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         io.read(&k_type_i_ref, sizeof(k_type_i_ref));
         const int32_t k_type_i = (int32_t) k->type;
         if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
+            state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                    format("%s: mismatched key type (%d != %d, layer %d)", __func__, k_type_i, k_type_i_ref, il));
         }
 
         // Read row size of key
@@ -2409,8 +2467,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-            return false;
+            state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                    format("%s: mismatched key row size (%zu != %zu, layer %d)", __func__, k_size_row, (size_t) k_size_row_ref, il));
         }
 
         if (cell_count) {
@@ -2443,8 +2501,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                        format("%s: mismatched value type (%d != %d, layer %d)", __func__, v_type_i, v_type_i_ref, il));
             }
 
             // Read row size of value
@@ -2452,8 +2510,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             if (v_size_row != v_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                        format("%s: mismatched value row size (%zu != %zu, layer %d)", __func__, v_size_row, (size_t) v_size_row_ref, il));
             }
 
             if (cell_count) {
@@ -2486,8 +2544,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                        format("%s: mismatched value type (%d != %d, layer %d)", __func__, v_type_i, v_type_i_ref, il));
             }
 
             // Read element size of value
@@ -2495,16 +2553,16 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&v_size_el_ref, sizeof(v_size_el_ref));
             const size_t v_size_el = ggml_type_size(v->type);
             if (v_size_el != v_size_el_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                        format("%s: mismatched value element size (%zu != %zu, layer %d)", __func__, v_size_el, (size_t) v_size_el_ref, il));
             }
 
             // Read GQA embedding size
             uint32_t n_embd_v_gqa_ref;
             io.read(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
             if (n_embd_v_gqa != n_embd_v_gqa_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched GQA embedding size (%u != %u, layer %d)\n", __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il);
-                return false;
+                state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                        format("%s: mismatched GQA embedding size (%u != %u, layer %d)", __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il));
             }
 
             if (cell_count) {
@@ -2527,8 +2585,6 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
         }
     }
-
-    return true;
 }
 
 //

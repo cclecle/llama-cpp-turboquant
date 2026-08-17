@@ -180,6 +180,28 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    // host-buffer twins of the two calls above, producing/consuming the identical byte layout.
+    // they touch no file, so a caller can keep only the (fast) device transfer on the inference
+    // thread and do the file I/O elsewhere. [TAG_STATE_SEQ_BUFFER]
+    size_t state_seq_get_file_size(
+          llama_seq_id   seq_id,
+                size_t   n_token_count);
+
+    size_t state_seq_save_buffer(
+          llama_seq_id   seq_id,
+               uint8_t * dst,
+                size_t   size,
+     const llama_token * tokens,
+                size_t   n_token_count);
+
+    size_t state_seq_load_buffer(
+          llama_seq_id   seq_id,
+         const uint8_t * src,
+                size_t   size,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
+
     //
     // perf
     //
