@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -3196,56 +3197,101 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
+// [TAG_STATE_SEQ_BUFFER]
+// The single-sequence state layout, shared by the file and host-buffer entry points so the two
+// can never drift:
+//
+//   [magic u32][version u32][n_token u32][tokens][memory state]
+//
+// Reads go through llama_io_read_i, so a short read anywhere raises an exception that the
+// callers below turn into LLAMA_STATE_SEQ_STATUS_CORRUPT.
+// tokens_out == nullptr asks for the token count alone: the header is read, the tokens and the
+// memory state are not, so a caller can size its buffer before the real load. returns whether
+// the tokens were read, i.e. whether the caller should go on to the memory state.
+static bool state_seq_read_header(
+        llama_io_read_i & io,
+            llama_token * tokens_out,
+                 size_t   n_token_capacity,
+                 size_t * n_token_count_out) {
+    uint32_t magic;
+    uint32_t version;
 
-    // version checks
-    {
-        const uint32_t magic   = file.read_u32();
-        const uint32_t version = file.read_u32();
+    io.read(&magic,   sizeof(magic));
+    io.read(&version, sizeof(version));
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
-            return 0;
-        }
+    if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                format("unknown (magic, version) for sequence state: %08x, %08x", magic, version));
     }
 
-    // load the prompt
-    {
-        const uint32_t n_token_count = file.read_u32();
+    uint32_t n_token_count;
+    io.read(&n_token_count, sizeof(n_token_count));
 
-        if (tokens_out == nullptr) {
-            const size_t n_token_max = (file.size() - file.tell()) / sizeof(llama_token);
-            if (n_token_count > n_token_max) {
-                LLAMA_LOG_ERROR("%s: token count in sequence state file exceeds the file size! %u > %zu\n", __func__, n_token_count, n_token_max);
-                return 0;
-            }
-
-            *n_token_count_out = n_token_count;
-            return file.tell();
-        }
-
-        if (n_token_count > n_token_capacity) {
-            LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
-            return 0;
-        }
-
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
+    if (tokens_out == nullptr) {
         *n_token_count_out = n_token_count;
+        return false;
     }
 
-    // restore the context state
-    {
-        const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
-        const size_t nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
-        }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+    if (n_token_count > n_token_capacity) {
+        // the state is well-formed, it simply holds more tokens than the destination can take
+        throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_NO_SPACE,
+                format("token count in sequence state exceeded capacity: %u > %zu", n_token_count, n_token_capacity));
     }
+
+    io.read(tokens_out, sizeof(llama_token) * n_token_count);
+
+    *n_token_count_out = n_token_count;
+
+    return true;
+}
+
+static void state_seq_write_header(
+        llama_io_write_i & io,
+     const llama_token * tokens,
+                 size_t   n_token_count) {
+    const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t n_tok   = (uint32_t) n_token_count;
+
+    io.write(&magic,   sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&n_tok,   sizeof(n_tok));
+
+    if (n_token_count > 0) {
+        io.write(tokens, sizeof(llama_token) * n_token_count);
+    }
+}
+
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    // a path that cannot be opened says nothing about whether the state itself is usable, so it
+    // is reported apart from the checks on the contents [TAG_STATE_SEQ_STATUS]
+    std::unique_ptr<llama_file> file_ptr;
+    try {
+        file_ptr = std::make_unique<llama_file>(filepath, "rb");
+    } catch (const std::exception & err) {
+        throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_IO_ERROR,
+                format("failed to open sequence state file '%s': %s", filepath, err.what()));
+    }
+
+    llama_file & file = *file_ptr;
+
+    llama_io_read_file io(&file);
+
+    if (!state_seq_read_header(io, tokens_out, n_token_capacity, n_token_count_out)) {
+        // bound the reported count by what is left of the file, so a corrupt count cannot make
+        // the caller allocate a huge buffer for the second pass
+        const size_t n_token_max = (file.size() - file.tell()) / sizeof(llama_token);
+        if (*n_token_count_out > n_token_max) {
+            throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                    format("token count in sequence state file exceeds the file size: %zu > %zu", *n_token_count_out, n_token_max));
+        }
+
+        return file.tell();
+    }
+
+    state_seq_read_data(io, seq_id, 0);
+
+    GGML_ASSERT(io.n_bytes() == file.tell());
 
     return file.tell();
 }
@@ -3253,19 +3299,71 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
-
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    // save the context state using stream saving
     llama_io_write_file io(&file);
+
+    state_seq_write_header(io, tokens, n_token_count);
+
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+    GGML_ASSERT(res == io.n_bytes());
+
+    return res;
+}
+
+size_t llama_context::state_seq_get_file_size(llama_seq_id seq_id, size_t n_token_count) {
+    llama_io_write_dummy io(false);
+
+    try {
+        state_seq_write_header(io, nullptr, 0);
+
+        state_seq_write_data(io, seq_id, 0);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+        return 0;
+    }
+
+    return io.n_bytes() + sizeof(llama_token) * n_token_count;
+}
+
+size_t llama_context::state_seq_save_buffer(llama_seq_id seq_id, uint8_t * dst, size_t size, const llama_token * tokens, size_t n_token_count) {
+    // llama_io_write_host defers the tensor reads to its destructor, so dst is only fully
+    // populated once io goes out of scope - i.e. by the time this returns to the caller
+    size_t res = 0;
+    {
+        llama_io_write_host io(dst, size);
+
+        state_seq_write_header(io, tokens, n_token_count);
+
+        state_seq_write_data(io, seq_id, 0);
+
+        res = io.n_bytes();
+    }
+
+    return res;
+}
+
+size_t llama_context::state_seq_load_buffer(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    // as above: ~llama_io_read_host is what actually pushes the tensor data to the device
+    size_t res = 0;
+    {
+        llama_io_read_host io(src, size);
+
+        if (!state_seq_read_header(io, tokens_out, n_token_capacity, n_token_count_out)) {
+            // as in state_seq_load_file: bound the reported count by what is left of the buffer
+            const size_t n_token_max = (size - io.n_bytes()) / sizeof(llama_token);
+            if (*n_token_count_out > n_token_max) {
+                throw llama_state_seq_error(LLAMA_STATE_SEQ_STATUS_CORRUPT,
+                        format("token count in sequence state exceeds the buffer size: %zu > %zu", *n_token_count_out, n_token_max));
+            }
+
+            return io.n_bytes();
+        }
+
+        state_seq_read_data(io, seq_id, 0);
+
+        res = io.n_bytes();
+    }
 
     return res;
 }
@@ -4220,14 +4318,62 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    return llama_state_seq_load_file_ext(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, nullptr);
+}
+
+// [TAG_STATE_SEQ_STATUS]
+// A typed llama_state_seq_error carries its own reason; a plain exception can only have come
+// from the io layer running out of bytes, i.e. a truncated or otherwise unreadable state.
+#define LLAMA_STATE_SEQ_LOAD_CATCH(status)                                       \
+    catch (const llama_state_seq_error & err) {                                  \
+        if (status) { *(status) = err.status; }                                  \
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());                       \
+        return 0;                                                                \
+    } catch (const std::exception & err) {                                       \
+        if (status) { *(status) = LLAMA_STATE_SEQ_STATUS_CORRUPT; }              \
+        LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what()); \
+        return 0;                                                                \
+    }
+
+size_t llama_state_seq_load_file_ext(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_seq_status * status) {
     ctx->synchronize();
+
+    if (status) {
+        *status = LLAMA_STATE_SEQ_STATUS_OK;
+    }
 
     try {
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
+    }
+    LLAMA_STATE_SEQ_LOAD_CATCH(status)
+}
+
+size_t llama_state_seq_get_file_size(llama_context * ctx, llama_seq_id seq_id, size_t n_token_count) {
+    return ctx->state_seq_get_file_size(seq_id, n_token_count);
+}
+
+size_t llama_state_seq_save_buffer(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_buffer(seq_id, dst, size, tokens, n_token_count);
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+size_t llama_state_seq_load_buffer(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_seq_status * status) {
+    ctx->synchronize();
+
+    if (status) {
+        *status = LLAMA_STATE_SEQ_STATUS_OK;
+    }
+
+    try {
+        return ctx->state_seq_load_buffer(dest_seq_id, src, size, tokens_out, n_token_capacity, n_token_count_out);
+    }
+    LLAMA_STATE_SEQ_LOAD_CATCH(status)
 }
 
 ///

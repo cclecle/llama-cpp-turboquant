@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-slot-io.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -936,7 +937,37 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // [TAG_SLOT_IO_ASYNC] slot state file I/O, kept off the inference thread.
+    // Declared after queue_tasks/queue_results on purpose: members are destroyed in reverse
+    // declaration order, so the pool joins its threads while the queues its jobs post into are
+    // still alive.
+    slot_io_pool slot_io;
+
+    // bumped whenever the contexts are torn down. An async slot restore carries the generation it
+    // started under and is dropped if it no longer matches, so a state read across a model swap
+    // can never be applied to the wrong model.
+    uint64_t ctx_generation = 1;
+
+    // Slots whose state file a worker is currently reading. Deliberately NOT expressed as a
+    // slot_state: several paths dereference slot.task as soon as is_processing() is true, and a
+    // reserved slot holds no task. Keeping it separate means the reservation only affects slot
+    // *selection*, which is all it needs to do. [TAG_SLOT_IO_ASYNC]
+    std::set<int> slots_io_pending;
+
+    bool slot_io_busy(const server_slot & slot) const {
+        return slots_io_pending.find(slot.id) != slots_io_pending.end();
+    }
+
     void destroy() {
+        // note: the I/O pool is deliberately left running across a model swap. Its jobs only ever
+        // touch files and the (still-live) task queues, never llama_context, and any restore that
+        // spans the swap is rejected by the ctx_generation check in SLOT_RESTORE_APPLY.
+        ctx_generation++;
+
+        // the slots these referred to are about to be rebuilt, so the reservations mean nothing.
+        // An in-flight job still posts its apply task, which the generation check then rejects.
+        slots_io_pending.clear();
+
         spec.reset();
         spec_init.reset();
 
@@ -1568,7 +1599,7 @@ private:
                 }
 
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot_io_busy(slot)) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
@@ -1616,7 +1647,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot_io_busy(slot)) {
                     continue;
                 }
 
@@ -1673,7 +1704,7 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot_io_busy(slot)) {
                 continue;
             }
 
@@ -2044,6 +2075,41 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // [TAG_STATE_SEQ_STATUS] Map a restore failure onto an error the caller can act on.
+    // The three types stay HTTP 400 and differ only in the "type" field: a proxy that caches state
+    // files should delete on slot_state_corrupt_error and keep the file on the other two, which
+    // say something about this instance rather than about the file.
+    static enum error_type slot_state_error_type(llama_state_seq_status status) {
+        switch (status) {
+            case LLAMA_STATE_SEQ_STATUS_NO_SPACE:     return ERROR_TYPE_SLOT_STATE_TOO_LARGE;
+            case LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE: return ERROR_TYPE_SLOT_STATE_INCOMPATIBLE;
+            case LLAMA_STATE_SEQ_STATUS_CORRUPT:
+            case LLAMA_STATE_SEQ_STATUS_IO_ERROR:
+            case LLAMA_STATE_SEQ_STATUS_OK:
+                break;
+        }
+        return ERROR_TYPE_SLOT_STATE_CORRUPT;
+    }
+
+    static std::string slot_state_error_msg(llama_state_seq_status status, int32_t n_ctx_slot) {
+        switch (status) {
+            case LLAMA_STATE_SEQ_STATUS_NO_SPACE:
+                return string_format(
+                        "Unable to restore slot, the saved state is larger than this slot's context of %d tokens. "
+                        "The file is still valid for a larger slot - do not delete it.", n_ctx_slot);
+            case LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE:
+                return "Unable to restore slot, the state was saved by an instance with a different KV cache type, "
+                       "layer count or embedding size. The file is still valid for that instance - do not delete it. "
+                       "See the server log for the exact mismatch.";
+            case LLAMA_STATE_SEQ_STATUS_IO_ERROR:
+                return "Unable to restore slot, the state file could not be read.";
+            case LLAMA_STATE_SEQ_STATUS_CORRUPT:
+            case LLAMA_STATE_SEQ_STATUS_OK:
+                break;
+        }
+        return "Unable to restore slot, the state file is unreadable or truncated.";
+    }
+
     // Identity of the media encoder, stored in the slot save file.
     // The chunk ids that get_common_prefix() matches on are a hash of the media bytes alone, so
     // without this a file saved under a different mmproj - or different image token limits, which
@@ -2274,7 +2340,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && !slot_io_busy(slot) && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2423,7 +2489,7 @@ private:
                         break;
                     }
 
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot_io_busy(*slot)) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -2565,7 +2631,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot_io_busy(*slot)) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -2577,6 +2643,8 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // the media chunks travel inside the payload, so the token list stays
+                    // index-aligned with the memory cells
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
@@ -2586,19 +2654,29 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    const llama_token * packed_tokens = reinterpret_cast<const llama_token *>(packed.data());
+                    const size_t n_packed    = packed.size() / sizeof(llama_token);
+                    const size_t token_count = slot->prompt.tokens.size();
+
+                    // [TAG_SLOT_IO_ASYNC] phase A, on the inference thread: build the complete file
+                    // image in host memory. Only the KV read below touches the device, and it costs
+                    // single-digit ms; the write that used to sit here cost hundreds and froze every
+                    // other slot for the duration. Once this returns the slot is free again.
+                    slot_byte_writer w;
+                    w.buf.resize(llama_state_seq_get_file_size(ctx_tgt, slot->id, n_packed));
+
+                    const size_t nwrite = llama_state_seq_save_buffer(ctx_tgt, w.buf.data(), w.buf.size(), slot->id, packed_tokens, n_packed);
                     if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        send_error(task, "Unable to save slot, failed to serialize the sequence state", ERROR_TYPE_SERVER);
                         break;
                     }
+                    w.buf.resize(nwrite);
 
                     // Append a trailer to the same file so it survives a model swap + reload.
                     // It carries (a) the FULL draft KV state, (b) the media encoder fingerprint
                     // and (c) context checkpoints. The media chunks themselves are in the payload
                     // written above, via server_tokens::serialize().
-                    // llama_state_seq_save_file() above only persists the TARGET; the draft has
+                    // llama_state_seq_save_buffer() above only persists the TARGET; the draft has
                     // no equivalent, so without (a) a restore brings the target back full while
                     // the draft comes back empty (ctx_dft pos_max=-1) and the drafter goes inert
                     // on the continuation turn. Checkpoints (c) are still needed by models whose
@@ -2607,19 +2685,19 @@ private:
                     //         [fp_len u64][fp data]
                     //         [n_ckpts u32][per-ckpt data...][section_offset u64][magic u64]
                     // The 16-byte footer lets the reader locate the section without scanning.
-                    if (nwrite > 0 && (ctx_dft != nullptr || mctx != nullptr || !slot->prompt.checkpoints.empty())) {
+                    if (ctx_dft != nullptr || mctx != nullptr || !slot->prompt.checkpoints.empty()) {
                         // "SLTCKPT1" magic — chosen to be detectable at file end
                         static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
 
-                        FILE * fcf = std::fopen(filepath.c_str(), "ab");
-                        if (fcf) {
+                        {
                             const uint64_t section_offset = static_cast<uint64_t>(nwrite);
                             const uint32_t ckpt_version   = 5; // v5: encoder fingerprint
                             const uint32_t n_ckpts        = static_cast<uint32_t>(slot->prompt.checkpoints.size());
 
-                            std::fwrite(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+                            w.pod(ckpt_version);
 
-                            // (a) full draft KV state (flags = 0), so the restored draft matches the target
+                            // (a) full draft KV state (flags = 0), so the restored draft matches the target.
+                            // this is another device read, and like the target's it stays on this thread
                             uint64_t draft_sz = 0;
                             std::vector<uint8_t> draft_buf;
                             if (ctx_dft) {
@@ -2627,8 +2705,8 @@ private:
                                 draft_buf.resize(cap);
                                 draft_sz = (uint64_t) llama_state_seq_get_data_ext(ctx_dft, draft_buf.data(), cap, slot->id, 0);
                             }
-                            std::fwrite(&draft_sz, sizeof(draft_sz), 1, fcf);
-                            if (draft_sz > 0) { std::fwrite(draft_buf.data(), 1, draft_sz, fcf); }
+                            w.pod(draft_sz);
+                            if (draft_sz > 0) { w.raw(draft_buf.data(), draft_sz); }
 
                             // (b) the drafter's deferred boundary. EAGLE writes draft memory pos P from
                             // the pair (token[P+1], h[P]), so the last position of every batch cannot be
@@ -2639,8 +2717,8 @@ private:
                             std::vector<uint8_t> spec_buf;
                             common_speculative_get_state(spec.get(), slot->id, spec_buf);
                             const uint64_t spec_sz = static_cast<uint64_t>(spec_buf.size());
-                            std::fwrite(&spec_sz, sizeof(spec_sz), 1, fcf);
-                            if (spec_sz > 0) { std::fwrite(spec_buf.data(), 1, spec_sz, fcf); }
+                            w.pod(spec_sz);
+                            if (spec_sz > 0) { w.raw(spec_buf.data(), spec_sz); }
 
                             // identity of the encoder that produced the media chunks in the payload.
                             // the chunk ids the prefix match runs on hash the media bytes alone, so
@@ -2648,60 +2726,82 @@ private:
                             // mmproj wrote.
                             const std::string fp     = mtmd_fingerprint();
                             const uint64_t    fp_len = static_cast<uint64_t>(fp.size());
-                            std::fwrite(&fp_len, sizeof(fp_len), 1, fcf);
-                            if (fp_len > 0) { std::fwrite(fp.data(), 1, fp_len, fcf); }
+                            w.pod(fp_len);
+                            if (fp_len > 0) { w.raw(fp.data(), fp_len); }
 
-                            std::fwrite(&n_ckpts,      sizeof(n_ckpts),      1, fcf);
+                            w.pod(n_ckpts);
 
                             for (const auto & ckpt : slot->prompt.checkpoints) {
-                                std::fwrite(&ckpt.n_tokens, sizeof(ckpt.n_tokens), 1, fcf);
-                                std::fwrite(&ckpt.pos_min,  sizeof(ckpt.pos_min),  1, fcf);
-                                std::fwrite(&ckpt.pos_max,  sizeof(ckpt.pos_max),  1, fcf);
+                                w.pod(ckpt.n_tokens);
+                                w.pod(ckpt.pos_min);
+                                w.pod(ckpt.pos_max);
 
                                 const uint64_t tgt_sz = static_cast<uint64_t>(ckpt.data_tgt.size());
-                                std::fwrite(&tgt_sz,            sizeof(tgt_sz), 1,      fcf);
-                                if (tgt_sz > 0) { std::fwrite(ckpt.data_tgt.data(), 1, tgt_sz, fcf); }
+                                w.pod(tgt_sz);
+                                if (tgt_sz > 0) { w.raw(ckpt.data_tgt.data(), tgt_sz); }
 
                                 const uint64_t dft_sz = static_cast<uint64_t>(ckpt.data_dft.size());
-                                std::fwrite(&dft_sz,            sizeof(dft_sz), 1,      fcf);
-                                if (dft_sz > 0) { std::fwrite(ckpt.data_dft.data(), 1, dft_sz, fcf); }
+                                w.pod(dft_sz);
+                                if (dft_sz > 0) { w.raw(ckpt.data_dft.data(), dft_sz); }
 
-                                const uint64_t spec_sz = static_cast<uint64_t>(ckpt.data_spec.size());
-                                std::fwrite(&spec_sz,           sizeof(spec_sz), 1,     fcf);
-                                if (spec_sz > 0) { std::fwrite(ckpt.data_spec.data(), 1, spec_sz, fcf); }
+                                const uint64_t ckpt_spec_sz = static_cast<uint64_t>(ckpt.data_spec.size());
+                                w.pod(ckpt_spec_sz);
+                                if (ckpt_spec_sz > 0) { w.raw(ckpt.data_spec.data(), ckpt_spec_sz); }
                             }
 
-                            std::fwrite(&section_offset, sizeof(section_offset), 1, fcf);
-                            std::fwrite(&SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC), 1, fcf);
-                            std::fclose(fcf);
+                            w.pod(section_offset);
+                            w.pod(SLOT_CKPT_MAGIC);
 
                             SRV_INF("slot %d: saved draft state (%.2f MiB, boundary %" PRIu64 " B) + %u context checkpoints to %s\n",
                                     id_slot, draft_sz / (1024.0 * 1024.0), spec_sz, n_ckpts, filename.c_str());
                         }
                     }
 
-                    const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
+                    // [TAG_SLOT_IO_ASYNC] phase B, off the inference thread: the image is complete
+                    // and owns everything it needs, so the write, the fsync and the cross-process
+                    // lock can all block a worker without holding up any other slot.
+                    {
+                        auto image = std::make_shared<std::vector<uint8_t>>(std::move(w.buf));
 
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = true;
-                    res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
-                    res->t_ms     = t_save_ms;
-                    queue_results.send(std::move(res));
+                        const int id_task = task.id;
+
+                        auto job = [this, image, filepath, filename, id_slot, id_task, token_count, t_start]() {
+                            std::string err;
+                            if (!slot_file_write(filepath, *image, err)) {
+                                send_error(id_task, "Unable to save slot: " + err, ERROR_TYPE_SERVER);
+                                return;
+                            }
+
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id       = id_task;
+                            res->id_slot  = id_slot;
+                            res->filename = filename;
+                            res->is_save  = true;
+                            res->n_tokens = token_count;
+                            res->n_bytes  = image->size();
+                            res->t_ms     = (ggml_time_us() - t_start) / 1000.0;
+                            queue_results.send(std::move(res));
+                        };
+
+                        if (!slot_io.submit(std::move(job))) {
+                            // the queue is full - better to make the caller retry than to run the
+                            // write here and stall every slot
+                            send_error(task, "Unable to save slot, too many slot state transfers in flight", ERROR_TYPE_UNAVAILABLE);
+                        }
+                    }
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    // [TAG_SLOT_IO_ASYNC] phase A: reserve the slot and hand the read to a worker.
+                    // Nothing here touches the file, so the other slots keep running while a
+                    // possibly slow --slot-save-path is read.
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot_io_busy(*slot)) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -2710,44 +2810,131 @@ private:
 
                     const int64_t t_start = ggml_time_us();
 
-                    std::string filename = task.slot_action.filename;
-                    std::string filepath = task.slot_action.filepath;
+                    const std::string filename = task.slot_action.filename;
+                    const std::string filepath = task.slot_action.filepath;
 
-                    size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
+                    // hold the slot so no completion request grabs it between the read and the apply
+                    slots_io_pending.insert(id_slot);
 
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+                    const int      id_task = task.id;
+                    const uint64_t gen     = ctx_generation;
 
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+                    auto job = [this, filepath, filename, id_slot, id_task, t_start, gen]() {
+                        auto bytes = std::make_shared<std::vector<uint8_t>>();
+                        std::string err;
+                        if (!slot_file_read(filepath, *bytes, err)) {
+                            bytes->clear();
                         }
 
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
+                        // always post the apply task, even on failure: it owns the slot
+                        // reservation and is the only place allowed to release it
+                        server_task apply(SERVER_TASK_TYPE_SLOT_RESTORE_APPLY);
+                        apply.id                    = id_task;
+                        apply.slot_action.id_slot   = id_slot;
+                        apply.slot_action.filename  = filename;
+                        apply.slot_action.filepath  = filepath;
+                        apply.slot_state_bytes      = std::move(bytes);
+                        apply.slot_state_err        = std::move(err);
+                        apply.slot_state_t_start    = t_start;
+                        apply.slot_state_gen        = gen;
+                        queue_tasks.post(std::move(apply), true);
+                    };
 
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    if (!slot_io.submit(std::move(job))) {
+                        slots_io_pending.erase(id_slot);
+                        send_error(task, "Unable to restore slot, too many slot state transfers in flight", ERROR_TYPE_UNAVAILABLE);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE_APPLY:
+                {
+                    // [TAG_SLOT_IO_ASYNC] phase B: the file is already in memory, so all that is
+                    // left here is the host -> device copy and the slot bookkeeping.
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
+                    // Release the reservation taken in phase A before anything below can fail.
+                    // Draining the deferred queue is what slot.release() would have done; without
+                    // it a request that arrived for this slot while the read was in flight would
+                    // sit deferred until some unrelated slot happens to free up.
+                    if (slots_io_pending.erase(id_slot) > 0) {
+                        queue_tasks.pop_deferred_task(id_slot);
+                    }
+
+                    const int64_t t_start = task.slot_state_t_start;
+
+                    const std::string filename = task.slot_action.filename;
+
+                    if (task.slot_state_gen != ctx_generation) {
+                        // the model was swapped while the file was being read, so this state
+                        // belongs to a context that no longer exists
+                        send_error(task, "Unable to restore slot, the model was reloaded while the state was being read", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    if (!task.slot_state_err.empty() || !task.slot_state_bytes || task.slot_state_bytes->empty()) {
+                        send_error(task, "Unable to restore slot, " + (task.slot_state_err.empty() ? std::string("the state file is empty") : task.slot_state_err),
+                                ERROR_TYPE_SLOT_STATE_CORRUPT);
+                        break;
+                    }
+
+                    const std::vector<uint8_t> & image = *task.slot_state_bytes;
+
+                    llama_state_seq_status status = LLAMA_STATE_SEQ_STATUS_OK;
+
+                    // the payload is the packed token list, media chunks included, so it is longer
+                    // than the prompt - the first pass only reads the header to size the buffer
+                    size_t n_packed = 0;
+                    size_t nread = llama_state_seq_load_buffer(ctx_tgt, image.data(), image.size(), slot->id, nullptr, 0, &n_packed, &status);
+
+                    llama_tokens packed;
+                    if (nread != 0) {
+                        packed.resize(std::max<size_t>(1, n_packed));
+                        nread = llama_state_seq_load_buffer(ctx_tgt, image.data(), image.size(), slot->id, packed.data(), packed.size(), &n_packed, &status);
+                    }
+
+                    if (nread == 0) {
+                        // Always clear, whatever the reason. state_read_meta() empties the target
+                        // sequence before it does anything else, so by the time any of these
+                        // statuses is raised the slot's KV is gone; leaving the token list behind
+                        // would let the next request prefix-match against a cache that no longer
+                        // exists. (Tempting to keep the cache for a header-level rejection, but the
+                        // status alone does not say whether the memory was reached.)
+                        slot->prompt_clear();
+                        send_error(task, slot_state_error_msg(status, slot->n_ctx), slot_state_error_type(status));
+                        break;
+                    }
+
+                    packed.resize(n_packed);
+
+                    server_tokens restored;
+                    try {
+                        restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        if (!restored.validate(ctx_tgt)) {
+                            throw std::runtime_error("the token list does not match the media chunks");
+                        }
+                    } catch (const std::exception & err) {
+                        slot->prompt_clear();
+                        send_error(task, std::string("Unable to restore slot, ") + err.what(), ERROR_TYPE_SLOT_STATE_CORRUPT);
+                        break;
+                    }
+
+                    if (restored.size() > (size_t) slot->n_ctx) {
+                        slot->prompt_clear();
+                        send_error(task, slot_state_error_msg(LLAMA_STATE_SEQ_STATUS_NO_SPACE, slot->n_ctx),
+                                slot_state_error_type(LLAMA_STATE_SEQ_STATUS_NO_SPACE));
+                        break;
+                    }
+
+                    slot->prompt.clear();
+                    slot->prompt.tokens = std::move(restored);
+
                     // deserialize() above already rebuilt the media chunks from the payload; the
                     // trailer only has to confirm they came from this encoder.
-                    const bool  has_media = slot->prompt.tokens.has_media();
+                    const bool  has_media = slot->prompt.tokens.find_next_media_chunk(0).first != nullptr;
                     std::string restore_err;
 
                     // Reload checkpoints saved by the corresponding SLOT_SAVE.
@@ -2759,27 +2946,29 @@ private:
                     slot->prompt.checkpoints.clear();
                     {
                         static constexpr uint64_t SLOT_CKPT_MAGIC = UINT64_C(0x3154504B434C5453);
-                        static constexpr long      FOOTER_SIZE     = 16; // section_offset u64 + magic u64
+                        static constexpr size_t   FOOTER_SIZE     = 16; // section_offset u64 + magic u64
 
-                        FILE * fcf = std::fopen(filepath.c_str(), "rb");
-                        if (fcf) {
-                            if (std::fseek(fcf, 0, SEEK_END) == 0) {
-                                const long fsize = std::ftell(fcf);
+                        // the trailer is parsed straight out of the image the worker read, so this
+                        // whole block is host-only work [TAG_SLOT_IO_ASYNC]
+                        slot_byte_reader r(image.data(), image.size());
+                        {
+                            {
+                                const size_t fsize = image.size();
                                 if (fsize >= FOOTER_SIZE) {
-                                    std::fseek(fcf, -FOOTER_SIZE, SEEK_END);
+                                    r.seek(fsize - FOOTER_SIZE);
                                     uint64_t section_offset = 0;
                                     uint64_t magic          = 0;
-                                    std::fread(&section_offset, sizeof(section_offset), 1, fcf);
-                                    std::fread(&magic,          sizeof(magic),          1, fcf);
+                                    r.pod(section_offset);
+                                    r.pod(magic);
 
-                                    if (magic == SLOT_CKPT_MAGIC &&
-                                        static_cast<long>(section_offset) < fsize - FOOTER_SIZE) {
+                                    if (r.ok() && magic == SLOT_CKPT_MAGIC &&
+                                        section_offset < fsize - FOOTER_SIZE) {
 
-                                        std::fseek(fcf, static_cast<long>(section_offset), SEEK_SET);
+                                        r.seek((size_t) section_offset);
 
                                         uint32_t ckpt_version = 0;
                                         uint32_t n_ckpts      = 0;
-                                        std::fread(&ckpt_version, sizeof(ckpt_version), 1, fcf);
+                                        r.pod(ckpt_version);
 
                                         // v5: a full draft-state blob, the drafter's deferred boundary and
                                         // the media chunks precede the checkpoints. Restore the draft
@@ -2796,9 +2985,9 @@ private:
                                                     id_slot, ckpt_version, filename.c_str());
                                         } else {
                                             uint64_t draft_sz = 0;
-                                            if (std::fread(&draft_sz, sizeof(draft_sz), 1, fcf) == 1 && draft_sz > 0) {
+                                            if (r.pod(draft_sz) && draft_sz > 0 && draft_sz <= r.remaining()) {
                                                 std::vector<uint8_t> draft_buf(draft_sz);
-                                                if (std::fread(draft_buf.data(), 1, draft_sz, fcf) == draft_sz && ctx_dft) {
+                                                if (r.raw(draft_buf.data(), draft_sz) && ctx_dft) {
                                                     const size_t n = llama_state_seq_set_data_ext(ctx_dft, draft_buf.data(), draft_sz, slot->id, 0);
                                                     if (n != draft_sz) {
                                                         SRV_WRN("slot %d: draft state restore mismatch (%zu != %" PRIu64 ")\n",
@@ -2812,9 +3001,9 @@ private:
 
                                             // the deferred boundary that completes the draft KV above
                                             uint64_t spec_sz = 0;
-                                            if (std::fread(&spec_sz, sizeof(spec_sz), 1, fcf) == 1 && spec_sz > 0) {
+                                            if (r.pod(spec_sz) && spec_sz > 0 && spec_sz <= r.remaining()) {
                                                 std::vector<uint8_t> spec_buf(spec_sz);
-                                                if (std::fread(spec_buf.data(), 1, spec_sz, fcf) == spec_sz) {
+                                                if (r.raw(spec_buf.data(), spec_sz)) {
                                                     common_speculative_set_state(spec.get(), slot->id, spec_buf);
                                                     SRV_INF("slot %d: restored draft boundary (%" PRIu64 " B) from %s\n",
                                                             id_slot, spec_sz, filename.c_str());
@@ -2822,15 +3011,14 @@ private:
                                             }
 
                                             // identity of the encoder that produced the media chunks the
-                                            // payload restored above. the length is bounded by the file
-                                            // size, so a corrupted field cannot force a huge allocation
-                                            const uint64_t max_len = static_cast<uint64_t>(fsize);
-
+                                            // payload restored above. the length is bounded by what is
+                                            // left in the image, so a corrupted field cannot force a
+                                            // huge allocation
                                             uint64_t    fp_len = 0;
                                             std::string fp_file;
-                                            if (std::fread(&fp_len, sizeof(fp_len), 1, fcf) == 1 && fp_len > 0 && fp_len <= max_len) {
+                                            if (r.pod(fp_len) && fp_len > 0 && fp_len <= r.remaining()) {
                                                 fp_file.resize(fp_len);
-                                                if (std::fread(&fp_file[0], 1, fp_len, fcf) != fp_len) {
+                                                if (!r.raw(&fp_file[0], fp_len)) {
                                                     fp_file.clear();
                                                 }
                                             }
@@ -2846,34 +3034,43 @@ private:
                                         }
 
                                         if (ckpt_version == 5 && restore_err.empty()) {
-                                            std::fread(&n_ckpts, sizeof(n_ckpts), 1, fcf);
+                                            r.pod(n_ckpts);
 
                                             bool ok = true;
                                             for (uint32_t ci = 0; ci < n_ckpts && ok; ++ci) {
                                                 common_prompt_checkpoint ckpt;
-                                                ok = ok && std::fread(&ckpt.n_tokens, sizeof(ckpt.n_tokens), 1, fcf) == 1;
-                                                ok = ok && std::fread(&ckpt.pos_min,  sizeof(ckpt.pos_min),  1, fcf) == 1;
-                                                ok = ok && std::fread(&ckpt.pos_max,  sizeof(ckpt.pos_max),  1, fcf) == 1;
+                                                ok = ok && r.pod(ckpt.n_tokens);
+                                                ok = ok && r.pod(ckpt.pos_min);
+                                                ok = ok && r.pod(ckpt.pos_max);
 
                                                 uint64_t tgt_sz = 0;
-                                                ok = ok && std::fread(&tgt_sz, sizeof(tgt_sz), 1, fcf) == 1;
+                                                ok = ok && r.pod(tgt_sz);
                                                 if (ok && tgt_sz > 0) {
-                                                    ckpt.data_tgt.resize(tgt_sz);
-                                                    ok = std::fread(ckpt.data_tgt.data(), 1, tgt_sz, fcf) == tgt_sz;
+                                                    ok = tgt_sz <= r.remaining();
+                                                    if (ok) {
+                                                        ckpt.data_tgt.resize(tgt_sz);
+                                                        ok = r.raw(ckpt.data_tgt.data(), tgt_sz);
+                                                    }
                                                 }
 
                                                 uint64_t dft_sz = 0;
-                                                ok = ok && std::fread(&dft_sz, sizeof(dft_sz), 1, fcf) == 1;
+                                                ok = ok && r.pod(dft_sz);
                                                 if (ok && dft_sz > 0) {
-                                                    ckpt.data_dft.resize(dft_sz);
-                                                    ok = std::fread(ckpt.data_dft.data(), 1, dft_sz, fcf) == dft_sz;
+                                                    ok = dft_sz <= r.remaining();
+                                                    if (ok) {
+                                                        ckpt.data_dft.resize(dft_sz);
+                                                        ok = r.raw(ckpt.data_dft.data(), dft_sz);
+                                                    }
                                                 }
 
-                                                uint64_t spec_sz = 0;
-                                                ok = ok && std::fread(&spec_sz, sizeof(spec_sz), 1, fcf) == 1;
-                                                if (ok && spec_sz > 0) {
-                                                    ckpt.data_spec.resize(spec_sz);
-                                                    ok = std::fread(ckpt.data_spec.data(), 1, spec_sz, fcf) == spec_sz;
+                                                uint64_t ckpt_spec_sz = 0;
+                                                ok = ok && r.pod(ckpt_spec_sz);
+                                                if (ok && ckpt_spec_sz > 0) {
+                                                    ok = ckpt_spec_sz <= r.remaining();
+                                                    if (ok) {
+                                                        ckpt.data_spec.resize(ckpt_spec_sz);
+                                                        ok = r.raw(ckpt.data_spec.data(), ckpt_spec_sz);
+                                                    }
                                                 }
 
                                                 if (ok) {
@@ -2889,7 +3086,6 @@ private:
                                     }
                                 }
                             }
-                            std::fclose(fcf);
                         }
                     }
 
@@ -2920,7 +3116,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot_io_busy(*slot)) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
