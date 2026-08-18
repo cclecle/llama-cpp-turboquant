@@ -580,8 +580,16 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    // host bank of the base cache when it is positionally split (-nckvc)
+    ggml_tensor * get_k_idxs_host()  const { return self_k_idxs_host; }
+    ggml_tensor * get_kq_mask_host() const { return self_kq_mask_host_cnv; }
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
+
+    ggml_tensor * self_k_idxs_host      = nullptr;
+    ggml_tensor * self_kq_mask_host     = nullptr;
+    ggml_tensor * self_kq_mask_host_cnv = nullptr;
 
     ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]

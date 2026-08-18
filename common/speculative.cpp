@@ -2962,9 +2962,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // the draft's KV placement does not follow the target's (see common_params_speculative_draft)
     result.no_kv_offload    = !params_spec.kv_offload;
     result.n_cpu_kv_layers  = 0;
-    // the draft KV is read on every speculated token, so keep it resident. this also stops the
-    // target's -nckvc from colliding with the draft's own kv-offload setting
-    result.n_cpu_kv_cells   = 0;
+
+    // the draft KV is read on every drafted token, so by default it stays resident even when the
+    // target spills. --spec-draft-cpu-kv-cells opts in to spilling it the same way, for when the
+    // offload is what makes the context fit at all
+    result.n_cpu_kv_cells   = params_spec.cpu_kv_cells ? params.n_cpu_kv_cells : 0;
+
+    if (result.n_cpu_kv_cells > 0) {
+        // -nckvc needs the KV on the device side of the split, and the two spill knobs do not mix
+        result.no_kv_offload   = false;
+        result.n_cpu_kv_layers = 0;
+    }
 
     return result;
 }
