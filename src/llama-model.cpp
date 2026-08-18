@@ -2791,7 +2791,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    cparams.n_cpu_kv_cells);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2808,7 +2809,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    cparams.n_cpu_kv_cells);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2831,7 +2833,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 "",
-                                cparams.n_cpu_kv_layers);
+                                cparams.n_cpu_kv_layers,
+                                cparams.n_cpu_kv_cells);
                     }
                 }
             }

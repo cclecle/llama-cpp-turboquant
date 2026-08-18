@@ -40,6 +40,9 @@ struct llama_cparams {
 
     // number of layers whose KV cache is kept in host RAM instead of VRAM (0 = all on device)
     uint32_t n_cpu_kv_layers;
+
+    // number of trailing cells per stream whose KV is kept in host RAM instead of VRAM (0 = all on device)
+    uint32_t n_cpu_kv_cells;
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
