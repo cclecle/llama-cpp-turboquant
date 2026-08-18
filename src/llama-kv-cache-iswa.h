@@ -28,7 +28,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // positional KV spill. only the base cache takes it: the SWA cache is only
+        // n_swa + n_ubatch cells and recycles them, so every cell in it stays hot
+                     uint32_t   n_cpu_kv_cells = 0);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -46,7 +49,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // positional KV spill. only the base cache takes it: the SWA cache is only
+        // n_swa + n_ubatch cells and recycles them, so every cell in it stays hot
+                     uint32_t   n_cpu_kv_cells = 0);
 
     ~llama_kv_cache_iswa() = default;
 

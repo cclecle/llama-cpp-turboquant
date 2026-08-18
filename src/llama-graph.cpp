@@ -29,8 +29,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+        const llama_cparams & cparams,
+        int64_t n_kv_override = -1) {
+    const auto n_kv     = n_kv_override >= 0 ? (uint32_t) n_kv_override : mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -467,13 +468,22 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    mctx->set_input_k_idxs(self_k_idxs, ubatch, 0);
+    mctx->set_input_v_idxs(self_v_idxs, ubatch, 0);
+
+    if (self_k_idxs_host) {
+        mctx->set_input_k_idxs(self_k_idxs_host, ubatch, 1);
+        mctx->set_input_v_idxs(self_v_idxs_host, ubatch, 1);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_kq_mask_host && self_kq_mask_host->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask_host, ubatch, cparams.causal_attn, mctx->get_n_kv_dev());
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -495,7 +505,17 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    // the split point only moves when n_kv crosses a padding quantum, so both extents are stable
+    // between the points where the graph is rebuilt anyway
+    res &= self_kq_mask->ne[0] == (mctx->is_split() ? (int64_t) mctx->get_n_kv_dev() : (int64_t) mctx->get_n_kv());
+
+    const uint32_t n_kv_host = mctx->is_split() ? mctx->get_n_kv_host() : 0;
+
+    res &= (self_kq_mask_host != nullptr) == (n_kv_host > 0);
+
+    if (self_kq_mask_host) {
+        res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+    }
 
     return res;
 }
@@ -2523,7 +2543,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+        const std::vector<ggml_tensor *> & k_host,
+        const std::vector<ggml_tensor *> & v_host,
+         ggml_tensor * kq_mask_host) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2538,6 +2561,83 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+
+    // positional KV split: attend the device range and the host range separately, then merge them
+    // with the log-sum-exp each flash-attn call reports. the host range is done one stream at a
+    // time, because a view spanning streams would make the scheduler copy the gaps between them
+    if (!k_host.empty()) {
+        GGML_ASSERT(use_flash_attn && "the positional KV split needs flash attention");
+        GGML_ASSERT(v_mla   == nullptr);
+        GGML_ASSERT(kq_mask_host != nullptr);
+        GGML_ASSERT((int64_t) k_host.size() == n_stream);
+        GGML_ASSERT((int64_t) v_host.size() == n_stream);
+
+        const float max_bias = hparams.f_max_alibi_bias;
+        const float softcap  = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+
+        auto fa_lse = [&](ggml_tensor * qq, ggml_tensor * kk, ggml_tensor * vv,
+                          ggml_tensor * mm, ggml_tensor * sk, ggml_tensor ** lse) {
+            if (kk->type == GGML_TYPE_F32) {
+                kk = ggml_cast(ctx0, kk, GGML_TYPE_F16);
+            }
+            if (vv->type == GGML_TYPE_F32) {
+                vv = ggml_cast(ctx0, vv, GGML_TYPE_F16);
+            }
+
+            ggml_tensor * o = ggml_flash_attn_ext(ctx0, qq, kk, vv, mm, kq_scale, max_bias, softcap);
+
+            ggml_flash_attn_ext_add_sinks(o, sk);
+            ggml_flash_attn_ext_set_prec (o, GGML_PREC_F32);
+
+            *lse = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, o->ne[1], o->ne[2], o->ne[3]);
+
+            ggml_flash_attn_ext_add_lse(o, *lse);
+
+            return o;
+        };
+
+        // the sinks are an extra logit in the shared denominator, so they go on one range only
+        ggml_tensor * lse_d = nullptr;
+        ggml_tensor * o_d   = fa_lse(q, k, v, kq_mask, sinks, &lse_d);
+
+        ggml_tensor * o_h   = nullptr;
+        ggml_tensor * lse_h = nullptr;
+
+        for (int64_t s = 0; s < n_stream; ++s) {
+            ggml_tensor * q_s = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1,
+                    q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
+
+            ggml_tensor * m_s = ggml_view_4d(ctx0, kq_mask_host,
+                    kq_mask_host->ne[0], kq_mask_host->ne[1], kq_mask_host->ne[2], 1,
+                    kq_mask_host->nb[1], kq_mask_host->nb[2], kq_mask_host->nb[3], s*kq_mask_host->nb[3]);
+
+            ggml_tensor * k_s = ggml_permute(ctx0, k_host[s], 0, 2, 1, 3);
+            ggml_tensor * v_s = ggml_permute(ctx0, v_host[s], 0, 2, 1, 3);
+
+            ggml_tensor * l_s = nullptr;
+            ggml_tensor * o_s = fa_lse(q_s, k_s, v_s, m_s, nullptr, &l_s);
+
+            o_h   = o_h   ? ggml_concat(ctx0, o_h,   o_s, 3) : o_s;
+            lse_h = lse_h ? ggml_concat(ctx0, lse_h, l_s, 3) : l_s;
+        }
+
+        // exact merge of two disjoint softmax ranges. with l = exp(lse),
+        //   out = (l_d*out_d + l_h*out_h) / (l_d + l_h)
+        // and l_d/(l_d + l_h) == sigmoid(lse_d - lse_h), which stays finite for any difference
+        // including a fully masked range, where the lse is -inf and the weight collapses to 0
+        ggml_tensor * w_d = ggml_sigmoid(ctx0, ggml_sub(ctx0, lse_d, lse_h));
+        ggml_tensor * w_h = ggml_sigmoid(ctx0, ggml_sub(ctx0, lse_h, lse_d));
+
+        ggml_tensor * out = ggml_add(ctx0,
+                ggml_mul(ctx0, o_d, w_d),
+                ggml_mul(ctx0, o_h, w_h));
+
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+
+        ggml_build_forward_expand(gf, out);
+
+        return out;
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2741,8 +2841,20 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        const uint32_t n_kv_host = mctx_cur->is_split() ? mctx_cur->get_n_kv_host() : 0;
+
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams,
+                mctx_cur->is_split() ? (int64_t) mctx_cur->get_n_kv_dev() : -1);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        // the host bank only enters the graph once the conversation runs past the split point
+        if (n_kv_host > 0) {
+            inp->self_k_idxs_host = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+            inp->self_v_idxs_host = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+
+            inp->self_kq_mask_host = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, (int64_t) n_kv_host);
+            inp->self_kq_mask_host_cnv = inp->self_kq_mask_host;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2797,8 +2909,15 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, 0));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, 0));
+
+        // rows that belong to the other bank land on its trash row, so both writes keep a fixed
+        // shape whatever the ubatch does
+        if (inp->get_k_idxs_host()) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs_host(), il, 1));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs_host(), il, 1));
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -2807,7 +2926,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    const auto k_host = mctx_cur->get_k_host(ctx0, il);
+    const auto v_host = mctx_cur->get_v_host(ctx0, il);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            k_host, v_host, inp->get_kq_mask_host());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

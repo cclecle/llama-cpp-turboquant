@@ -115,7 +115,10 @@ public:
         const  layer_share_cb & share,
         // number of layers whose KV is kept in host RAM instead of VRAM (hybrid placement).
         // 0 = all on device. `offload == false` (--no-kv-offload) still means "all layers".
-                     uint32_t   n_cpu_kv_layers = 0);
+                     uint32_t   n_cpu_kv_layers = 0,
+        // number of trailing cells per stream whose KV is kept in host RAM instead of VRAM.
+        // 0 = all on device. rounded up to a multiple of the graph padding quantum.
+                     uint32_t   n_cpu_kv_cells  = 0);
 
     ~llama_kv_cache() = default;
 
@@ -175,13 +178,34 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
-    // get views of the current state of the cache
+    // first cell of layer il that lives in the host bank. == get_size() when the layer is fully on device
+    uint32_t get_n_dev(int32_t il) const;
+
+    // get views of the current state of the cache - device bank, cells [0, min(n_kv, n_dev))
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    // host bank, cells [n_dev, n_kv), one view per stream in [sinfo.s0, sinfo.s1].
+    // per-stream because a view spanning streams would make the scheduler copy the gaps between them.
+    // returns an empty vector when the layer has no host cells in range
+    std::vector<ggml_tensor *> get_k_host(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    std::vector<ggml_tensor *> get_v_host(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // store k_cur and v_cur in the given bank of the cache. rows that do not belong to the bank
+    // are written to its trash row, so both banks keep a fixed shape across ubatches
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, int bank = 0) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, int bank = 0) const;
+
+    // true when the cache is split by cell position, i.e. -nckvc is in effect
+    bool is_split() const;
+
+    // cell counts and allocated rows per bank. the same for every layer
+    struct bank_geom {
+        uint32_t n_cell[2];
+        uint32_t n_row [2];
+    };
+
+    bank_geom get_bank_geom() const;
 
     //
     // preparation API
@@ -211,12 +235,12 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
-    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int bank = 0) const;
+    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int bank = 0) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -226,16 +250,38 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // the KV of one layer is split in two banks by cell position:
+    //   bank 0 = cells [0, n_cell[0])            , normally on the device
+    //   bank 1 = cells [n_cell[0], get_size())   , in host RAM
+    // a bank with n_cell == 0 has no tensors. with -nckvc unset, bank 1 is empty and the
+    // layout is identical to a cache without positional split.
+    static constexpr int KV_BANK_DEV  = 0;
+    static constexpr int KV_BANK_HOST = 1;
+    static constexpr int KV_BANK_N    = 2;
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
         uint32_t il;
 
-        ggml_tensor * k;
-        ggml_tensor * v;
+        ggml_tensor * k[KV_BANK_N];
+        ggml_tensor * v[KV_BANK_N];
 
-        std::vector<ggml_tensor *> k_stream;
-        std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_stream[KV_BANK_N];
+        std::vector<ggml_tensor *> v_stream[KV_BANK_N];
+
+        // logical cells held by each bank. n_cell[0] + n_cell[1] == get_size()
+        uint32_t n_cell[KV_BANK_N];
+
+        // rows allocated per stream. == n_cell[b] plus one trash row when the layer is split,
+        // which gives ggml_set_rows somewhere harmless to send the cells the bank does not own
+        uint32_t n_row[KV_BANK_N];
+
+        bool is_split() const { return n_cell[KV_BANK_DEV] > 0 && n_cell[KV_BANK_HOST] > 0; }
+
+        // bank holding cell c, and the row of c inside that bank
+        int  bank_of(uint32_t c) const { return c < n_cell[KV_BANK_DEV] ? KV_BANK_DEV : KV_BANK_HOST; }
+        uint32_t row_of(uint32_t c) const { return c < n_cell[KV_BANK_DEV] ? c : c - n_cell[KV_BANK_DEV]; }
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -245,6 +291,11 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // first cell of every stream that lives in host RAM. == kv_size when nothing is spilled.
+    // always a multiple of the graph padding quantum, so the two attention ranges keep stable
+    // shapes between the points where n_kv itself changes
+    uint32_t n_dev = 0;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -373,9 +424,20 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // cells attended from each bank in the current ubatch. the split point is the same for
+    // every layer, so this needs no layer index
+    uint32_t get_n_kv_dev () const;
+    uint32_t get_n_kv_host() const;
+
+    bool is_split() const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // host bank, one view per stream in the current ubatch
+    std::vector<ggml_tensor *> get_k_host(ggml_context * ctx, int32_t il) const;
+    std::vector<ggml_tensor *> get_v_host(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -383,8 +445,8 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int bank = 0) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, int bank = 0) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
@@ -395,11 +457,11 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
-    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, int bank = 0) const;
+    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, int bank = 0) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

@@ -120,6 +120,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.n_cpu_kv_layers         = params.n_cpu_kv_layers;
+    cparams.n_cpu_kv_cells          = params.n_cpu_kv_cells;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -3642,6 +3643,7 @@ llama_context_params llama_context_default_params() {
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.n_cpu_kv_layers             =*/ 0,
+        /*.n_cpu_kv_cells              =*/ 0,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
