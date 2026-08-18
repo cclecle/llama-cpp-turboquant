@@ -7,8 +7,8 @@
 //
 //   - the device <-> host copy of the KV bytes stays on the inference thread, because llama.cpp
 //     backends cannot be driven from two threads at once. It is a few ms.
-//   - the file read/write, the fsync and the cross-process lock run on a worker thread here.
-//     That is the part measured in seconds.
+//   - the file read/write and the fsync run on a worker thread here. That is the part measured
+//     in seconds.
 //
 // Workers therefore never touch llama_context: they only ever see the finished byte image.
 
@@ -67,13 +67,15 @@ struct slot_byte_reader {
 //
 // file access
 //
-// Both calls take an advisory cross-process lock on "<path>.lock" for their duration - exclusive
-// for a write, shared for a read - because several server processes can share one
-// --slot-save-path and nothing else coordinates them. They block while waiting, which is safe
-// only because they run on a worker thread. Never call them from the inference thread.
+// Several server processes can share one --slot-save-path, so a save must never be visible
+// half-written. It writes a temp file in the same directory and renames it over the target, which
+// is atomic: a reader sees either the old file or the new one, never a mix, and a crash mid-save
+// leaves the previous file intact. No lock is needed, so nothing can be stranded on disk.
+// These block on disk I/O, so keep calling them from a worker, never the inference thread.
 //
 
-// Write the whole image, fsync it, then release the lock. Returns false and fills err on failure.
+// Write the whole image to a temp file, fsync it, then rename it onto path.
+// Returns false and fills err on failure, leaving any existing file at path untouched.
 bool slot_file_write(const std::string & path, const std::vector<uint8_t> & bytes, std::string & err);
 
 // Read the whole file. Returns false and fills err on failure.

@@ -54,91 +54,15 @@ bool slot_byte_reader::seek(size_t pos) {
 }
 
 //
-// cross-process advisory lock
+// atomic file replacement
 //
-// A sidecar "<path>.lock" is used rather than the state file itself so that the lock survives the
-// truncate-and-rewrite of the target, and so a reader can hold a shared lock while a save is
-// preparing a different file in the same directory.
+// A save writes a temp file in the same directory and renames it over the target. rename is
+// atomic, so a reader never observes a partial file and no cross-process lock is needed. It also
+// means a crash part-way through a save leaves the previous good state file untouched - only a
+// stray ".tmp" is left behind, never a truncated target.
 //
 
 namespace {
-
-class slot_file_lock {
-public:
-    slot_file_lock(const std::string & path, bool exclusive) {
-        const std::string lock_path = path + ".lock";
-
-#if defined(_WIN32)
-        handle = CreateFileA(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (handle == INVALID_HANDLE_VALUE) {
-            return;
-        }
-
-        OVERLAPPED ov = {};
-        const DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
-        if (LockFileEx(handle, flags, 0, MAXDWORD, MAXDWORD, &ov)) {
-            locked = true;
-        }
-#else
-        fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (fd < 0) {
-            return;
-        }
-
-        struct flock fl = {};
-        fl.l_type   = exclusive ? F_WRLCK : F_RDLCK;
-        fl.l_whence = SEEK_SET;
-        fl.l_start  = 0;
-        fl.l_len    = 0;
-
-        // F_SETLKW blocks until the holder is done. That is fine here and only here: this runs on
-        // an I/O worker, never on the inference thread.
-        while (::fcntl(fd, F_SETLKW, &fl) == -1) {
-            if (errno != EINTR) {
-                return;
-            }
-        }
-        locked = true;
-#endif
-    }
-
-    ~slot_file_lock() {
-#if defined(_WIN32)
-        if (handle != INVALID_HANDLE_VALUE) {
-            if (locked) {
-                OVERLAPPED ov = {};
-                UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &ov);
-            }
-            CloseHandle(handle);
-        }
-#else
-        if (fd >= 0) {
-            if (locked) {
-                struct flock fl = {};
-                fl.l_type   = F_UNLCK;
-                fl.l_whence = SEEK_SET;
-                ::fcntl(fd, F_SETLK, &fl);
-            }
-            ::close(fd);
-        }
-#endif
-    }
-
-    slot_file_lock(const slot_file_lock &)             = delete;
-    slot_file_lock & operator=(const slot_file_lock &) = delete;
-
-private:
-    // A lock we could not take is not fatal - the sidecar may sit on a filesystem without
-    // locking (some network mounts). The caller then proceeds unserialised, which is no worse
-    // than the behaviour before locking existed.
-    bool locked = false;
-#if defined(_WIN32)
-    HANDLE handle = INVALID_HANDLE_VALUE;
-#else
-    int fd = -1;
-#endif
-};
 
 bool file_sync(FILE * f) {
     if (std::fflush(f) != 0) {
@@ -167,14 +91,41 @@ void dir_sync(const std::string & path) {
 #endif
 }
 
+// unique per process, so two servers sharing a --slot-save-path cannot clobber each other's temp
+std::string temp_path(const std::string & path) {
+#if defined(_WIN32)
+    const unsigned long pid = GetCurrentProcessId();
+#else
+    const unsigned long pid = (unsigned long) ::getpid();
+#endif
+    return path + ".tmp." + std::to_string(pid);
+}
+
+bool rename_over(const std::string & from, const std::string & to) {
+#if defined(_WIN32)
+    // std::rename fails when the target exists, MoveFileEx replaces it
+    return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return ::rename(from.c_str(), to.c_str()) == 0;
+#endif
+}
+
+void remove_file(const std::string & path) {
+#if defined(_WIN32)
+    DeleteFileA(path.c_str());
+#else
+    ::unlink(path.c_str());
+#endif
+}
+
 } // namespace
 
 bool slot_file_write(const std::string & path, const std::vector<uint8_t> & bytes, std::string & err) {
-    slot_file_lock lock(path, true);
+    const std::string tmp = temp_path(path);
 
-    FILE * f = std::fopen(path.c_str(), "wb");
+    FILE * f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
-        err = "failed to open '" + path + "' for writing: " + std::strerror(errno);
+        err = "failed to open '" + tmp + "' for writing: " + std::strerror(errno);
         return false;
     }
 
@@ -183,31 +134,39 @@ bool slot_file_write(const std::string & path, const std::vector<uint8_t> & byte
     if (!bytes.empty()) {
         ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
         if (!ok) {
-            err = "short write to '" + path + "': " + std::strerror(errno);
+            err = "short write to '" + tmp + "': " + std::strerror(errno);
         }
     }
 
-    // durable before the caller is told the save succeeded
+    // the temp must be durable before it is renamed over the target, else a crash just after the
+    // rename could leave the target pointing at data that never reached the disk
     if (ok && !file_sync(f)) {
         ok  = false;
-        err = "failed to flush '" + path + "': " + std::strerror(errno);
+        err = "failed to flush '" + tmp + "': " + std::strerror(errno);
     }
 
     if (std::fclose(f) != 0 && ok) {
         ok  = false;
-        err = "failed to close '" + path + "': " + std::strerror(errno);
+        err = "failed to close '" + tmp + "': " + std::strerror(errno);
     }
 
-    if (ok) {
-        dir_sync(path);
+    if (ok && !rename_over(tmp, path)) {
+        ok  = false;
+        err = "failed to rename '" + tmp + "' onto '" + path + "': " + std::strerror(errno);
     }
 
-    return ok;
+    if (!ok) {
+        remove_file(tmp);
+        return false;
+    }
+
+    // the rename itself is a directory change, so the directory entry needs syncing too
+    dir_sync(path);
+
+    return true;
 }
 
 bool slot_file_read(const std::string & path, std::vector<uint8_t> & bytes, std::string & err) {
-    slot_file_lock lock(path, false);
-
     FILE * f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {
         err = "failed to open '" + path + "': " + std::strerror(errno);
