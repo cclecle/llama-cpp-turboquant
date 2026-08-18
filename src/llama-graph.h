@@ -338,11 +338,23 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // the host bank of a positionally split cache (-nckvc). null when the cache is not split
+    ggml_tensor * get_k_idxs_host() const { return self_k_idxs_host; }
+    ggml_tensor * get_v_idxs_host() const { return self_v_idxs_host; }
+
+    ggml_tensor * get_kq_mask_host() const { return self_kq_mask_host_cnv; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
+    ggml_tensor * self_k_idxs_host = nullptr;
+    ggml_tensor * self_v_idxs_host = nullptr;
+
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_kq_mask_host     = nullptr; // [n_kv_host, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_host_cnv = nullptr;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1163,6 +1175,8 @@ struct llm_graph_context {
     // attention
     //
 
+    // k_host/v_host hold one view per stream of the host bank of a positionally split KV cache,
+    // and kq_mask_host the matching mask. empty for the ordinary single-range path
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1173,7 +1187,10 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            const std::vector<ggml_tensor *> & k_host = {},
+            const std::vector<ggml_tensor *> & v_host = {},
+            ggml_tensor * kq_mask_host = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

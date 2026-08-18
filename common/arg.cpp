@@ -2587,6 +2587,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_KV_LAYERS"));
     add_opt(common_arg(
+        {"-nckvc", "--n-cpu-kv-cells"}, "N",
+        string_format(
+            "keep the last N cells of every slot's KV cache in host RAM instead of VRAM (default: %d)\n"
+            "unlike -nckvl this splits by position, not by layer: a conversation that stays below\n"
+            "(ctx-size/parallel - N) tokens never touches host RAM and runs at full VRAM speed,\n"
+            "and only the part beyond it costs bus bandwidth. rounded up to a multiple of 256.\n"
+            "requires flash attention",
+            params.n_cpu_kv_cells),
+        [](common_params & params, int value) {
+            params.n_cpu_kv_cells = value;
+        }
+    ).set_env("LLAMA_ARG_N_CPU_KV_CELLS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
