@@ -2579,6 +2579,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_KV_CELLS"));
     add_opt(common_arg(
+        {"--spec-draft-cpu-kv-cells"}, "on|off",
+        string_format(
+            "also apply --n-cpu-kv-cells to the draft KV cache of every speculative type\n"
+            "(draft-mtp, eagle, dflash, draft models, ...) (default: %s)\n"
+            "the draft KV is read on every drafted token, so this costs draft speed. use it when\n"
+            "the offload is a fallback to fit the context at all and VRAM matters more",
+            params.speculative.draft.cpu_kv_cells ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.cpu_kv_cells = is_truthy(value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_KV_CELLS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

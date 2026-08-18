@@ -755,9 +755,18 @@ void llm_graph_input_attn_k_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
     }
 
+    if (self_k_idxs_host && self_k_idxs_host->buffer) {
+        mctx->get_base()->set_input_k_idxs(self_k_idxs_host, ubatch, 1);
+    }
+
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_kq_mask_host && self_kq_mask_host->buffer) {
+        mctx->get_base()->set_input_kq_mask(self_kq_mask_host, ubatch, cparams.causal_attn,
+                mctx->get_base()->get_n_kv_dev());
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -791,7 +800,21 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_kq_mask && self_kq_mask->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+        const auto * base = mctx->get_base();
+
+        if (base->is_split()) {
+            res &= self_kq_mask->ne[0] == (int64_t) base->get_n_kv_dev();
+
+            const uint32_t n_kv_host = base->get_n_kv_host();
+
+            res &= (self_kq_mask_host != nullptr) == (n_kv_host > 0);
+
+            if (self_kq_mask_host) {
+                res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+            }
+        } else {
+            res &= can_reuse_kq_mask(self_kq_mask, base, params.ubatch, params.cparams);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -3411,15 +3434,20 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
 
-    // see the note in build_attn(llm_graph_input_attn_kv *): the split needs the two-range path
-    GGML_ASSERT(!mctx_iswa->get_base()->is_split() && "-nckvc is not supported on this attention path");
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    // only the base cache can be positionally split - the SWA cache recycles its cells
+    const bool split = !is_swa && inp->get_k_idxs_host() != nullptr;
 
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, 0));
+
+        if (split) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs_host(), il, 1));
+        }
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
@@ -3429,7 +3457,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    const auto k_host = split ? mctx_cur->get_k_host(ctx0, il) : std::vector<ggml_tensor *>();
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il,
+            k_host, k_host, split ? inp->get_kq_mask_host() : nullptr);
     cb(cur, "kqv_out", il);
 
     if (k_rot) {
@@ -3646,10 +3677,22 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     auto inp = std::make_unique<llm_graph_input_attn_k_iswa>(hparams, cparams, mctx_cur);
 
     {
-        inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
+        const auto * base = mctx_cur->get_base();
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
+        inp->self_k_idxs = base->build_input_k_idxs(ctx0, ubatch);
+
+        const uint32_t n_kv_host = base->is_split() ? base->get_n_kv_host() : 0;
+
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, base, ubatch, cparams,
+                base->is_split() ? (int64_t) base->get_n_kv_dev() : -1);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        if (n_kv_host > 0) {
+            inp->self_k_idxs_host = base->build_input_k_idxs(ctx0, ubatch);
+
+            inp->self_kq_mask_host = build_attn_inp_kq_mask(ctx0, base, ubatch, cparams, (int64_t) n_kv_host);
+            inp->self_kq_mask_host_cnv = inp->self_kq_mask_host;
+        }
     }
 
     {
