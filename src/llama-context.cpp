@@ -2334,6 +2334,18 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // a positionally split KV cache (-nckvc) attends a second, host-resident range per layer: the
+    // per-stream views of that range, the concat gathering them, one more flash-attn call with its
+    // log-sum-exp output, the merge, and a second pair of ggml_set_rows to write the host bank.
+    // the estimates above carry no slack, so this has to be accounted for rather than absorbed
+    if (cparams.n_cpu_kv_cells > 0) {
+        const uint32_t n_stream = cparams.kv_unified ? 1 : cparams.n_seq_max;
+
+        // per layer: ~18 fixed (casts, flash-attn, lse, the 7-op merge, reshape, 2x set_rows and
+        // their views) plus ~4 per stream (a K and a V view, and the concat consuming each)
+        res += model.hparams.n_layer_all * (24 + 6*n_stream);
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
