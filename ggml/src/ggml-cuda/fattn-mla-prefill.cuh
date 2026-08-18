@@ -301,7 +301,7 @@ static __global__ void flash_attn_ext_mla_prefill(
         if (q_g >= int(ne01.z)) {
             continue;
         }
-        const float norm = gridDim.y == 1 ? 1.0f/Sm[q_l] : 1.0f;
+        const float norm = dst_meta_ptr == nullptr ? 1.0f/Sm[q_l] : 1.0f;
         const int j_dst = ((sequence*int(ne01.z) + q_g)*ne02 + head0)*gridDim.y + blockIdx.y;
 #pragma unroll
         for (int t = 0; t < C::NDV; ++t) {
@@ -313,7 +313,7 @@ static __global__ void flash_attn_ext_mla_prefill(
         }
     }
 
-    if (gridDim.y != 1 && tid < Br && col_Q_0 + tid < int(ne01.z)) {
+    if (dst_meta_ptr != nullptr && tid < Br && col_Q_0 + tid < int(ne01.z)) {
         const int j_dst = ((sequence*int(ne01.z) + col_Q_0 + tid)*ne02 + head0)*gridDim.y + blockIdx.y;
         dst_meta_ptr[j_dst] = make_float2(Mx[tid], Sm[tid]);
     }
