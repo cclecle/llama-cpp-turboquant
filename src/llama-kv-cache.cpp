@@ -125,8 +125,11 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // keep at least one quantum on the device, so the split path always has both ranges and
-        // never degenerates into an all-host cache with no device bank
-        n_dev = kv_size - std::min(n_host, kv_size - n_pad_cur);
+        // never degenerates into an all-host cache with no device bank.
+        // a cache smaller than one quantum cannot be split at all
+        const uint32_t n_host_max = kv_size > n_pad_cur ? kv_size - n_pad_cur : 0;
+
+        n_dev = kv_size - std::min(n_host, n_host_max);
     }
 
     const uint32_t n_layer = hparams.n_layer_all;
@@ -1304,10 +1307,14 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
+    GGML_ASSERT(!layers.empty());
+
     return (layers[0].k[KV_BANK_DEV] ? layers[0].k[KV_BANK_DEV] : layers[0].k[KV_BANK_HOST])->type;
 }
 
 ggml_type llama_kv_cache::type_v() const {
+    GGML_ASSERT(!layers.empty());
+
     return (layers[0].v[KV_BANK_DEV] ? layers[0].v[KV_BANK_DEV] : layers[0].v[KV_BANK_HOST])->type;
 }
 
@@ -1352,6 +1359,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 uint32_t llama_kv_cache::get_n_dev(int32_t il) const {
+    if (layers.empty()) {
+        return get_size();
+    }
+
     const auto it = map_layer_ids.find(il);
 
     // the split point is the same for every layer in the cache
@@ -1365,10 +1376,8 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layer.k[KV_BANK_DEV];
 
-    // the whole layer is spilled - only the host bank has cells
-    if (!k) {
-        return nullptr;
-    }
+    // the device bank always keeps at least one quantum, so this never legitimately trips
+    GGML_ASSERT(k && "kv cache device bank has no K tensor");
 
     const uint64_t n_row        = layer.n_row[KV_BANK_DEV];
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1608,7 +1617,9 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 }
 
 bool llama_kv_cache::is_split() const {
-    return n_dev > 0 && n_dev < get_size();
+    // an iswa half can own no layers at all (a model with only SWA layers, or only non-SWA ones).
+    // it has nothing to split, and no layer to read the bank geometry from
+    return !layers.empty() && n_dev > 0 && n_dev < get_size();
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

@@ -648,8 +648,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
                 }
-                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
-                ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
+                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il, 0));
+                ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il, 0));
+
+                // the base cache may be positionally split - without this the injected cells past
+                // the split point go to the bank's trash row and are silently lost
+                if (!is_swa && inp_attn_iswa->get_k_idxs_host()) {
+                    ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_host(), il, 1));
+                    ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, inp_attn_iswa->get_v_idxs_host(), il, 1));
+                }
             } else {
                 // rotate K/V into the cache's rotated space
                 if (inp_attn->self_k_rot) {
@@ -658,8 +665,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (inp_attn->self_v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
                 }
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il, 0));
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il, 0));
+
+                if (inp_attn->get_k_idxs_host()) {
+                    ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs_host(), il, 1));
+                    ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs_host(), il, 1));
+                }
             }
         }
 

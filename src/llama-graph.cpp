@@ -2701,8 +2701,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
 
     // positional KV split: attend the device range and the host range separately, then merge them
-    // with the log-sum-exp each flash-attn call reports. the host range is done one stream at a
-    // time, because a view spanning streams would make the scheduler copy the gaps between them
+    // with the log-sum-exp each flash-attn call reports. the host range arrives as one view per
+    // stream - a view spanning streams would make the scheduler copy the gaps between them - so
+    // concatenate those views into one compact tensor and attend it in a single call
     if (!k_host.empty()) {
         GGML_ASSERT(use_flash_attn && "the positional KV split needs flash attention");
         GGML_ASSERT(kq_mask_host != nullptr);
@@ -2737,26 +2738,30 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * lse_d = nullptr;
         ggml_tensor * o_d   = fa_lse(q, k, v, kq_mask, sinks, &lse_d);
 
-        ggml_tensor * o_h   = nullptr;
-        ggml_tensor * lse_h = nullptr;
+        // gather the per-stream host views. each is contiguous, so the scheduler copies exactly the
+        // cells past the split point for that stream and nothing between them
+        const bool v_aliases_k = v_host.data() == k_host.data() || v_host[0] == k_host[0];
 
-        for (int64_t s = 0; s < n_stream; ++s) {
-            ggml_tensor * q_s = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1,
-                    q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
+        ggml_tensor * k_h = k_host[0];
+        ggml_tensor * v_h = v_host[0];
 
-            ggml_tensor * m_s = ggml_view_4d(ctx0, kq_mask_host,
-                    kq_mask_host->ne[0], kq_mask_host->ne[1], kq_mask_host->ne[2], 1,
-                    kq_mask_host->nb[1], kq_mask_host->nb[2], kq_mask_host->nb[3], s*kq_mask_host->nb[3]);
-
-            ggml_tensor * k_s = ggml_permute(ctx0, k_host[s], 0, 2, 1, 3);
-            ggml_tensor * v_s = ggml_permute(ctx0, v_host[s], 0, 2, 1, 3);
-
-            ggml_tensor * l_s = nullptr;
-            ggml_tensor * o_s = fa_lse(q_s, k_s, v_s, m_s, nullptr, &l_s);
-
-            o_h   = o_h   ? ggml_concat(ctx0, o_h,   o_s, 3) : o_s;
-            lse_h = lse_h ? ggml_concat(ctx0, lse_h, l_s, 3) : l_s;
+        for (int64_t s = 1; s < n_stream; ++s) {
+            k_h = ggml_concat(ctx0, k_h, k_host[s], 3);
         }
+
+        if (v_aliases_k) {
+            v_h = k_h;
+        } else {
+            for (int64_t s = 1; s < n_stream; ++s) {
+                v_h = ggml_concat(ctx0, v_h, v_host[s], 3);
+            }
+        }
+
+        k_h = ggml_permute(ctx0, k_h, 0, 2, 1, 3);
+        v_h = v_aliases_k ? k_h : ggml_permute(ctx0, v_h, 0, 2, 1, 3);
+
+        ggml_tensor * lse_h = nullptr;
+        ggml_tensor * o_h   = fa_lse(q, k_h, v_h, kq_mask_host, nullptr, &lse_h);
 
         // exact merge of two disjoint softmax ranges. with l = exp(lse),
         //   out = (l_d*out_d + l_h*out_h) / (l_d + l_h)
