@@ -6218,6 +6218,11 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
 }
 
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // this backend does not write the flash-attn log-sum-exp output
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
+
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();
 
