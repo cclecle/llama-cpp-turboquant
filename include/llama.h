@@ -402,6 +402,11 @@ extern "C" {
         // keep the KV cache of the first n_cpu_kv_layers layers in host RAM instead of VRAM.
         // 0 = all on device. Lets a model use whatever VRAM is left for KV and spill only the rest.
         uint32_t n_cpu_kv_layers;
+
+        // keep the last n_cpu_kv_cells cells of every stream in host RAM instead of VRAM.
+        // 0 = all on device. Splits by cell position, so a short conversation pays nothing.
+        // rounded up to a multiple of 256. requires flash attention.
+        uint32_t n_cpu_kv_cells;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
