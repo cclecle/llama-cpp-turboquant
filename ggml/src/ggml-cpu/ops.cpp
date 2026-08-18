@@ -5260,7 +5260,10 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                if (i1 < 0 || i1 >= ne1) {
+                    GGML_ABORT("%s: row index %lld out of range [0, %lld) for dst '%s' (src1 '%s', i10=%lld)",
+                            __func__, (long long) i1, (long long) ne1, dst->name, src1->name, (long long) i10);
+                }
 
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(
