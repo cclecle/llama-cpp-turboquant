@@ -2437,6 +2437,18 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // attach a destination tensor for the log-sum-exp of the softmax denominator
+    //   lse: [1, n_head, n_batch, ne3] F32
+    // the op writes lse in addition to the normalized result. this lets two attention
+    // calls over disjoint KV ranges be merged exactly:
+    //   w_a = sigmoid(lse_a - lse_b), w_b = sigmoid(lse_b - lse_a), out = w_a*out_a + w_b*out_b
+    // a fully masked row gives out = 0 and lse = -INFINITY
+    // note: consumers of lse must also depend on the result of `a`, so that they are
+    //       ordered after the op that writes it
+    GGML_API void ggml_flash_attn_ext_add_lse(
+            struct ggml_tensor * a,
+            struct ggml_tensor * lse);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

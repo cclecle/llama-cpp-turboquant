@@ -8465,6 +8465,22 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// write the log-sum-exp of the softmax denominator, if a destination was attached
+static void ggml_flash_attn_ext_write_lse(
+        ggml_tensor * dst,
+        int64_t i1, int64_t i2, int64_t i3,
+        float M, float S) {
+    ggml_tensor * lse = dst->src[5];
+    if (!lse) {
+        return;
+    }
+
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+
+    ((float *) lse->data)[i3*ne2*ne1 + i1*ne1 + i2] = S == 0.0f ? -INFINITY : M + logf(S);
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8699,6 +8715,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+
+            ggml_flash_attn_ext_write_lse(dst, i1, i2, i3, M, S);
         }
     }
 }
@@ -8964,6 +8982,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
                 if (s > M[tq]) {
                     ms = expf(M[tq] - s);
+                    M[tq] = s;
                     ggml_vec_scale_f32(DV, VKQ32 + tq * DV, ms);
                 } else {
                     vs = expf(s - M[tq]);
@@ -8985,6 +9004,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+
+            ggml_flash_attn_ext_write_lse(dst, i1, i2, i3, M[tq], S[tq]);
         }
 
         ir += tile_rows;
@@ -9060,6 +9081,8 @@ static void ggml_flash_attn_ext_reduce_partials(
         }
         // iq1=0, iq3=0 for decode
         memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+
+        ggml_flash_attn_ext_write_lse(dst, 0, q_head, 0, M_final, S_final);
     }
 }
 
