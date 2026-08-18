@@ -3120,7 +3120,9 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
+                    // bytes read from the file, so it matches the n_written the save reported.
+                    // llama_state_seq_load_buffer only counts the sequence state, not the trailer
+                    res->n_bytes  = image.size();
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
