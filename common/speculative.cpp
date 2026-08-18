@@ -2962,6 +2962,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // the draft's KV placement does not follow the target's (see common_params_speculative_draft)
     result.no_kv_offload    = !params_spec.kv_offload;
     result.n_cpu_kv_layers  = 0;
+    // the draft KV is read on every speculated token, so keep it resident. this also stops the
+    // target's -nckvc from colliding with the draft's own kv-offload setting
+    result.n_cpu_kv_cells   = 0;
 
     return result;
 }
