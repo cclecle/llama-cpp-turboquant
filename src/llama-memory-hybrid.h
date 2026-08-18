@@ -39,7 +39,10 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* positional KV spill, forwarded to the attention cache only:
+                               the recurrent state is per sequence, not per token */
+                 uint32_t   n_cpu_kv_cells = 0);
 
     ~llama_memory_hybrid() = default;
 

@@ -27,7 +27,10 @@ public:
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const layer_filter_cb & filter_idx,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        // positional KV spill, applied to the main cache only - the indexer cache is
+        // small and read in full every step
+                     uint32_t   n_cpu_kv_cells = 0);
 
     ~llama_kv_cache_msa() = default;
 
