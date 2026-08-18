@@ -338,7 +338,7 @@ static __global__ void flash_attn_ext_mla_decode(
             dst_val[i] = VKQ[h][i];
         }
 
-        if (gridDim.y == 1) {
+        if (dst_meta_ptr == nullptr) {
             const float inv_sum = 1.0f / KQ_sum_s[h];
 #pragma unroll
             for (int i = 0; i < dpl_B; ++i) {
@@ -353,7 +353,7 @@ static __global__ void flash_attn_ext_mla_decode(
         }
     }
 
-    if (gridDim.y != 1 && tid < ncols2) {
+    if (dst_meta_ptr != nullptr && tid < ncols2) {
         dst_meta_ptr[((sequence*int(ne01.z) + 0)*ne02 + head0 + tid)*gridDim.y + blockIdx.y] =
             make_float2(KQ_max_s[tid], KQ_sum_s[tid]);
     }

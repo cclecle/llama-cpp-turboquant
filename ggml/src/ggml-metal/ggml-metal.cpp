@@ -739,6 +739,11 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // this backend does not write the flash-attn log-sum-exp output
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
+
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     return ggml_metal_device_supports_op(ctx_dev, op);

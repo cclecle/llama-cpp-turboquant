@@ -494,7 +494,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -715,6 +715,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+
+    // the mma kernel keeps its partials in the stream-k layout, which the combine kernel that
+    // writes the LSE does not read. the tile kernel goes through the combine path, so use it
+    // when a caller asks for the LSE.
+    if (dst->src[5] && kernel == BEST_FATTN_KERNEL_MMA_F16) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
+    return kernel;
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
