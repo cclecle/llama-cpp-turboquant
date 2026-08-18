@@ -2323,8 +2323,33 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// -nckvc splits an attention KV cache by cell position. Not every memory type can carry it, and
+// a cache that quietly ignores it allocates the full context on the device instead, which shows
+// up as an unrelated-looking OOM. Refuse instead.
+static void kv_cells_unsupported(const llama_cparams & cparams, const char * arch_name, const char * mem_name) {
+    if (cparams.n_cpu_kv_cells == 0) {
+        return;
+    }
+
+    throw std::runtime_error(
+            format("n_cpu_kv_cells (-nckvc) is not supported for %s, whose memory type is %s", arch_name, mem_name));
+}
+
+// -nckvl predates the positional split and is ignored the same way, but warn rather than refuse:
+// something may already rely on it being a no-op here
+static void kv_layers_ignored(const llama_cparams & cparams, const char * arch_name, const char * mem_name) {
+    if (cparams.n_cpu_kv_layers == 0) {
+        return;
+    }
+
+    LLAMA_LOG_WARN("%s: n_cpu_kv_layers (-nckvl) is ignored for %s, whose memory type is %s\n",
+            __func__, arch_name, mem_name);
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    const char * arch_name = llm_arch_name(arch);
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2344,6 +2369,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
             {
+                kv_cells_unsupported(cparams, arch_name, "none");
+
                 res = nullptr;
             } break;
         case LLM_ARCH_MINIMAX_M3:
@@ -2351,6 +2378,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // sparse (MSA) layers carry an indexer key cache, but leading dense layers do not
                 llama_kv_cache::layer_filter_cb filter_idx =
                     [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
+
+                kv_layers_ignored(cparams, arch_name, "llama_kv_cache_msa");
 
                 res = new llama_kv_cache_msa(
                         *this,
@@ -2366,7 +2395,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.swa_type,
                         nullptr,
                         filter_idx,
-                        nullptr);
+                        nullptr,
+                        cparams.n_cpu_kv_cells);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2403,6 +2433,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
                     }
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
+
+                    kv_cells_unsupported(cparams, arch_name, "llama_kv_cache_dsa");
 
                     res = new llama_kv_cache_dsa(
                             *this,
@@ -2540,6 +2572,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr);
                 } else {
+                    kv_cells_unsupported(cparams, arch_name, "llama_kv_cache_dsv4");
+
                     res = new llama_kv_cache_dsv4(
                             *this,
                             params.type_k,
@@ -2660,7 +2694,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* n_cpu_kv_cells    */ cparams.n_cpu_kv_cells);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2681,7 +2716,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* n_cpu_kv_cells    */ cparams.n_cpu_kv_cells);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2700,8 +2736,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* n_cpu_kv_cells    */ cparams.n_cpu_kv_cells);
                     }
+
+                    kv_layers_ignored(cparams, arch_name, "llama_memory_hybrid");
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
