@@ -51,6 +51,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr,
+        "",
         0,
         n_cpu_kv_cells
     )),

@@ -99,6 +99,10 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // a bare 0 here binds as a null pointer constant and silently shifts the two KV-placement
+    // knobs one slot left, which only shows up as "cache_(null)k_l0" much later
+    GGML_ASSERT(name_tag != nullptr);
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     // the graph pads the attended KV extent to this quantum (see get_n_kv), and kv_size is already
