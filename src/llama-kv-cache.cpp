@@ -195,6 +195,9 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    uint32_t n_layer_host = 0;
+    ggml_backend_buffer_type_t buft_host_any = ggml_backend_cpu_buffer_type();
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -252,6 +255,8 @@ llama_kv_cache::llama_kv_cache(
         // A layer spilled in full has no device bank at all, which is the pre-existing behaviour.
         const bool layer_in_host_ram = !offload || (il < n_cpu_kv_layers);
 
+        n_layer_host += layer_in_host_ram;
+
         auto * dev = model.dev_layer(il);
 
         ggml_backend_buffer_type_t buft_dev  = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
@@ -268,6 +273,8 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        buft_host_any = buft_host;
+
         kv_layer layer = {};
 
         layer.il = il;
@@ -279,14 +286,6 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev cells = %u, host cells = %u\n",
                 __func__, il, layer.n_cell[KV_BANK_DEV], layer.n_cell[KV_BANK_HOST]);
-
-        if (il == 0) {
-            const uint32_t n_layer_tot  = hparams.n_layer();
-            const uint32_t n_layer_host = offload ? std::min(n_cpu_kv_layers, n_layer_tot) : n_layer_tot;
-            LLAMA_LOG_INFO("%s: KV cache placement: %u/%u layers fully in host RAM ('%s'), %u split at cell %u of %u\n",
-                    __func__, n_layer_host, n_layer_tot, ggml_backend_buft_name(buft_host),
-                    n_layer_tot - n_layer_host, n_dev, kv_size);
-        }
 
         const bool has_k = true;
         const bool has_v = !is_mla;
@@ -332,6 +331,12 @@ llama_kv_cache::llama_kv_cache(
 
         layers.push_back(layer);
     }
+
+    // count the layers this cache actually holds: a filtered cache (hybrid attention, SWA) skips
+    // model layers, so -nckvl spilling "the first N" of them spills fewer than N
+    LLAMA_LOG_INFO("%s: KV cache placement: %u/%u cache layers fully in host RAM ('%s'), %u split at cell %u of %u\n",
+            __func__, n_layer_host, (uint32_t) layers.size(), ggml_backend_buft_name(buft_host_any),
+            (uint32_t) layers.size() - n_layer_host, n_dev, kv_size);
 
     if (reuse) {
         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
