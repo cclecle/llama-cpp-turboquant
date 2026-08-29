@@ -830,6 +830,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (!split_states_equal(src_ss[0], src_ss[2])) {
+            GGML_LOG_ERROR("[META] set_rows mismatch node=%s | src0=%s axis=%s nseg=%d nr0=%d | src2=%s axis=%s nseg=%d nr0=%d\n",
+                    tensor->name,
+                    tensor->src[0]->name, ggml_backend_meta_split_axis_name(src_ss[0].axis), (int) src_ss[0].n_segments, (int) src_ss[0].nr[0],
+                    tensor->src[2]->name, ggml_backend_meta_split_axis_name(src_ss[2].axis), (int) src_ss[2].n_segments, (int) src_ss[2].nr[0]);
+        }
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
