@@ -37,11 +37,7 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx,
-                            /* positional KV spill, forwarded to the attention cache only:
-                               the recurrent state is per sequence, and the indexer is one key
-                               head per layer that every token scores against, so both stay resident */
-                 uint32_t   n_cpu_kv_cells = 0);
+    const layer_filter_cb & filter_idx);
 
     ~llama_memory_hybrid_idx() = default;
 
