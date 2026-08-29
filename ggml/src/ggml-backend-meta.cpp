@@ -870,7 +870,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // mirrored, so device-local Q head h maps to KV head 0 on every device - the same head it
         // maps to without the split. Head-parallel Q is therefore exact here.
         if (q_head_split && kv_mirrored && tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1) {
-            GGML_ASSERT(tensor->src[4] == nullptr); // sinks are per head, they would need a split
+            // sinks are per head, so a head-split Q needs them split the same way
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
         }
 
