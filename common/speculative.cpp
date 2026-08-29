@@ -3000,6 +3000,27 @@ struct common_speculative_init_result::impl {
     llama_context_ptr context;
 };
 
+// Splitting a draft KV cache is often a losing trade. The host-range staging in the compute
+// buffer scales with the host pool and the stream count but NOT with the layer count, so a draft
+// with few layers pays the same staging as the full target while saving only its own small KV.
+// Rather than refuse to start, drop the draft split and carry on - the flag is there to make a
+// context fit, and a draft that stays resident still fits it.
+static llama_context * spec_init_ctx_retry_unsplit(llama_model * model, llama_context_params & cparams, const char * what) {
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (ctx != nullptr || cparams.n_cpu_kv_cells == 0) {
+        return ctx;
+    }
+
+    LOG_WRN("%s: could not create the %s with n_cpu_kv_cells = %u, retrying with the draft KV resident\n",
+            __func__, what, cparams.n_cpu_kv_cells);
+    LOG_WRN("%s: a draft split costs compute buffer in proportion to the host pool and the slot count,\n", __func__);
+    LOG_WRN("%s: but saves KV only in proportion to the draft's own layers\n", __func__);
+
+    cparams.n_cpu_kv_cells = 0;
+
+    return llama_init_from_model(model, cparams);
+}
+
 common_speculative_init_result::common_speculative_init_result(
     common_params & params,
       llama_model * model_tgt,
@@ -3038,7 +3059,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
-        llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
+        llama_context * ctx_dft = spec_init_ctx_retry_unsplit(model_dft, cparams, "draft context");
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -3050,7 +3071,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
-        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
+        llama_context * ctx_dft = spec_init_ctx_retry_unsplit(model_tgt, cparams, "MTP context");
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
