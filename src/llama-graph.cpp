@@ -46,6 +46,24 @@ static ggml_tensor * build_attn_inp_kq_mask(
     return res;
 }
 
+// the split branches size ne[0] per range (device / host), so they check that themselves;
+// everything else about the mask shape is the same and must be checked too
+static bool can_reuse_kq_mask_shape(
+        ggml_tensor * kq_mask,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    const auto n_tokens = ubatch.n_tokens;
+    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    bool res = true;
+
+    res &= (kq_mask->ne[1] == n_tokens/n_stream);
+    res &= (kq_mask->ne[2] == 1);
+    res &= (kq_mask->ne[3] == n_stream);
+
+    return res;
+}
+
 static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
@@ -509,6 +527,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     // the split point only moves when n_kv crosses a padding quantum, so both extents are stable
     // between the points where the graph is rebuilt anyway
     res &= self_kq_mask->ne[0] == (mctx->is_split() ? (int64_t) mctx->get_n_kv_dev() : (int64_t) mctx->get_n_kv());
+    res &= can_reuse_kq_mask_shape(self_kq_mask, params.ubatch, params.cparams);
 
     const uint32_t n_kv_host = mctx->is_split() ? mctx->get_n_kv_host() : 0;
 
@@ -516,6 +535,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_host) {
         res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+        res &= can_reuse_kq_mask_shape(self_kq_mask_host, params.ubatch, params.cparams);
     }
 
     return res;
@@ -548,6 +568,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
 
     if (mctx->is_split()) {
         res &= self_kq_mask->ne[0] == (int64_t) mctx->get_n_kv_dev();
+        res &= can_reuse_kq_mask_shape(self_kq_mask, params.ubatch, params.cparams);
 
         const uint32_t n_kv_host = mctx->get_n_kv_host();
 
@@ -555,6 +576,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
 
         if (self_kq_mask_host) {
             res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+            res &= can_reuse_kq_mask_shape(self_kq_mask_host, params.ubatch, params.cparams);
         }
     } else {
         res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
@@ -723,6 +745,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         if (base->is_split()) {
             // the split point only moves when n_kv crosses a padding quantum
             res &= self_kq_mask->ne[0] == (int64_t) base->get_n_kv_dev();
+            res &= can_reuse_kq_mask_shape(self_kq_mask, params.ubatch, params.cparams);
 
             const uint32_t n_kv_host = base->get_n_kv_host();
 
@@ -730,6 +753,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
             if (self_kq_mask_host) {
                 res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+                res &= can_reuse_kq_mask_shape(self_kq_mask_host, params.ubatch, params.cparams);
             }
         } else {
             res &= can_reuse_kq_mask(self_kq_mask, base, params.ubatch, params.cparams);
@@ -804,6 +828,7 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
 
         if (base->is_split()) {
             res &= self_kq_mask->ne[0] == (int64_t) base->get_n_kv_dev();
+            res &= can_reuse_kq_mask_shape(self_kq_mask, params.ubatch, params.cparams);
 
             const uint32_t n_kv_host = base->get_n_kv_host();
 
@@ -811,6 +836,7 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
 
             if (self_kq_mask_host) {
                 res &= self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+                res &= can_reuse_kq_mask_shape(self_kq_mask_host, params.ubatch, params.cparams);
             }
         } else {
             res &= can_reuse_kq_mask(self_kq_mask, base, params.ubatch, params.cparams);
@@ -1211,6 +1237,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
         if (attn->is_split()) {
             res &= inp_attn->self_kq_mask->ne[0] == (int64_t) attn->get_n_kv_dev();
+            res &= can_reuse_kq_mask_shape(inp_attn->self_kq_mask, params.ubatch, params.cparams);
 
             const uint32_t n_kv_host = attn->get_n_kv_host();
 
@@ -1218,6 +1245,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
             if (inp_attn->self_kq_mask_host) {
                 res &= inp_attn->self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+                res &= can_reuse_kq_mask_shape(inp_attn->self_kq_mask_host, params.ubatch, params.cparams);
             }
         } else {
             res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn, params.ubatch, params.cparams);
@@ -1272,6 +1300,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
         if (attn->is_split()) {
             res &= inp_attn->self_kq_mask->ne[0] == (int64_t) attn->get_n_kv_dev();
+            res &= can_reuse_kq_mask_shape(inp_attn->self_kq_mask, params.ubatch, params.cparams);
 
             const uint32_t n_kv_host = attn->get_n_kv_host();
 
@@ -1279,6 +1308,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
             if (inp_attn->self_kq_mask_host) {
                 res &= inp_attn->self_kq_mask_host->ne[0] == (int64_t) n_kv_host;
+                res &= can_reuse_kq_mask_shape(inp_attn->self_kq_mask_host, params.ubatch, params.cparams);
             }
         } else {
             res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn, params.ubatch, params.cparams);
@@ -2762,6 +2792,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * lse_h = nullptr;
         ggml_tensor * o_h   = fa_lse(q, k_h, v_h, kq_mask_host, nullptr, &lse_h);
+
+        // the lse is written as a side effect of the flash-attn op and nothing depends on it,
+        // so both calls must be in the graph before anything reads one
+        ggml_build_forward_expand(gf, o_d);
+        ggml_build_forward_expand(gf, o_h);
 
         // exact merge of two disjoint softmax ranges. with l = exp(lse),
         //   out = (l_d*out_d + l_h*out_h) / (l_d + l_h)
