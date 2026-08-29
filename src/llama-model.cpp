@@ -2529,6 +2529,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_indexer_full(il); };
 
+                    kv_cells_unsupported(cparams, arch_name, "llama_kv_cache_dsa_iswa");
+
                     res = new llama_kv_cache_dsa_iswa(
                             *this,
                             params.type_k,
@@ -2697,6 +2699,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* n_cpu_kv_cells    */ cparams.n_cpu_kv_cells);
                     } else if (needs_mem_idx) {
+                        // QSA reads the whole cache through the single-tensor get_k/get_v and calls
+                        // build_attn_mha itself, so it never sees the two banks of a positional split
+                        kv_cells_unsupported(cparams, arch_name, "llama_memory_hybrid_idx");
+
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
@@ -2716,8 +2722,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx),
-                            /* n_cpu_kv_cells    */ cparams.n_cpu_kv_cells);
+                            /* filter_idx        */ std::move(filter_idx));
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
