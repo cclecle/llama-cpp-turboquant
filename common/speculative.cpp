@@ -957,7 +957,7 @@ struct common_speculative_impl_draft_eagle : public common_speculative_impl {
     std::vector<int32_t>            verify_h_rows;    // [n_seq] - number of rows
 
     common_speculative_impl_draft_eagle(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE, n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE, n_seq, params.draft.n_max)
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle'\n");
