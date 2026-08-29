@@ -970,7 +970,9 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    // a fully masked range leaves both at 0; match the CPU reference and the documented
+    // contract (out = 0, lse = -INFINITY) instead of producing NaN
+    dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
 
     if (dst_lse_ptr && tid == 0) {
         dst_lse_ptr[j_dst_unrolled] = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
