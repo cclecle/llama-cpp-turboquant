@@ -346,11 +346,11 @@ static void ggml_cuda_flash_attn_ext_mla_prefill_case(ggml_backend_cuda_context 
     if (logit_softcap == 0.0f) {
         fattn_kernel_t fattn_kernel = flash_attn_ext_mla_prefill<Br, Bc, NW, false>;
         launch_fattn<MLA_PRE_DV, Br, 1>
-            (ctx, dst, fattn_kernel, NW, nbytes_shared, Bc, true, true, false);
+            (ctx, dst, fattn_kernel, NW, nbytes_shared, Bc, true, true, false, false);
     } else {
         fattn_kernel_t fattn_kernel = flash_attn_ext_mla_prefill<Br, Bc, NW, true>;
         launch_fattn<MLA_PRE_DV, Br, 1>
-            (ctx, dst, fattn_kernel, NW, nbytes_shared, Bc, true, true, false);
+            (ctx, dst, fattn_kernel, NW, nbytes_shared, Bc, true, true, false, false);
     }
 }
 
