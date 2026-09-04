@@ -390,11 +390,11 @@ static void ggml_cuda_flash_attn_ext_mla_decode_case_impl(ggml_backend_cuda_cont
     if (logit_softcap == 0.0f) {
         fattn_kernel_t fattn_kernel = flash_attn_ext_mla_decode<ncols2, nthreads_t, nbatch_fa_t, type_K, false>;
         launch_fattn<MLA_DEC_DV, 1, ncols2>
-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_t, need_f16_K, false, false);
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_t, need_f16_K, false, false, false);
     } else {
         fattn_kernel_t fattn_kernel = flash_attn_ext_mla_decode<ncols2, nthreads_t, nbatch_fa_t, type_K, true>;
         launch_fattn<MLA_DEC_DV, 1, ncols2>
-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_t, need_f16_K, false, false);
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_t, need_f16_K, false, false, false);
     }
 }
 
