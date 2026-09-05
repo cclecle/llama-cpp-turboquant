@@ -1770,6 +1770,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+static bool spec_model_arch_is(const llama_model * model, const char * arch) {
+    char buf[64];
+    const int32_t n = llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf));
+    return n > 0 && strcmp(buf, arch) == 0;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1863,7 +1869,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // only the gemma4 assistant mirrors the target KV. other draft heads set ctx_other just to borrow the target embeddings and output, and keep their own KV
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && spec_model_arch_is(llama_get_model(ctx_dft), "gemma4-assistant");
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
