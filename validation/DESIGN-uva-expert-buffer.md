@@ -254,3 +254,30 @@ SINGLEGPU (GPU 0, `llamacpp-0` flags):
 Not covered by this check: the other rungs of each family, vision (mmproj) profiles, slot save and
 restore, the speculative decoders' acceptance on each model, and throughput within noise of v12 on the
 same rung (only a single sample per model here).
+
+## 7. Cutover to v14 (2026-09-05 09:26, on the user's instruction after the fleet check)
+
+- Units `llamacpp-0`, `llamacpp-1`, `llamacpp-both` repointed from v12 to v14 and restarted. Backups:
+  `/etc/systemd/system/llamacpp-*.service.bak-v12-20260905-092637`.
+- `/opt/llamacpp-config/DUALGPU/Qwen3.8-Flash-Next.ini` rewritten for the mapped placement: every rung
+  keeps its layer count N but as `n-cpu-moe = 0` plus the `ot = ...=ROCm0_UVA` line (same VRAM as before,
+  so the recorded "tested ok" figures stand); the base rung (c=131072, 1 slot) gets 10 mapped layers and
+  the shared MTP head (`md`, `spec-type = draft-mtp`, `spec-draft-n-max = 2`), the configuration measured
+  at 41.9 / 45.4 t/s and 1087 t/s prefill. The MTP + ngram combination was not measured and is not shipped.
+  Backup: `Qwen3.8-Flash-Next.ini.bak-v12-20260905-092637`.
+- Rollback: restore both backups, `systemctl daemon-reload`, restart the three units.
+
+Trap hit during the cutover: a unit file references the build directory three times
+(`WorkingDirectory=`, `Environment="LD_LIBRARY_PATH=..."`, `ExecStart=`). Editing only `ExecStart` ran
+the v14 launcher (a 17 KB stub) against v12's shared libraries; the router's child then failed with
+`--override-tensor: unknown buffer type` because v12's libggml-hip has no UVA type. Replace all three and
+verify with `grep llama-cpp-mine /proc/<MainPID>/maps | sort -u`.
+
+Post-cutover validation through the production proxy (llamacpp-ha, port 11434), 2026-09-05 09:40-09:46:
+`ladder_check.py Qwen3.8-Flash-Next` loaded and answered on XS, S, base, L, XL and S:VISION (HTTP 200
+everywhere; between them every mapped-layer count of the preset: 8, 10, 12, 14). Its two complaints are
+family-shape expectations, not defects: this family has no f16 `:SHQ` lane, and at ~92k tokens the proxy
+now prefers the base rung to `:M` (both fit). A steered request on the base rung: 3546 tokens, natural
+stop, coherent, 53.8 t/s, draft acceptance 88.3%, mean accepted length 2.77. Note that unit-level
+`/models/load` tests are invalid while llamacpp-ha runs: it reaps models it did not schedule within
+a minute and force-kills the child mid-generation.
