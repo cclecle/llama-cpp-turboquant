@@ -82,6 +82,9 @@
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
