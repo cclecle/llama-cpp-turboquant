@@ -281,3 +281,27 @@ now prefers the base rung to `:M` (both fit). A steered request on the base rung
 stop, coherent, 53.8 t/s, draft acceptance 88.3%, mean accepted length 2.77. Note that unit-level
 `/models/load` tests are invalid while llamacpp-ha runs: it reaps models it did not schedule within
 a minute and force-kills the child mid-generation.
+
+## 8. Muse-Glimmer-30B:HQ family added (2026-09-05, user request)
+
+`DUALGPU/Muse-Glimmer-30B.ini`, included from `DUALGPU/main.ini` (backup `main.ini.bak-<ts>`): the
+Q8_K_XL quant (30.1 GiB) under tensor split, f16 KV, BF16 mmproj, dflash draft + ngram-map-k4v, the
+same samplers and chat template as the SINGLEGPU Q5_K_XL family. The model is dense, 52 layers, 2 KV
+heads, 2048-token sliding window on 3 of 4 layers, so a 131072-token slot of f16 KV costs ~1 GB per
+card and every rung keeps the full context per slot; the ladder differs by slot count.
+
+Calibration (`/root/hqprobe.sh`, per card GB at load / peak, 2k prompt + 400 tokens, ~43 t/s and
+~1050 t/s prefill at every shape): 1 slot 262144: 21.55 / 22.15; 2 x 262144: 22.52 / 23.06;
+4 x 131072: 22.30 / 22.83; 8 x 131072: 26.15 / 26.67; 14 x 131072: 31.94 / 32.46 (16 OOMs at load);
+vision 1 x 131072: 24.27 / 24.86 (card 0); vision 2: 25.04; vision 4: 26.95; vision 8: 30.81;
+vision 10: 32.73. Shipped: XL 1 x 262144, L 2 x 262144, M 4 x 131072, S 8 x 131072, XS 13 x 131072
+(one below the measured 14 on the user's instruction, not re-tested), VISION 1 x 262144, L:VISION 2,
+M:VISION 4, S:VISION 8, XS:VISION 9 (one below the measured 10).
+
+The trained context is 131072 and the GGUF has no YaRN metadata. The server caps a slot at the
+trained context, so the 262144 rungs raise it with `override-kv = muse-glimmer.context_length=int:262144`
+(the "max_position_embeddings" trick): rope unchanged, no YaRN, so the KV lineage is shared with the
+131072 rungs (a YaRN rung would NOT be cache-compatible: mscale scales every stored key by 1.069 and
+the interpolated dimensions rotate at half the rate for every position). Needle check at 205,788
+tokens on the 262144 shape: the sentinel on the first line was returned exactly and the first file was
+named correctly; 835 t/s prefill, 40 t/s decode at that depth, 22.15 GB per card.
