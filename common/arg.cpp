@@ -259,6 +259,15 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg) {
+            auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+            if (get_extra_bufts) {
+                for (ggml_backend_buffer_type_t * p = get_extra_bufts(dev); p && *p; ++p) {
+                    buft_list[ggml_backend_buft_name(*p)] = *p;
+                }
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

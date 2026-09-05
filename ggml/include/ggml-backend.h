@@ -404,6 +404,10 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // meta buffer type built from the extra buffer type of every simple device that matches simple_buft (e.g. ROCm0_UVA -> Meta(ROCm0_UVA,ROCm1_UVA)).
+    // returns NULL when simple_buft is not an extra buffer type of one of the simple devices or the others have no counterpart
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_from_simple(ggml_backend_dev_t meta_dev, ggml_backend_buffer_type_t simple_buft);
+
     //
     // Utils
     //

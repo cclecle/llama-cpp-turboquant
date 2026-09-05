@@ -56,6 +56,10 @@
 #define cudaEventDestroy musaEventDestroy
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
+#define cudaHostAlloc musaHostAlloc
+#define cudaHostAllocMapped musaHostAllocMapped
+#define cudaHostAllocPortable musaHostAllocPortable
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
 #define cudaGetDevice musaGetDevice
 #define cudaGetDeviceCount musaGetDeviceCount
 #define cudaGetDeviceProperties musaGetDeviceProperties
