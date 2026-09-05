@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <set>
 #include <string>
@@ -63,15 +64,16 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_device_context(
             std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+        // the parameter was moved from above, read the member
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
@@ -255,12 +257,13 @@ struct ggml_backend_meta_buffer_type_context {
     std::string name;
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
+        // the parameter was moved from above, read the member. the loader keys its contexts by this name, so it must differ per buffer type set
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -368,6 +371,69 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
         /*ctx    =*/ buft_ctx,
     };
     auto result = meta_bufts.emplace(dev, meta_buft);
+    return &result.first->second;
+}
+
+static std::vector<ggml_backend_buffer_type_t> ggml_backend_meta_simple_dev_extra_bufts(ggml_backend_dev_t simple_dev) {
+    std::vector<ggml_backend_buffer_type_t> ret;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(simple_dev);
+    if (reg == nullptr) {
+        return ret;
+    }
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts == nullptr) {
+        return ret;
+    }
+    for (ggml_backend_buffer_type_t * p = get_extra_bufts(simple_dev); p != nullptr && *p != nullptr; p++) {
+        ret.push_back(*p);
+    }
+    return ret;
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_from_simple(ggml_backend_dev_t dev, ggml_backend_buffer_type_t simple_buft) {
+    static std::mutex mutex;
+    static std::map<std::vector<ggml_backend_buffer_type_t>, struct ggml_backend_buffer_type> meta_bufts;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (simple_buft == nullptr || ggml_backend_buft_is_meta(simple_buft)) {
+        return nullptr;
+    }
+    const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
+
+    // the extra buffer types of every simple device are matched by index
+    std::vector<std::vector<ggml_backend_buffer_type_t>> extra(n_devs);
+    int index = -1;
+    for (size_t i = 0; i < n_devs; i++) {
+        extra[i] = ggml_backend_meta_simple_dev_extra_bufts(ggml_backend_meta_dev_simple_dev(dev, i));
+        for (size_t k = 0; k < extra[i].size(); k++) {
+            if (extra[i][k] == simple_buft) {
+                index = (int) k;
+            }
+        }
+    }
+    if (index < 0) {
+        return nullptr;
+    }
+    std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    simple_bufts.reserve(n_devs);
+    for (size_t i = 0; i < n_devs; i++) {
+        if ((size_t) index >= extra[i].size()) {
+            return nullptr;
+        }
+        simple_bufts.push_back(extra[i][index]);
+    }
+
+    auto it = meta_bufts.find(simple_bufts);
+    if (it != meta_bufts.end()) {
+        return &it->second;
+    }
+    struct ggml_backend_buffer_type meta_buft = {
+        /*iface  =*/ ggml_backend_meta_buffer_type_iface,
+        /*device =*/ dev,
+        /*ctx    =*/ new ggml_backend_meta_buffer_type_context(simple_bufts),
+    };
+    auto result = meta_bufts.emplace(simple_bufts, meta_buft);
     return &result.first->second;
 }
 

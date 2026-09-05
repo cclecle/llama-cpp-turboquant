@@ -1245,6 +1245,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        // under tensor parallelism the layer lives on a meta device: a per-device override (e.g. ROCm0_UVA) means the matching meta buffer type
+                        ggml_backend_dev_t layer_dev = buft_list->front().first;
+                        if (ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_META && ggml_backend_dev_type(ggml_backend_buft_get_device(buft)) != GGML_BACKEND_DEVICE_TYPE_META) {
+                            ggml_backend_buffer_type_t meta_buft = ggml_backend_meta_buffer_type_from_simple(layer_dev, buft);
+                            if (meta_buft != nullptr) {
+                                buft = meta_buft;
+                            }
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
