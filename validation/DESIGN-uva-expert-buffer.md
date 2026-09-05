@@ -287,16 +287,23 @@ a minute and force-kills the child mid-generation.
 `DUALGPU/Muse-Glimmer-30B.ini`, included from `DUALGPU/main.ini` (backup `main.ini.bak-<ts>`): the
 Q8_K_XL quant (30.1 GiB) under tensor split, f16 KV, BF16 mmproj, dflash draft + ngram-map-k4v, the
 same samplers and chat template as the SINGLEGPU Q5_K_XL family. The model is dense, 52 layers, 2 KV
-heads, 2048-token sliding window on 3 of 4 layers, so a 131072-token slot of f16 KV costs ~1 GB per
-card and every rung keeps the full context per slot; the ladder differs by slot count.
+heads, 2048-token sliding window on 3 of 4 layers, so f16 KV costs ~1 GB per card per 131072 tokens of
+TOTAL context: VRAM follows `c`, not the slot count (4 x 262144 and 8 x 131072 both peak at 26.7 GB).
 
-Calibration (`/root/hqprobe.sh`, per card GB at load / peak, 2k prompt + 400 tokens, ~43 t/s and
-~1050 t/s prefill at every shape): 1 slot 262144: 21.55 / 22.15; 2 x 262144: 22.52 / 23.06;
-4 x 131072: 22.30 / 22.83; 8 x 131072: 26.15 / 26.67; 14 x 131072: 31.94 / 32.46 (16 OOMs at load);
-vision 1 x 131072: 24.27 / 24.86 (card 0); vision 2: 25.04; vision 4: 26.95; vision 8: 30.81;
-vision 10: 32.73. Shipped: XL 1 x 262144, L 2 x 262144, M 4 x 131072, S 8 x 131072, XS 13 x 131072
-(one below the measured 14 on the user's instruction, not re-tested), VISION 1 x 262144, L:VISION 2,
-M:VISION 4, S:VISION 8, XS:VISION 9 (one below the measured 10).
+Ladder rule as stated by the user: the reference profile is one slot at the maximum achievable context
+(capped at 256k), with more slots if there is a lot of headroom; a second profile at the maximum without
+CPU offload when that differs; then the context is split for concurrency in ~32k/65k/128k steps up to
+8 parallel slots, and once the 8-slot profile is reached nothing lower is needed. Vision mirrors the
+text ladder; an HQ family has no `:SHQ` lane because it already uses f16 KV.
+
+Applied here (per card GB at load / peak, `/root/hqprobe.sh`, 2k prompt + 400 tokens, ~43 t/s decode
+and ~1050 t/s prefill at every shape):
+- `:HQ:XL` 4 x 262144: 26.19 / 26.73 (1 slot: 21.55 / 22.15; the no-offload profile is the same shape)
+- `:HQ:M` 8 x 131072: 26.15 / 26.67
+- `:HQ:XL:VISION` 4 x 262144: 30.31 / 30.84 on card 0
+- `:HQ:M:VISION` 8 x 131072: 30.28 / 30.81 on card 0
+Other measured points, for the record: 2 x 262144 23.06; 14 x 131072 32.46 (16 OOMs); vision 10 x
+131072 32.73. The user's margin rule: a 32.4 GB peak is too high, ship one slot below.
 
 The trained context is 131072 and the GGUF has no YaRN metadata. The server caps a slot at the
 trained context, so the 262144 rungs raise it with `override-kv = muse-glimmer.context_length=int:262144`
