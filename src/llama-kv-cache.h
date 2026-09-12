@@ -176,8 +176,10 @@ public:
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
-    //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
-    //   sinfos_in : if set, the layout to use instead of searching. one entry per stream, cell count must match the blob
+    // both vectors are indexed by ENTRY IN THE STATE, not by stream, so a single-sequence state carries one entry
+    // whatever --parallel wrote it [TAG_STATE_SEQ_N_STREAM]
+    //   sinfos_out: if set, filled with the layout used; an entry with no cells is left empty
+    //   sinfos_in : if set, the layout to use instead of searching. cell count must match the blob
     void state_read_sinfo(
             llama_io_read_i & io,
                llama_seq_id   seq_id,
