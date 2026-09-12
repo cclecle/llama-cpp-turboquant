@@ -1,5 +1,6 @@
 #include "server-slot-io.h"
 
+#include <atomic>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdio>
@@ -91,14 +92,17 @@ void dir_sync(const std::string & path) {
 #endif
 }
 
-// unique per process, so two servers sharing a --slot-save-path cannot clobber each other's temp
+// unique per save: the pid keeps two servers sharing a --slot-save-path apart, the counter keeps
+// two concurrent saves in one process apart - they would otherwise share one temp and truncate it
 std::string temp_path(const std::string & path) {
 #if defined(_WIN32)
     const unsigned long pid = GetCurrentProcessId();
 #else
     const unsigned long pid = (unsigned long) ::getpid();
 #endif
-    return path + ".tmp." + std::to_string(pid);
+    static std::atomic<uint64_t> seq{0};
+
+    return path + ".tmp." + std::to_string(pid) + "." + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
 }
 
 bool rename_over(const std::string & from, const std::string & to) {

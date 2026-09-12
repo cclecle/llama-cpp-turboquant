@@ -70,7 +70,9 @@ struct slot_byte_reader {
 // Several server processes can share one --slot-save-path, so a save must never be visible
 // half-written. It writes a temp file in the same directory and renames it over the target, which
 // is atomic: a reader sees either the old file or the new one, never a mix, and a crash mid-save
-// leaves the previous file intact. No lock is needed, so nothing can be stranded on disk.
+// leaves the previous file intact. No lock is needed.
+// The temp name is unique per save, so concurrent saves of one target cannot truncate each other.
+// A crash therefore strands one temp per interrupted save, which nothing reclaims.
 // These block on disk I/O, so keep calling them from a worker, never the inference thread.
 //
 
