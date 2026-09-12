@@ -2451,16 +2451,6 @@ const slot_info_vec_t *   sinfos_in) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    if (sinfos_out) {
-        sinfos_out->assign(n_stream, slot_info{});
-    }
-
-    if (sinfos_in && sinfos_in->size() != n_stream) {
-        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
-                format("%s: mirrored slot layout has the wrong stream count (%u != %u)",
-                    __func__, (uint32_t) sinfos_in->size(), n_stream));
-    }
-
     // [TAG_STATE_SEQ_N_STREAM]
     // For a single-sequence restore the stream count in the state is framing only - the cells
     // land in this instance own stream for dest_seq_id, and capacity is checked against that
@@ -2470,13 +2460,33 @@ const slot_info_vec_t *   sinfos_in) {
     // empty).
     //
     // A whole-context restore still requires an exact match: it is a snapshot of every stream
-    // and there is nowhere to put the extras. A mirrored restore does too - the layout it is
-    // handed is indexed per stream and only lines up when both caches are configured the same.
+    // and there is nowhere to put the extras.
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if ((seq_id == -1 || sinfos_in) && n_stream_cur != n_stream) {
+
+    // the count sizes a vector below, so bound it before it is used
+    // zero would also skip the loop and report success while the sequence keeps its old cells
+    if (n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ) {
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                format("%s: invalid stream count in state (%u)", __func__, n_stream_cur));
+    }
+
+    if (seq_id == -1 && n_stream_cur != n_stream) {
         state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
                 format("%s: n_stream mismatch (%u != %u)", __func__, n_stream_cur, n_stream));
+    }
+
+    // the sinfos are indexed by entry in the state, not by stream: a single-sequence state frames
+    // one entry whatever --parallel wrote it. Both sections come from one state_write with one
+    // seq_id, so the mirrored cache always reads back the entry the mirrored-from cache filled.
+    if (sinfos_out) {
+        sinfos_out->assign(n_stream_cur, slot_info{});
+    }
+
+    if (sinfos_in && sinfos_in->size() != n_stream_cur) {
+        state_read_fail(LLAMA_STATE_SEQ_STATUS_INCOMPATIBLE,
+                format("%s: mirrored slot layout has the wrong entry count (%u != %u)",
+                    __func__, (uint32_t) sinfos_in->size(), n_stream_cur));
     }
 
     // a whole-context restore replaces every stream, so the cache is emptied once here
@@ -2538,7 +2548,7 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[strm] = sinfo;
+            (*sinfos_out)[s] = sinfo;
         }
     }
 }
