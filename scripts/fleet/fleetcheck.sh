@@ -3,7 +3,7 @@
 # (llamacpp-both for DUALGPU, llamacpp-0 for SINGLEGPU) minus --no-models-autoload and the slot cache.
 # Restarts production at the end whatever happens. Set BIN to the release under test.
 set -u
-BIN=${BIN:-/opt/llamacpp/llama-cpp-mine-v16/build3/bin/llama-server}
+BIN=${BIN:-/opt/llamacpp/llama-cpp-mine-v17/build3/bin/llama-server}
 PORT=20099
 LOG=/root/fleetcheck
 mkdir -p $LOG
