@@ -2524,6 +2524,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * lse);
 
+    // hint: attention runs split across devices (tensor split); process-wide, default false
+    GGML_API void ggml_set_fa_tensor_parallel(bool enable);
+    GGML_API bool ggml_get_fa_tensor_parallel(void);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
