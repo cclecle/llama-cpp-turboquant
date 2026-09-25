@@ -6,6 +6,7 @@ set -u; PORT=20098; ARGSFILE=${1:?args file}; DEV=${2:?HIP_VISIBLE_DEVICES}; RA=
 mkdir -p /root/work-$(date +%Y%m%d)
 # MP_NO_RESTART=1: the caller already stopped production and restarts it itself (a series of runs)
 # MP_ENV_A / MP_ENV_B: extra env assignments for release a / b (e.g. "GGML_HIP_FA_BAND_WMMA=0")
+# MP_CHARS: prompt size in corpus characters (default 8000, about 2.5k tokens); raise it to test deep-context decode
 finish() { [ -n "${MP_NO_RESTART:-}" ] || systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo MP_ALL_DONE; }; trap finish EXIT
 [ -n "${MP_NO_RESTART:-}" ] || { systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3; }
 mapfile -t ARGS < "$ARGSFILE"
@@ -17,7 +18,7 @@ for V in $RA $RB; do
   for i in $(seq 1 240); do curl -sf http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 1; done
   python3 - "$V" <<PY
 import json,urllib.request,sys
-V=sys.argv[1]; corpus=open('/root/ppl.txt',errors='ignore').read()
+V=sys.argv[1]; corpus=open('/root/ppl.txt',errors='ignore').read(); C=int('${MP_CHARS:-8000}')
 tasks=['Summarise the code above in five bullet points, then write a four-line poem about it.',
        'Explain what this code does to a junior developer, step by step.',
        'List every function defined above with a one-line description each.',
@@ -26,8 +27,8 @@ tasks=['Summarise the code above in five bullet points, then write a four-line p
        'Write unit test ideas for the code above.']
 tot_t=tot_n=0; tot_acc=tot_dr=0
 for k,task in enumerate(tasks):
-    off=20000+k*9000
-    body={'messages':[{'role':'user','content':corpus[off:off+8000]+'\n\n'+task}],'max_tokens':400,'temperature':0}
+    off=20000+k*(C+1000)
+    body={'messages':[{'role':'user','content':corpus[off:off+C]+'\n\n'+task}],'max_tokens':400,'temperature':0}
     r=urllib.request.Request('http://127.0.0.1:$PORT/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
     j=json.load(urllib.request.urlopen(r,timeout=600)); tm=j['timings']; n=tm['predicted_n']; t=tm['predicted_ms']/1000
     tot_t+=t; tot_n+=n; tot_acc+=tm.get('draft_n_accepted',0) or 0; tot_dr+=tm.get('draft_n',0) or 0
