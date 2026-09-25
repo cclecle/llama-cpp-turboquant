@@ -4,12 +4,15 @@
 # The args file is the child command line the router prints after "spawning server instance with args:".
 set -u; PORT=20098; ARGSFILE=${1:?args file}; DEV=${2:?HIP_VISIBLE_DEVICES}; RA=${3:?release a, e.g. v15}; RB=${4:?release b}
 mkdir -p /root/work-$(date +%Y%m%d)
-finish() { systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo MP_ALL_DONE; }; trap finish EXIT
-systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
+# MP_NO_RESTART=1: the caller already stopped production and restarts it itself (a series of runs)
+# MP_ENV_A / MP_ENV_B: extra env assignments for release a / b (e.g. "GGML_HIP_FA_BAND_WMMA=0")
+finish() { [ -n "${MP_NO_RESTART:-}" ] || systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo MP_ALL_DONE; }; trap finish EXIT
+[ -n "${MP_NO_RESTART:-}" ] || { systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3; }
 mapfile -t ARGS < "$ARGSFILE"
 for V in $RA $RB; do
   BIN=/opt/llamacpp/llama-cpp-mine-$V/build3/bin
-  HIP_VISIBLE_DEVICES=$DEV LD_LIBRARY_PATH=$BIN $BIN/llama-server "${ARGS[@]}" --host 127.0.0.1 --port $PORT > /root/work-$(date +%Y%m%d)/mp-$V.log 2>&1 &
+  if [ "$V" = "$RA" ]; then XENV=${MP_ENV_A:-}; else XENV=${MP_ENV_B:-}; fi
+  env $XENV HIP_VISIBLE_DEVICES=$DEV LD_LIBRARY_PATH=$BIN $BIN/llama-server "${ARGS[@]}" --host 127.0.0.1 --port $PORT > /root/work-$(date +%Y%m%d)/mp-$V.log 2>&1 &
   P=$!
   for i in $(seq 1 240); do curl -sf http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 1; done
   python3 - "$V" <<PY
