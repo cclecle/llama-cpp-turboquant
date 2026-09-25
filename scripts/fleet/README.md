@@ -13,6 +13,7 @@ committed when the work ends.
 | `rungpass-dual.sh <main.ini> <tag> <ids...>` | same for DUALGPU (GPU 0+1, tensor split), args mirror llamacpp-both |
 | `rungmeasure.py <port> <ids...>` | the per-rung measurement: load via /models/load, 10k-token prefill + decode, VRAM after generation (peak proxy, max over cards), text sanity, unload |
 | `visiontest.py <port> <id> <image> [max_tokens]` | ask a real image question on a VISION rung; shows reasoning vs visible answer |
+| `rungsweep.sh <release> [frac]` | EVERY rung of both stores once (resumable): prompt = frac (0.5) of the per-slot context, 256 greedy tokens, load time, pp/tg, VRAM after generation, gibberish check; logs `sweep-<release>-{single,dual}.log` |
 | `multi-prompt.sh <args-file> <devices> <vA> <vB>` | same rung, 6 prompts, two releases, pooled tg. A single greedy prompt is a trajectory sample, not a measurement |
 
 Conventions the tools assume: production units `llamacpp-0` (GPU 0, `SINGLEGPU/main.ini`), `llamacpp-1`
