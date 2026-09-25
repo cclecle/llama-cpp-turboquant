@@ -7,12 +7,13 @@ mkdir -p /root/work-$(date +%Y%m%d)
 # MP_NO_RESTART=1: the caller already stopped production and restarts it itself (a series of runs)
 # MP_ENV_A / MP_ENV_B: extra env assignments for release a / b (e.g. "GGML_HIP_FA_BAND_WMMA=0")
 # MP_CHARS: prompt size in corpus characters (default 8000, about 2.5k tokens); raise it to test deep-context decode
+# MP_ARGS_B: a second args file for release b (A/B of two configurations on one build)
 finish() { [ -n "${MP_NO_RESTART:-}" ] || systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo MP_ALL_DONE; }; trap finish EXIT
 [ -n "${MP_NO_RESTART:-}" ] || { systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3; }
 mapfile -t ARGS < "$ARGSFILE"
 for V in $RA $RB; do
   BIN=/opt/llamacpp/llama-cpp-mine-$V/build3/bin
-  if [ "$V" = "$RA" ]; then XENV=${MP_ENV_A:-}; else XENV=${MP_ENV_B:-}; fi
+  if [ "$V" = "$RA" ]; then XENV=${MP_ENV_A:-}; mapfile -t ARGS < "$ARGSFILE"; else XENV=${MP_ENV_B:-}; mapfile -t ARGS < "${MP_ARGS_B:-$ARGSFILE}"; fi
   env $XENV HIP_VISIBLE_DEVICES=$DEV LD_LIBRARY_PATH=$BIN $BIN/llama-server "${ARGS[@]}" --host 127.0.0.1 --port $PORT > /root/work-$(date +%Y%m%d)/mp-$V.log 2>&1 &
   P=$!
   for i in $(seq 1 240); do curl -sf http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 1; done
