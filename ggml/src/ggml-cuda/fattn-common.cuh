@@ -206,16 +206,17 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
         }
     }
 
-    // GGML_HIP_FA_BAND_WMMA_F16=1 also takes an F16 cache (read directly, nothing to convert)
+    // An F16 cache is read directly. At n_q = 1 the vec kernel is faster there (gfx1201, kv 16k: 92 vs 128 us),
+    // from n_q = 2 the band wins (n_q 3: 130 vs 213 us). GGML_HIP_FA_BAND_WMMA_F16=0 keeps F16 off the band.
     static const bool band_f16 = [] {
         const char * env = getenv("GGML_HIP_FA_BAND_WMMA_F16");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
 
     const int  gqa_ratio = Q->ne[2] / K->ne[2];
     const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
     const bool kv_ok     = (kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V)) ||
-        (band_f16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+        (band_f16 && Q->ne[1] >= 2 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
 
     return gqa_opt && Q->ne[1] <= 8 && Q->ne[3] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         gqa_ratio > 4 && gqa_ratio <= 8 && logit_softcap == 0.0f && kv_ok;
