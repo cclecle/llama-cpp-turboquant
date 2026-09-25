@@ -222,6 +222,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+            if (ggml_cuda_fattn_band_wmma_ncols1() == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 8>(ctx, dst);
+            }
+            return;
+        }
+    }
+
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
@@ -667,6 +678,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+    // RDNA4 decode/verify band: head 256, GQA 5..8, q8_0 K/V read natively by the WMMA kernel
+    if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:

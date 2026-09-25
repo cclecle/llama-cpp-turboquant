@@ -39,7 +39,9 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        // fattn_kv_native_type of K and V: NONE when K/V point to F16 data, else the raw cache type
+        const int kv_native_K, const int kv_native_V);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -82,6 +84,134 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     }
 
     return data;
+}
+
+// Native q8_0 K/V (from rdna-boosts block 15): the MMA kernel dequantizes each 16-byte shared-memory
+// chunk (8 elements, a quarter q8_0 block) while it loads the tiles, instead of reading an F16 copy of
+// the whole cache that the launcher converts on every call. Used for the decode/verify band only
+// (n_q <= 8), where that whole-cache conversion dominates. GGML_CUDA_FA_KV_NATIVE=0 disables it.
+static constexpr int GGML_CUDA_FA_Q8_CHUNK = 8;
+
+enum fattn_kv_native_type : int {
+    FATTN_KV_NATIVE_NONE = 0, // F16 data (staged by the launcher or F16 cache)
+    FATTN_KV_NATIVE_Q8_0 = 1, // raw q8_0 rows
+};
+
+static inline bool ggml_cuda_fattn_kv_native_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_KV_NATIVE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// t is the K or V operand of a FLASH_ATTN_EXT node
+static inline int ggml_cuda_fattn_kv_native_type(const ggml_tensor * t) {
+#ifdef FAST_FP16_AVAILABLE
+    if (ggml_cuda_fattn_kv_native_enabled() && t != nullptr && t->type == GGML_TYPE_Q8_0 &&
+            t->ne[0] % GGML_CUDA_FA_Q8_CHUNK == 0 && t->nb[0] == (size_t) ggml_type_size(GGML_TYPE_Q8_0)) {
+        return FATTN_KV_NATIVE_Q8_0;
+    }
+#else
+    GGML_UNUSED(t);
+#endif // FAST_FP16_AVAILABLE
+    return FATTN_KV_NATIVE_NONE;
+}
+
+// byte-addressed K/V rows of one K/V head for a native operand
+struct fattn_kv_native_t {
+    const char * K;
+    const char * V;
+    int stride_K; // bytes per KV cell
+    int stride_V;
+    int type_K;   // fattn_kv_native_type
+    int type_V;
+};
+
+// dequantize the 8 elements starting at element el (a multiple of 8) of a q8_0 row, same math as dequantize_block_q8_0_f16
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q8_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q8_0) == QK8_0 + 2, "bad block_q8_0");
+
+    const char * bp = row + (size_t) (el / QK8_0)*sizeof(block_q8_0);
+
+    // a q8_0 block is 34 bytes, so only 2-byte alignment holds
+    half d;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d, bp);
+    const half2 d2 = __half2half2(d);
+
+    int8_t q[GGML_CUDA_FA_Q8_CHUNK];
+    ggml_cuda_memcpy_1<GGML_CUDA_FA_Q8_CHUNK, 2>(q, bp + sizeof(half) + el % QK8_0);
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        dst[l] = d2 * make_half2(q[2*l + 0], q[2*l + 1]);
+    }
+}
+
+// RDNA4 decode/verify band (from rdna-boosts block 15): head 256 with GQA 5..8 and a q8_0 cache.
+// The tile kernel can only fold ncols2 = 2 there, so it re-reads every K/V element once per head pair.
+// The band runs the whole n_q <= 8 range on the WMMA kernel with the GQA group in ncols2 = 8 and a
+// round-robin KV split over a fixed P blocks, so decode and every verify width reduce in the same order.
+// GGML_HIP_FA_BAND_WMMA=0 disables it, =2 picks ncols1 = 2 (default 4). GGML_HIP_FA_BAND_WMMA_SPLIT sets P.
+static inline int ggml_cuda_fattn_band_wmma_ncols1() {
+    static const int ncols1 = [] {
+        const char * env = getenv("GGML_HIP_FA_BAND_WMMA");
+        const int v = env != nullptr ? atoi(env) : -1;
+        return v == 0 ? 0 : (v == 2 ? 2 : 4);
+    }();
+    return ncols1;
+}
+
+static inline int ggml_cuda_fattn_band_wmma_split() {
+    static const int split = [] {
+        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
+        const int v = env != nullptr ? atoi(env) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return split;
+}
+
+// shared by the kernel chooser, the ncols2 dispatch and launch_fattn so that they cannot disagree
+static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_tensor * dst) {
+    if (ggml_cuda_fattn_band_wmma_ncols1() == 0 || !GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc)) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    // the log-sum-exp output (src[5]) needs the non-stream-k combine path
+    if (dst->src[5] != nullptr) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    bool gqa_opt = mask != nullptr && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, K, V, mask}) {
+        if (t == nullptr || ggml_is_quantized(t->type)) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                gqa_opt = false;
+                break;
+            }
+        }
+    }
+
+    const int  gqa_ratio = Q->ne[2] / K->ne[2];
+    const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
+    const bool kv_ok     = kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V);
+
+    return gqa_opt && Q->ne[1] <= 8 && Q->ne[3] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        gqa_ratio > 4 && gqa_ratio <= 8 && logit_softcap == 0.0f && kv_ok;
 }
 
 template <int D, int nthreads>
@@ -983,7 +1113,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool allow_kv_native = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1016,6 +1146,12 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // the kernel reads a native operand itself, so its whole-cache F16 conversion is skipped.
+    // Only for decode/verify (n_q <= 8); a prefill amortizes the conversion over many query rows.
+    const bool native_width = allow_kv_native && Q->ne[1] <= 8;
+    const int  kv_native_K  = native_width && need_f16_K ? ggml_cuda_fattn_kv_native_type(K) : FATTN_KV_NATIVE_NONE;
+    const int  kv_native_V  = native_width && need_f16_V ? (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)) : FATTN_KV_NATIVE_NONE;
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1030,7 +1166,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != GGML_TYPE_F16 && kv_native_K == FATTN_KV_NATIVE_NONE) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1058,7 +1194,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && kv_native_V == FATTN_KV_NATIVE_NONE) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1171,7 +1307,15 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k) {
+        // band: each output tile's KV is split round-robin over a fixed P blocks (gridDim.y), block i
+        // takes KV iterations i, i+P, ... P depends on neither n_q nor the KV length, so decode and every
+        // verify width accumulate the same partials in the same order. The fast path exists only for ncols2 == 8.
+        const bool band_wmma = ncols2 == 8 && ggml_cuda_fattn_band_wmma_applies(cc, dst);
+
+        if (band_wmma) {
+            const int split_env = ggml_cuda_fattn_band_wmma_split();
+            blocks_num.y = split_env > 0 ? split_env : std::max(2, nsm);
+        } else if (use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable.
@@ -1187,8 +1331,9 @@ void launch_fattn(
             blocks_num.x = nblocks_stream_k;
         }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+        const int nblocks_total = blocks_num.x * blocks_num.y; // blocks_num.y > 1 only in the band
+        if (ntiles_dst % nblocks_total != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+            dst_tmp_meta.alloc((size_t(nblocks_total) * ncols * (2 + DV/2)));
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1267,14 +1412,16 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        kv_native_K, kv_native_V
     );
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k_use) {
-        if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
+        const int nblocks_launched = (int)(blocks_num.x * blocks_num.y); // 2-D only in the band
+        if (nblocks_launched % ntiles_dst == 0 && nblocks_launched > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
-            const int nblocks_sk  = (int)blocks_num.x;
+            const int nblocks_sk  = nblocks_launched;
             const int bpt         = nblocks_sk / ntiles_dst;
 
             const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
@@ -1289,7 +1436,7 @@ void launch_fattn(
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
-        } else if (ntiles_dst % blocks_num.x != 0) {
+        } else if (ntiles_dst % nblocks_launched != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
 
