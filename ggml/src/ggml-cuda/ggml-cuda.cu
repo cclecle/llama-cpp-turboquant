@@ -2763,6 +2763,34 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+// Token count of a split. nodes[0]->ne[1] is not reliable: a split-MoE decode split can start on an
+// expert tensor [n_ff, n_expert_used, n_tokens]. Read it from the first weight matmul instead.
+static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return node->ne[2];
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
+            return node->src[1]->ne[1];
+        }
+    }
+
+    return cgraph->n_nodes > 0 ? cgraph->nodes[0]->ne[1] : 0;
+}
+
+// Prefill ubatches change shape on every call, so capture never pays off there.
+// Small batches (decode, spec verify) keep graphs. GGML_CUDA_GRAPH_MAX_TOKENS sets the limit.
+static bool ggml_cuda_graph_too_many_tokens(const ggml_cgraph * cgraph) {
+    static const int64_t max_tokens = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_MAX_TOKENS");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 8;
+    }();
+    return max_tokens > 0 && ggml_cuda_graph_n_tokens(cgraph) > max_tokens;
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
@@ -2807,6 +2835,20 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+#ifdef GGML_USE_HIP
+    // hipGraphExecUpdate leaks a kernel-argument slot per update until the exec is destroyed
+    // (ROCm/rocm-systems#10713). Re-instantiate instead. GGML_HIP_GRAPH_FORCE_UPDATE=1 keeps the update path.
+    static const bool force_update = getenv("GGML_HIP_GRAPH_FORCE_UPDATE") != nullptr;
+    if (!force_update) {
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
+#endif // GGML_USE_HIP
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -4606,7 +4648,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph) && !ggml_cuda_graph_too_many_tokens(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
