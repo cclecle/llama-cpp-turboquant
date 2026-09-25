@@ -282,6 +282,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
+// Keep the whole decode/verify band (1..MMVQ_MAX_BATCH_SIZE) on mmvq: MMQ reduces in another order,
+// so a cap inside the band makes a 1-token decode and an n-token verify of the same MoE matmul differ.
+static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
+    return cap > MMVQ_MAX_BATCH_SIZE ? cap : MMVQ_MAX_BATCH_SIZE;
+}
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
@@ -298,7 +304,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // AMD
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-            return get_mmvq_mmid_max_batch_rdna4(type);
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
             return get_mmvq_mmid_max_batch_rdna3(type);
@@ -432,7 +438,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
-    return get_mmvq_mmid_max_batch_rdna4(type);
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
 #elif defined(RDNA3)
     return get_mmvq_mmid_max_batch_rdna3(type);
 #elif defined(RDNA2) || defined(RDNA1)
