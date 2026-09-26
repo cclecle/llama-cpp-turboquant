@@ -874,8 +874,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+
+            // but not at the cost of balance: with an even split, halve the unit while the width does not divide
+            // evenly. 640 (the Qwen3.8-Flash-Next experts) in units of 128 splits 384/256, so one device does 1.5x
+            // the other's work in every layer and the other waits for it in each AllReduce; 64 splits it 320/320
+            const float * tensor_split = ud->model->tensor_split();
+            bool split_even = true;
+            for (size_t j = 1; tensor_split != nullptr && j < ud->n_devices; j++) {
+                split_even &= tensor_split[j] == tensor_split[0];
+            }
+            if (split_even) {
+                while (blck_size_perf > blck_size && (blck_size_perf/2) % blck_size == 0 &&
+                        segments[0].first % (blck_size_perf*(int64_t) ud->n_devices) != 0) {
+                    blck_size_perf /= 2;
+                }
+            }
             return {blck_size_perf};
         }
 
