@@ -151,5 +151,34 @@ The head 320/512/576 instances were compiled but kept off AMD by a kernel guard.
 ## r9 (fork release r9): typed MMA K/V store
 
 - Upstream 1884824fd (the FA swizzle refactor) is in this base and not in v16. It made the generic MMA K/V loader store through a `char *` even without swizzling, so HIP splits the 16-byte shared store. The fork measured 2-6% prefill, and 14-40% on head-256 MMA prefill.
-- Fixed in `d6d8dbfc9`.
-- Results: see below once `r9.sh` finishes.
+- Ported in `d6d8dbfc9`, **reverted in `93759983c`**: on this tree it is slower everywhere.
+- `r9.sh`, pp4096 t/s at d0 / d32768, v17 vs r9 (the only head-256 difference is the store):
+
+| Model | v17 d0 | r9 d0 | v17 d32768 | r9 d32768 |
+|---|---|---|---|---|
+| Qwen3.8-27B, q8_0 KV | 1130.3 | 1113.5 | 874.6 | 874.5 |
+| Qwen3.8-27B, f16 KV | 1134.2 | 1131.5 | 908.9 | 882.8 |
+| Qwen3.6-35B-A3B | 2041.3 | 2039.6 | 1724.6 | 1711.1 |
+| Qwen3.5-9B | 4214.3 | 4187.6 | 3072.2 | 3057.0 |
+| gemma-4-31B | 1064.4 | 1054.4 | 395.1 | 393.8 |
+| GLM-4.7-Flash | 2994.0 | 2992.0 | 838.1 | 836.4 |
+| Devstral-24B | 1241.1 | 1238.4 | 835.3 | 833.9 |
+| TurboFable-HQ, 2 GPU tensor | 2196.4 | 2179.2 | 1731.4 | 1661.2 |
+| Mistral-Small-4, 2 GPU tensor (pp512) | 152.3 | 149.2 | 115.0 | 113.8 |
+
+- FLASH_ATTN_EXT: 4052/4052 on both builds.
+
+### r5 f16 band settings (op level)
+
+`test-backend-ops perf -o FLASH_ATTN_EXT`, head 256, GQA 6, kv 16384, us/run (lower is better). The f16 n_q = 1 row
+is not in the band (vec kernel).
+
+| n_q | f16 ncols1=4 (default) | f16 ncols1=2 | f16 ncols1=2, P=48 | q8_0 ncols1=4 (default) | q8_0 ncols1=2 | q8_0 ncols1=2, P=48 |
+|---|---|---|---|---|---|---|
+| 1 | 94.6 | 94.3 | 94.2 | 134.1 | 83.9 | 74.9 |
+| 3 | 134.5 | 122.2 | 122.8 | 135.7 | 141.8 | 125.1 |
+| 5 | 189.4 | 141.0 | 168.2 | 205.9 | 168.4 | 169.7 |
+| 8 | 192.6 | 180.9 | 203.7 | 208.6 | 221.5 | 219.4 |
+
+ncols1 = 2 wins almost everywhere; q8_0 single-token decode drops 134 -> 75 us per attention layer. Taken up as a
+per-width choice below.
