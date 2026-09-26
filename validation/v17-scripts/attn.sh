@@ -13,7 +13,7 @@ systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 5
 [ -s corpus.txt ] || cat /opt/llamacpp/tmp-attn/docs/*.md /opt/llamacpp/tmp-attn/docs/*/*.md > corpus.txt
 
 # SKIP=tbo skips the kernel tests (already passed)
-[ "${SKIP:-}" = tbo ] || { echo "### FLASH_ATTN_EXT on ROCm0 (derived cases included), then with native q8_0 prefill"
+[ "${SKIP:-}" = tbo ] || [ "${SKIP:-}" = all ] || { echo "### FLASH_ATTN_EXT on ROCm0 (derived cases included), then with native q8_0 prefill"
 for E in 'X=0' 'GGML_CUDA_FA_KV_NATIVE_PREFILL=1'; do
   env $E HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=$B timeout 3600 $B/test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 > tbo-attn.log 2>&1
   echo "[$E] $(grep -cE '^ +FLASH_ATTN_EXT.*OK' tbo-attn.log) OK, $(grep -cE '^ +FLASH_ATTN_EXT.*FAIL' tbo-attn.log) FAIL, derived OK: $(grep -E 'derived=' tbo-attn.log | grep -c OK)"
@@ -31,6 +31,7 @@ load() { # <tag> <env> <server args...>
   grep -iE 'error|abort|failed' load.log | head -3
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 3
 }
+if [ "${SKIP:-}" != all ]; then
 echo "### compute buffers"
 A27="-m $M27 -ngl 999 -c 131072 -np 1 -ub 1024 -b 4096 -ctk q8_0 -ctv q8_0 -fa on"
 for E in 'LLAMA_KQ_MASK_DERIVED=0' 'LLAMA_KQ_MASK_DERIVED=1' 'LLAMA_KQ_MASK_DERIVED=1 GGML_CUDA_FA_KV_NATIVE_PREFILL=1'; do load 27B-c131k-ub1024 "$E" $A27; done
@@ -54,6 +55,7 @@ for E in 'LLAMA_KQ_MASK_DERIVED=0' 'LLAMA_KQ_MASK_DERIVED=1'; do ppl 27B-nckvc20
 for E in 'LLAMA_KQ_MASK_DERIVED=0' 'LLAMA_KQ_MASK_DERIVED=1'; do DEV=0,1 ppl 27B-TP "$E" -m $M27 -ctk f16 -ctv f16 -sm tensor; done
 for E in 'LLAMA_KQ_MASK_DERIVED=0' 'LLAMA_KQ_MASK_DERIVED=1'; do DEV=0,1 ppl gemma31B-TP "$E" -m $MG -ctk q8_0 -ctv q8_0 -sm tensor; done
 
+fi # SKIP=all: prefill A/B only
 echo "### prefill, derived and native prefill (attn tree both arms)"
 Q="-fa 1 -p 4096 -n 0 -d 0,32768 -r 3 -t 8 -ub 1024"
 ENV_A='LLAMA_KQ_MASK_DERIVED=0' ENV_B='LLAMA_KQ_MASK_DERIVED=1' bash $S/benchab.sh 27B-q8 0 attn attn -- -m $M27 -ngl 999 -ctk q8_0 -ctv q8_0 $Q
@@ -63,6 +65,7 @@ ENV_A='LLAMA_KQ_MASK_DERIVED=0' ENV_B='LLAMA_KQ_MASK_DERIVED=1' bash $S/benchab.
 ENV_A='LLAMA_KQ_MASK_DERIVED=0' ENV_B='LLAMA_KQ_MASK_DERIVED=1' bash $S/benchab.sh 35B-A3B 0 attn attn -- -m $M35 -ngl 999 -ctk q8_0 -ctv q8_0 -ot 'blk\.(32|34|36|37|38)\.ffn_.*_exps\.weight=CPU' $Q
 ENV_A='LLAMA_KQ_MASK_DERIVED=0' ENV_B='LLAMA_KQ_MASK_DERIVED=1' bash $S/benchab.sh 27B-TP 0,1 attn attn -- -m $M27 -ngl 999 -ctk f16 -ctv f16 -sm tensor -fa 1 -p 4096 -n 0 -d 0,32768 -r 3 -t 12 -ub 1536
 
+[ "${SKIP:-}" = all ] && exit 0
 echo "### decode, band retune (v17 vs attn)"
 T="-fa 1 -p 0 -n 64 -d 0,16384,65536 -r 3 -t 8"
 bash $S/benchab.sh 27B-q8-tg 0 v17 attn -- -m $M27 -ngl 999 -ctk q8_0 -ctv q8_0 $T
