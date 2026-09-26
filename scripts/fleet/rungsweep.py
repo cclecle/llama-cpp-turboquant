@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-# rungsweep.py <port> <log> [frac] : run EVERY rung of the router's preset store once.
+# rungsweep.py <port> <log> [frac] [card] [shard/nshards] : run EVERY rung of the router's preset store once.
+# card: rocm-smi index for the VRAM reading (default: max over cards 0-1). With nshards > 1 several routers share one
+# store: each claims its next rung with mkdir in <log dir>/claims (the caller clears it). Rungs in any <log stem>*.log
+# are skipped.
 # Per rung: load, one chat request whose prompt fills `frac` (default 0.5) of the per-slot context, 256 greedy
 # tokens, VRAM after generation (peak proxy, max over the cards), a gibberish check, unload.
 # Appends one line per rung to <log>; rungs already in <log> are skipped, so a crashed sweep resumes.
-import json, re, subprocess, sys, time, urllib.request
+import glob, json, os, re, subprocess, sys, time, urllib.request
 
 port, log = sys.argv[1], sys.argv[2]
 frac = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
+card = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != "-" else None
+shard, nshards = (int(x) for x in sys.argv[5].split("/")) if len(sys.argv) > 5 else (0, 1)
 base = "http://127.0.0.1:%s" % port
 CHARS_PER_TOKEN = 3.2  # C++ source; the real prompt_n is printed
 
@@ -17,7 +22,8 @@ def req(p, b=None, t=600):
         return json.load(resp)
 
 def vram():
-    out = subprocess.run("rocm-smi --showmeminfo vram 2>/dev/null | grep -i 'Used' | head -2 | grep -oE '[0-9]+$'",
+    sel = ("-d %s" % card) if card is not None else ""
+    out = subprocess.run("rocm-smi %s --showmeminfo vram 2>/dev/null | grep -i 'Used' | head -2 | grep -oE '[0-9]+$'" % sel,
                          shell=True, capture_output=True, text=True).stdout.split()
     return max(int(x) for x in out) / 1e9 if out else float("nan")
 
@@ -37,20 +43,32 @@ def gibberish(txt):
 def arg(a, k, dv=None):
     return a[a.index(k) + 1] if k in a else dv
 
-done = set()
-try:
-    for l in open(log):
-        if l.startswith("RUNG "):
-            done.add(l.split()[1])
-except FileNotFoundError:
-    pass
+def done_rungs():
+    done = set()
+    for f in glob.glob(log[:-len(".log")] + "*.log"):
+        for l in open(f, errors="ignore"):
+            if l.startswith("RUNG "):
+                done.add(l.split()[1])
+    return done
 
 corpus = open("/root/ppl.txt", errors="ignore").read()
 models = req("/models")["data"]
 out = open(log, "a")
+claims = os.path.join(os.path.dirname(log), "claims")
+os.makedirs(claims, exist_ok=True)
+
+def claim(mid):
+    if nshards == 1:
+        return True
+    try:
+        os.mkdir(os.path.join(claims, re.sub(r"[^A-Za-z0-9._-]", "_", mid)))
+        return True
+    except FileExistsError:
+        return False
+
 for m in models:
     mid = m["id"]
-    if mid in done:
+    if mid in done_rungs() or not claim(mid):
         continue
     a = m["status"].get("args", [])
     per_slot = int(arg(a, "--ctx-size", 0)) // max(1, int(arg(a, "--parallel", 1)))
