@@ -28,3 +28,4 @@ prompt corpus (any few-MB C++ text); `BIN=<path to llama-server>` overrides the 
 `fleetcheck`/`rungpass` scripts run (default: the production release when they were last updated); the 34.2 GB cards with a ship target of 33.5-33.9 GB used at peak.
 The router prints the exact child command line after `spawning server instance with args:` in its log -
 that is the args file `multi-prompt.sh` takes, and the faithful way to run a rung standalone.
+| `r9v_fetch.py <r9v checkout> <package.json> <image-bundle.json> <dest> [local gguf dir]` | lay out an R9V model package + runtime image parts, every file SHA-256 checked; our matching GGUF shards are symlinked, not downloaded |
