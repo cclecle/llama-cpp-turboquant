@@ -164,6 +164,8 @@ echo "=== compute layout must not change the result (perplexity, tol ${PPL_TOL})
 ppl_close "tensor split == layer split"      -sm layer  -- -sm tensor
 ppl_close "KV in host RAM == KV in VRAM"     -sm tensor -- -sm tensor -nkvo
 ppl_close "hybrid KV (-nckvl 8) == in VRAM"  -sm tensor -- -sm tensor -nckvl 8
+ppl_close "positional KV (-nckvc) crossing == in VRAM, tensor" -sm tensor -- -sm tensor --n-cpu-kv-cells 256
+ppl_close "positional KV (-nckvc) crossing == in VRAM, layer"  -sm layer  -- -sm layer  --n-cpu-kv-cells 256
 ppl_close "n_seq>1 tensor+nkvo == layer"     -sm layer -nkvo -- -sm tensor -nkvo
 [ -n "${NCMOE:-}" ] && ppl_close "CPU-MoE offload == all on GPU" -sm tensor -- -sm tensor -ncmoe "$NCMOE"
 
