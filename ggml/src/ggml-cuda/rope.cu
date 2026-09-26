@@ -470,9 +470,16 @@ static void rope_multi_cuda(const T *            x,
                             const bool           inplace,
                             cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
-    const dim3 block_nums(nr, n_blocks_x, 1);
+    // a short row leaves most of a block idle (the 8,192 pooled 128-wide qwen4exp indexer keys per layer: 81 us),
+    // so pack rows into one block. The kernel does not check the row bound, so the packed rows must divide nr
+    int rows_per_block = 1;
+    while ((ne00/2) * (2*rows_per_block) <= CUDA_ROPE_BLOCK_SIZE && nr % (2*rows_per_block) == 0) {
+        rows_per_block *= 2;
+    }
+    const int  pairs_per_block = CUDA_ROPE_BLOCK_SIZE / rows_per_block;
+    const dim3 block_dims(rows_per_block, pairs_per_block, 1);
+    const int  n_blocks_x = (ne00/2 + pairs_per_block - 1) / pairs_per_block;
+    const dim3 block_nums(nr / rows_per_block, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 

@@ -864,6 +864,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
+                    // as F16: at 4-5 columns mul_mat_f launches one block per 32 rows, too few for a
+                    // skinny matrix (the qwen4exp indexer projections, 128 and 512 rows: 48 us vs mmvf)
+                    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+                        return ne11 <= 5;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
