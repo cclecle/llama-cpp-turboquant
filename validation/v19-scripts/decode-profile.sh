@@ -3,9 +3,11 @@
 # under rocprofv3 --kernel-trace, one short prompt, 512 generated tokens (MTP on, as in production), then per-kernel
 # totals and, for the MoE mat-vec kernels, the per-dispatch duration split (host-resident UVA experts read over PCIe
 # are an order of magnitude slower than VRAM ones). Production must already be stopped; it is left stopped.
+# DP_ARGS: args file; DP_PROMPT: prompt file (default: a short essay request); DP_TOKENS: tokens to generate (512);
+# DP_TAG: output directory suffix.
 cd /mnt/gguf/r9v/bench
 b=${1:-v18}
-out=prof-decode-$b
+out=prof-decode-$b${DP_TAG:-}
 rm -rf $out; mkdir -p $out
 mapfile -t A < ${DP_ARGS:-fn-xl.args}   # DP_ARGS: another args file (same layout)
 for i in "${!A[@]}"; do [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536; done
@@ -17,7 +19,12 @@ until curl -sf -o /dev/null http://127.0.0.1:8090/health; do
   sleep 2; kill -0 $SRV 2>/dev/null || { echo "server died"; tail -20 $out/server.log; exit 1; }
   [ $(( $(date +%s) - t0 )) -gt 900 ] && { echo timeout; exit 1; }
 done
-curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a long, detailed essay about the history of the printing press."}],"max_tokens":512,"temperature":0}' > $out/answer.json
+python3 - "${DP_PROMPT:-}" "${DP_TOKENS:-512}" > $out/body.json <<'PY'
+import json, sys
+text = open(sys.argv[1], errors='ignore').read() if sys.argv[1] else 'Write a long, detailed essay about the history of the printing press.'
+print(json.dumps({'messages': [{'role': 'user', 'content': text}], 'max_tokens': int(sys.argv[2]), 'temperature': 0, 'cache_prompt': False}))
+PY
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d @$out/body.json > $out/answer.json
 python3 -c "import json; d=json.load(open('$out/answer.json')); print('timings', {k: d['timings'].get(k) for k in ('prompt_n','predicted_n','predicted_per_second','draft_n','draft_n_accepted')})"
 kill -TERM -- -$SRV; sleep 15; kill -KILL -- -$SRV 2>/dev/null; sleep 2
 f=$(find $out -name '*kernel_trace.csv' | head -1)
