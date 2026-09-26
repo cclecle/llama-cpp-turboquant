@@ -29,3 +29,5 @@ prompt corpus (any few-MB C++ text); `BIN=<path to llama-server>` overrides the 
 The router prints the exact child command line after `spawning server instance with args:` in its log -
 that is the args file `multi-prompt.sh` takes, and the faithful way to run a rung standalone.
 | `r9v_fetch.py <r9v checkout> <package.json> <image-bundle.json> <dest> [local gguf dir]` | lay out an R9V model package + runtime image parts, every file SHA-256 checked; our matching GGUF shards are symlinked, not downloaded |
+| `oci_unpack.py <docker-save tar or .gz.part000> <rootfs> [image id]` | unpack a `docker save` image into a plain directory without docker: split gzip parts joined, layers applied in order, whiteouts honoured, image config (Env, Entrypoint) written next to it |
+| `openai_bench.py <url> <model> <prompt file> <label> <results.jsonl> [max_tokens] [warmup]` | one streaming chat completion against any OpenAI-compatible server (llama-server, vLLM): TTFT/prefill t/s, decode t/s, draft acceptance (llama timings or vLLM /metrics) |
