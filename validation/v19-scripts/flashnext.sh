@@ -3,16 +3,18 @@
 # the 32k-token prompt (mkprompt.sh), up to 2,048 generated tokens, temperature 0, shared client openai_bench.py.
 #   v16 / v18: the production :XL rung args (rungargs.py, llamacpp-both journal) with --ctx-size 65536
 #   r9v:       R9V profile qwen38-mtp4 via r9v-run.sh 65536 (vLLM fork, host process from the unpacked image)
-# Production stopped for the whole run; VRAM per card + host RAM sampled every second. Everything lands in
-# /mnt/gguf/r9v/bench. The rig is a Proxmox container: the page cache cannot be dropped between backends, and an
+# Production is stopped and left stopped; VRAM per card + host RAM sampled every second. Everything lands in
+# /mnt/gguf/r9v/bench. The rig is a Proxmox container: the page cache cannot be dropped between backends, and
 # its locked memory is capped at 8 MiB for ssh sessions and units alike. Run it detached, as a transient service:
-#   systemd-run --unit=flashnext-bench --collect -p LimitMEMLOCK=infinity -p WorkingDirectory=/mnt/gguf/r9v/bench \n#     /bin/bash -c 'bash flashnext.sh > run.log 2>&1'
+#   systemd-run --unit=flashnext-bench --collect -p WorkingDirectory=/mnt/gguf/r9v/bench \
+#     /bin/bash -c 'bash flashnext.sh > run.log 2>&1'
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
 CARDS="0000:03:00.0 0000:07:00.0"
 SRV=
 stop_srv() { [ -n "$SRV" ] && kill -TERM -- -"$SRV" 2>/dev/null; sleep 10; [ -n "$SRV" ] && kill -KILL -- -"$SRV" 2>/dev/null; SRV=; sleep 3; }
-trap 'stop_srv; kill $SAMPLER 2>/dev/null; systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo "FLASHNEXT_DONE production: $(systemctl is-active llamacpp-0 llamacpp-1 llamacpp-both | tr "\n" " ")"' EXIT
+# production is left stopped for the whole campaign (the user restarts it); the trap only cleans up the server
+trap 'stop_srv; kill $SAMPLER 2>/dev/null; echo "FLASHNEXT_DONE production (left stopped): $(systemctl is-active llamacpp-0 llamacpp-1 llamacpp-both | tr "\n" " ")"' EXIT
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 5
 
 sample() { # <file>: t, vram used MiB per card, host MemAvailable MiB
