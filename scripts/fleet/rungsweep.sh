@@ -6,7 +6,7 @@
 set -u
 V=${1:?release, e.g. v17}; FRAC=${2:-0.5}; PORT=20099
 BIN=/opt/llamacpp/llama-cpp-mine-$V/build3/bin
-W=/root/work-$(date +%Y%m%d); mkdir -p $W
+W=${SWEEP_DIR:-/root/work-$(date +%Y%m%d)}; mkdir -p $W   # set SWEEP_DIR to resume a sweep started on another day
 PID=
 finish() { [ -n "$PID" ] && { kill -TERM $PID 2>/dev/null; sleep 5; kill -9 $PID 2>/dev/null; }; systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo "SWEEP_ALL_DONE production: $(systemctl is-active llamacpp-0 llamacpp-1 llamacpp-both | tr '\n' ' ')"; }
 trap finish EXIT
