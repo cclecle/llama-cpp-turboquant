@@ -1,7 +1,8 @@
 #!/bin/bash
-# build the scratch tree with the production options (copied from scripts/fleet/build-release.sh)
+# build a scratch tree with the production options (copied from scripts/fleet/build-release.sh)
+# usage: build-scratch.sh [tree dir, default /opt/llamacpp/tmp-rdnab]
 set -eu
-cd /opt/llamacpp/tmp-rdnab
+cd "${1:-/opt/llamacpp/tmp-rdnab}"
 cmake -B build3 -DCMAKE_BUILD_TYPE=Release \
   -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
   -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.4/lib/llvm/bin/clang++ \
