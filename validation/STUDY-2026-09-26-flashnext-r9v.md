@@ -85,7 +85,8 @@ On the box, `/mnt/gguf/r9v/`:
 - **1.1 AllReduce hybrid** (`5a9fdf8c9`): small FP32 reductions go through the direct-P2P kernel next to RCCL.
   - Cap: 32,768 elements, below RCCL's own BF16 threshold, so the numerics are unchanged. `GGML_CUDA_AR_HYBRID=0` turns it off.
   - Perplexity at ub 8, where every reduction is decode-sized: bit-identical, 1.4516 off and on.
-  - Pooled 6-prompt decode (`:XL` args, 65k): **39.7 → 43.4 t/s**. At matched acceptance the gain is +7.1% to +9.7% (p0 201/294: 40.2 → 44.1; p2 181/262: 41.9 → 45.2).
+  - ~~Pooled 6-prompt decode 39.7 → 43.4 t/s.~~ **INVALID:** `multi-prompt.sh` picked the arms by release name, so with one build as both A and B it ran the A settings twice. Both arms had the hybrid **off**, so the 9% gap is run-to-run drift between identical runs. Fixed: arms by position, plus `MP_ABBA=1`. Re-measured in step 3.
+  - Other evidence, single runs: the decode profile (short prompt) went 34.2 (v18) → 38.1 t/s (v19 with the hybrid); warm flashnext at 32k went 37.2-37.4 → 37.4-37.9.
   - Prefill: unchanged (978 vs 979). Prefill reductions exceed the cap and stay on RCCL.
   - Note: the P2P kernel's GPU time equals NCCL's (61 us/call, both mostly waiting for the peer GPU). The gain is RCCL's host-side cost.
 - **1.4 prefill ubatch** (config only, not applied), warm runs:
