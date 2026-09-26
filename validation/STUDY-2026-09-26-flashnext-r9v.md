@@ -392,3 +392,14 @@ ubatch (~0.9 ms at 33k per its own comment), not yet measured.
   host-sync gaps 4.4 ms.
 - The hyper-connection down projection (10240 -> 320, 96 per step) runs at ~240 GB/s: RDNA4 verify batches get
   one warp per row, which starves a matrix with few rows and a long K.
+
+### 11.9 Step 10: tall-K verify mat-vecs, MoE sharing
+
+- `GGML_CUDA_MMVQ_TALL_K` (default on): on RDNA4 a verify batch (2-8 columns) through a q8_0 matrix with fewer than
+  2,048 rows and at least 128 blocks of K gets 4 warps per row instead of one (the hyper-connection down projection
+  10240 -> 320 ran at ~240 GB/s). test-backend-ops MUL_MAT q8_0 59/59.
+- A (off) 53.9 / 54.6, B 50.9 / 52.3 ms/step → **-2.6 ms/step (-4.8%)**. Since the start: **68.0 → 51.6 ms/step**.
+- `GGML_CUDA_MOE_STATS=1` (a debug counter; it synchronizes): per MoE call of a verify batch, **49.9 (token, slot)
+  pairs but 33.7 distinct experts (32% duplicates); cold 11.2 pairs, 7.3 distinct (35% duplicates)**. Our kernel reads
+  an expert once per pair, and cold experts sit in uncached host memory, so every duplicate crosses PCIe again: the
+  case for a kernel that reads each distinct expert once per batch (R9V's reuse3v2).
