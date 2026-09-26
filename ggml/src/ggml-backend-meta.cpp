@@ -2411,6 +2411,25 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// The scheduler allocates the meta graph, and every device tensor sits at its meta tensor's offset, so an allocation
+// dependency on the meta graph holds on every device. The device backends' fusions that read inputs while writing the
+// output need them (the CUDA MoE weighted sum): ask each distinct backend for them on the meta graph. Their
+// graph_optimize itself is not called, since it may reorder nodes or keep state keyed on the graph.
+static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
+    std::vector<ggml_backend_graph_add_alloc_deps_t> done;
+    for (const auto & bc : backend_ctx->backend_configs) {
+        const ggml_backend_graph_add_alloc_deps_t add_alloc_deps = (ggml_backend_graph_add_alloc_deps_t)
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(bc.backend)),
+                "ggml_backend_graph_add_alloc_deps");
+        if (add_alloc_deps == nullptr || std::find(done.begin(), done.end(), add_alloc_deps) != done.end()) {
+            continue;
+        }
+        add_alloc_deps(cgraph, params);
+        done.push_back(add_alloc_deps);
+    }
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2985,7 +3004,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
-    /* .graph_optimize          = */ nullptr,
+    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

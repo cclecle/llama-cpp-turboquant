@@ -4856,9 +4856,11 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
-static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-
+// The allocation dependencies of the fusions that read their inputs while they write the output. Also exported as
+// ggml_backend_graph_add_alloc_deps: the meta backend (-sm tensor) asks for them on its own graph, whose allocation
+// the device tensors share (each sits at its meta tensor's offset); without them the fused MoE sum found its output
+// placed over the freed expert outputs and fell back to 3 kernels per layer.
+static void ggml_backend_cuda_graph_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
@@ -4947,6 +4949,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     }
+}
+
+static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_backend_cuda_graph_add_alloc_deps(cgraph, params);
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -6152,6 +6160,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_graph_add_alloc_deps") == 0) {
+        ggml_backend_graph_add_alloc_deps_t fct = ggml_backend_cuda_graph_add_alloc_deps;
+        return (void *)fct;
     }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cuda_device_get_extra_bufts;

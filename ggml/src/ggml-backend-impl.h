@@ -118,6 +118,10 @@ extern "C" {
         void * user_data;
     };
 
+    // "ggml_backend_graph_add_alloc_deps" (reg proc address): only the allocation dependencies of graph_optimize,
+    // without changing the graph or the backend state; the meta backend asks for them on its own graph
+    typedef void (*ggml_backend_graph_add_alloc_deps_t)(struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
