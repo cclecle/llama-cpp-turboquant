@@ -378,6 +378,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+
+    // a cache of a layer this model does not have (e.g. a gemma4 assistant reads the target's KV): not ours to decide
+    if (tensor_name.rfind("cache_", 0) == 0) {
+        const size_t pos = tensor_name.find("_l", 6);
+        if (pos != std::string::npos && pos + 2 < tensor_name.size() && isdigit((unsigned char) tensor_name[pos + 2]) &&
+                std::stoul(tensor_name.substr(pos + 2)) >= hparams.n_layer_all) {
+            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+    }
+
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
