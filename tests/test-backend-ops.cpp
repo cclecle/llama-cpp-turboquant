@@ -10419,6 +10419,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // multi-token MoE mat-vec (mul_mat_vec_q_moe_reuse): experts shared across the batch, more routes than a warp,
+    // row counts that leave a partial block, per-slot and broadcast activations
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (int n : {2, 5, 8}) {
+            for (bool b : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 12, 10, b,  37, n, 512));
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, b, 320, n, 256));
+            }
+        }
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
