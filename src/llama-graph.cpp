@@ -2768,7 +2768,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_add_sinks(o, sk);
             ggml_flash_attn_ext_set_prec (o, GGML_PREC_F32);
 
-            *lse = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, o->ne[1], o->ne[2], o->ne[3]);
+            // [1, n_head, n_tokens] buffer that the flash-attn op overwrites. It is derived from q (not a leaf)
+            // so that a tensor split gives it the same head split as o.
+            *lse = ggml_cont(ctx0, ggml_permute(ctx0, ggml_sum_rows(ctx0, qq), 0, 2, 1, 3));
 
             ggml_flash_attn_ext_add_lse(o, *lse);
 

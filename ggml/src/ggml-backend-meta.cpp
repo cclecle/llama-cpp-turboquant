@@ -584,6 +584,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // [TP-CPU-BOUNDARY] tensor->buffer may be a host (CPU) buffer, or null for a not-yet-allocated meta
     // compute tensor reached via src-recursion during graph allocation. Only read the buffer when it is
     // actually a meta buffer; otherwise fall back to the device count recorded on stc.
+    // Unallocated tensors have no buffer-keyed cache, and a DAG with shared srcs makes the recursion
+    // exponential in depth. Memoize them for the duration of one outermost query only.
+    static thread_local int depth = 0;
+    static thread_local std::map<std::pair<const ggml_tensor *, bool>, ggml_backend_meta_split_state> memo;
+    struct depth_guard {
+        depth_guard()  { depth++; }
+        ~depth_guard() { if (--depth == 0) { memo.clear(); } }
+    } guard;
+
     const bool on_meta = (tensor->buffer != nullptr) && ggml_backend_buffer_is_meta(tensor->buffer);
     const size_t n_bufs = on_meta ? ggml_backend_meta_buffer_n_bufs(tensor->buffer) : stc.n_bufs;
     ggml_backend_meta_buffer_context * buf_ctx =
@@ -666,6 +675,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_ERROR("%s: no common split state for %s (%s) ne=[%lld,%lld,%lld,%lld]\n", __func__,
+                tensor->name, ggml_op_desc(tensor), (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] != nullptr) {
+                    GGML_LOG_ERROR("  src[%zu] %s (%s) axis=%d host=%d view=%d ne=[%lld,%lld,%lld,%lld]\n", i, tensor->src[i]->name, ggml_op_desc(tensor->src[i]),
+                        (int) src_ss[i].axis, (int) ggml_backend_meta_tensor_is_host(tensor->src[i]), tensor->src[i]->view_src != nullptr,
+                        (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1], (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3]);
+                }
+            }
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
@@ -1078,6 +1098,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // on every device), which makes each device's local head indices map correctly.
                 if (strstr(tensor->name, "cache_k_l") != nullptr ||
                         strstr(tensor->name, "cache_v_l") != nullptr) {
+                    if (ggml_backend_meta_debug_enabled()) {
+                        GGML_LOG_ERROR("[META] host KV copy %s ne=[%lld,%lld,%lld,%lld]\n", tensor->name,
+                            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+                    }
+                    // Some models keep their KV cache mirrored (e.g. an EAGLE draft of an MLA target, whose
+                    // attention stays replicated). Ask the model about the cache tensor itself: the copy is
+                    // named "<backend>#<src name>#<n>" and holds [head_dim, n_tokens, n_head_kv] of a
+                    // [head_dim*n_head_kv, n_cells] cache.
+                    if (stc.dev_ctx != nullptr) {
+                        std::string name = tensor->name;
+                        const size_t b0 = name.find('#');
+                        const size_t b1 = name.rfind('#');
+                        if (b0 != std::string::npos && b1 > b0) {
+                            name = name.substr(b0 + 1, b1 - b0 - 1);
+                        }
+                        name = name.substr(0, name.find(' '));
+
+                        ggml_tensor cache = *tensor;
+                        snprintf(cache.name, sizeof(cache.name), "%s", name.c_str());
+                        cache.ne[0] = tensor->ne[0]*tensor->ne[2];
+                        cache.ne[1] = tensor->ne[1];
+                        cache.ne[2] = 1;
+                        cache.ne[3] = 1;
+                        cache.view_src = nullptr;
+                        if (stc.dev_ctx->get_split_state(&cache, stc.dev_ctx->get_split_state_ud).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                        }
+                    }
                     const int64_t n_head_kv = tensor->ne[2];
                     if (n_bufs > 0 && n_head_kv > 0 && n_head_kv % (int64_t) n_bufs == 0) {
                         ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
@@ -1333,7 +1381,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // [TP-CPU-BOUNDARY] no meta buffer to cache against (unallocated tensor during alloc-time
     // src-recursion): compute directly, skip the buffer-keyed cache.
     if (buf_ctx == nullptr) {
-        return calculate_split_state();
+        const std::pair key = std::make_pair(tensor, assume_sync);
+        auto it = memo.find(key);
+        if (it != memo.end()) {
+            return it->second;
+        }
+        const ggml_backend_meta_split_state ss = calculate_split_state();
+        memo[key] = ss;
+        return ss;
     }
 
     const std::pair key = std::make_pair(tensor, assume_sync);
