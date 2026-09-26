@@ -45,7 +45,8 @@ def arg(a, k, dv=None):
 
 def done_rungs():
     done = set()
-    for f in glob.glob(log[:-len(".log")] + "*.log"):
+    # the per-card logs of one store share a stem: sweep-v17-single.log, sweep-v17-single-g1.log
+    for f in glob.glob(re.sub(r"(-g\d+)?\.log$", "", log) + "*.log"):
         for l in open(f, errors="ignore"):
             if l.startswith("RUNG "):
                 done.add(l.split()[1])
