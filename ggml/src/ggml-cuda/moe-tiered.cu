@@ -522,3 +522,11 @@ const void * ggml_cuda_tiered_expert(const ggml_tensor * t, int64_t expert) {
     GGML_ASSERT(info != nullptr && expert >= 0 && expert < info->n_expert);
     return info->h_table[expert];
 }
+
+int ggml_cuda_tiered_is_hot(const ggml_tensor * t, int64_t expert) {
+    const tiered_tensor * info = tiered_info(t);
+    if (info == nullptr || expert < 0 || expert >= info->n_expert) {
+        return -1;
+    }
+    return info->hot(expert) ? 1 : 0;
+}

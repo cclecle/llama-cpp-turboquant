@@ -21,3 +21,6 @@ const void * const * ggml_cuda_tiered_table(const ggml_tensor * t);
 
 // Device address of one expert (host copy of the table), for the synchronous MUL_MAT_ID fallback.
 const void * ggml_cuda_tiered_expert(const ggml_tensor * t, int64_t expert);
+
+// 1 if the expert is in VRAM, 0 if it is in mapped host memory, -1 if t is not a tiered expert tensor
+int ggml_cuda_tiered_is_hot(const ggml_tensor * t, int64_t expert);

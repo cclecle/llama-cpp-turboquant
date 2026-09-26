@@ -11308,6 +11308,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 2560, n));
         }
     }
+    // verify-batch mat-vecs through few rows and a long K (the qwen4exp hyper-connection down projection)
+    for (int64_t n : { 2, 5, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 7, n, 10240, {2, 1}, {1, 1}));
+    }
     for (bool strided : { false, true }) {
         test_cases.emplace_back(new test_rms_norm_scale({128, 16, 5, 1}, strided));
         test_cases.emplace_back(new test_rms_norm_scale({2048, 3, 2, 1}, strided));
