@@ -403,3 +403,13 @@ ubatch (~0.9 ms at 33k per its own comment), not yet measured.
   pairs but 33.7 distinct experts (32% duplicates); cold 11.2 pairs, 7.3 distinct (35% duplicates)**. Our kernel reads
   an expert once per pair, and cold experts sit in uncached host memory, so every duplicate crosses PCIe again: the
   case for a kernel that reads each distinct expert once per batch (R9V's reuse3v2).
+
+### 11.10 Status at the mid-way write-up (2026-09-26 night)
+
+- 68.0 → **51.6 ms/step** (-24%), prefill 1,045 → ~1,120 t/s, perplexity unchanged. R9V: 41 ms/step.
+- The reusable lessons are in `PLAYBOOK-rdna4-tp-decode-optimisation.md` (methodology, traps, design rules, the gap
+  table) and `PLAYBOOK-hip-kernel-optimisation.md` (HIP / RDNA4 kernel work).
+- In progress: MoE expert reuse (`mul_mat_vec_q_moe_reuse`, R9V reuse3v2 structure, `GGML_CUDA_MOE_REUSE`).
+- Next: the draft loop (needs a split-aware top-k in the meta backend for an unrolled draft graph or a coarse head),
+  fewer and wider dense mat-vecs, the sparse FA config (75 us vs R9V's 14 us), the MoE weighted-reduction fusion that
+  does not match on this graph, the GDN gate chains.
