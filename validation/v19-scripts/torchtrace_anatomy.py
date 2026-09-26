@@ -9,7 +9,8 @@ import collections, csv, gzip, json, re, sys
 
 
 def short(name):
-    n = re.sub(r'\(.*', '', name)
+    n = name.replace('(anonymous namespace)::', '')
+    n = re.sub(r'\(.*', '', n)
     n = re.sub(r'<.*', '', n).replace('void ', '').strip()
     return n[-48:]
 
