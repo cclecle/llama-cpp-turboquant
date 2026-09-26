@@ -808,10 +808,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            // the MMA launcher reads a native operand itself (see launch_fattn), no F16 copy needed
+            const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const bool native_width = ggml_cuda_fattn_kv_native_width(Q);
+            const bool native_K = native_width && ggml_cuda_fattn_kv_native_type(K) != FATTN_KV_NATIVE_NONE;
+            const bool native_V = native_width && (V_is_K_view ? native_K : ggml_cuda_fattn_kv_native_type(V) != FATTN_KV_NATIVE_NONE);
+            need_f16_K = !native_K;
+            need_f16_V = !native_V;
+        } break;
         case BEST_FATTN_KERNEL_MLA_DECODE:
             // q8_0 is read natively; V is never read, it aliases the first DV dims of K.
             need_f16_K = K->type != GGML_TYPE_Q8_0;

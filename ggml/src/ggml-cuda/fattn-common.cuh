@@ -88,8 +88,10 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
 // Native q8_0 K/V (from rdna-boosts block 15): the MMA kernel dequantizes each 16-byte shared-memory
 // chunk (8 elements, a quarter q8_0 block) while it loads the tiles, instead of reading an F16 copy of
-// the whole cache that the launcher converts on every call. Used for the decode/verify band only
-// (n_q <= 8), where that whole-cache conversion dominates. GGML_CUDA_FA_KV_NATIVE=0 disables it.
+// the whole cache that the launcher converts on every call. Used for decode/verify (n_q <= 8), where
+// that whole-cache conversion dominates; GGML_CUDA_FA_KV_NATIVE=0 disables it. A prefill amortizes the
+// conversion over many query rows, but its F16 copy of K and V sits in the compute buffer (1 GiB for
+// 4x256 KV heads at 262k cells): GGML_CUDA_FA_KV_NATIVE_PREFILL=1 reads q8_0 natively there too.
 static constexpr int GGML_CUDA_FA_Q8_CHUNK = 8;
 
 enum fattn_kv_native_type : int {
@@ -103,6 +105,20 @@ static inline bool ggml_cuda_fattn_kv_native_enabled() {
         return env == nullptr || atoi(env) != 0;
     }();
     return enabled;
+}
+
+static inline bool ggml_cuda_fattn_kv_native_prefill_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_KV_NATIVE_PREFILL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// the widths at which a native-capable launcher reads K/V natively; the launcher and the
+// compute-buffer sizing (ggml_cuda_flash_attn_ext_get_alloc_size) both ask this, so they agree
+static inline bool ggml_cuda_fattn_kv_native_width(const ggml_tensor * Q) {
+    return Q->ne[1] <= 8 || ggml_cuda_fattn_kv_native_prefill_enabled();
 }
 
 // t is the K or V operand of a FLASH_ATTN_EXT node
@@ -1154,9 +1170,8 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
-    // the kernel reads a native operand itself, so its whole-cache F16 conversion is skipped.
-    // Only for decode/verify (n_q <= 8); a prefill amortizes the conversion over many query rows.
-    const bool native_width = allow_kv_native && Q->ne[1] <= 8;
+    // the kernel reads a native operand itself, so its whole-cache F16 conversion is skipped
+    const bool native_width = allow_kv_native && ggml_cuda_fattn_kv_native_width(Q);
     const int  kv_native_K  = native_width && need_f16_K ? ggml_cuda_fattn_kv_native_type(K) : FATTN_KV_NATIVE_NONE;
     const int  kv_native_V  = native_width && need_f16_V ? (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)) : FATTN_KV_NATIVE_NONE;
 
