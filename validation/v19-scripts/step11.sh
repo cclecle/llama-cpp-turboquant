@@ -7,6 +7,8 @@
 # A = reuse off, B = default. Production stays stopped.
 #   1) test-backend-ops MUL_MAT_ID and MUL_MAT_VEC_FUSION, test-moe-tiered, 2) perplexity at ub 8 / 8k A vs B
 #   (bit-identical expected), 3) same-config throughput A B B A, 4) kernel trace of B: the MoE kernels and the anatomy
+#   S11_SPEED_ONLY=1 skips 1) and 2). This build also has the meta backend's allocation dependencies (no toggle): the
+#   trace shows whether the fused MoE weighted sum now runs in decode (moe_weighted_reduction_f32 per verify pass).
 cd /mnt/gguf/r9v/bench
 B=/opt/llamacpp/llama-cpp-mine-v19dev/build3/bin
 M=/mnt/gguf/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
@@ -16,6 +18,7 @@ ENV_A="GGML_CUDA_MOE_REUSE=0"
 ENV_B="X=0"
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
 
+if [ "${S11_SPEED_ONLY:-0}" != 1 ]; then
 echo "### test-backend-ops"
 for op in MUL_MAT_ID MUL_MAT_VEC_FUSION; do
   echo "$op: $(HIP_VISIBLE_DEVICES=0 timeout 3000 $B/test-backend-ops -o $op -b ROCm0 2>&1 | grep -E 'tests passed|FAIL' | head -4 | tr '\n' ' ')"
@@ -33,6 +36,7 @@ for arm in A B; do
       grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+' | tr '\n' ' ')
   echo "$arm: $r"
 done
+fi
 
 echo "### throughput, warm, A B B A"
 n=0

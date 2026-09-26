@@ -2416,6 +2416,13 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 // output need them (the CUDA MoE weighted sum): ask each distinct backend for them on the meta graph. Their
 // graph_optimize itself is not called, since it may reorder nodes or keep state keyed on the graph.
 static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_META_ALLOC_DEPS"); // 0: no allocation dependencies (the fusions that need them fall back)
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
     std::vector<ggml_backend_graph_add_alloc_deps_t> done;
     for (const auto & bc : backend_ctx->backend_configs) {
