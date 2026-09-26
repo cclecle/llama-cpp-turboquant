@@ -2078,10 +2078,21 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
     }
 
     if (ubatch.is_pos_2d()) {
+        // the packed mask this falls back to was not in the reserve: say so once, the compute
+        // buffer grows by n_kv x n_tokens x 2 bytes
+        static bool warned = false;
+        auto out_of_range = [&]() {
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: M-RoPE positions out of the derived kq mask range, using the packed mask\n", __func__);
+            }
+            return false;
+        };
+
         uint32_t yx;
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (!llama_kq_derived_yx(ubatch.pos[i], ubatch.pos[i + 2*ubatch.n_tokens], ubatch.pos[i + ubatch.n_tokens], yx)) {
-                return false;
+                return out_of_range();
             }
         }
 
@@ -2093,7 +2104,7 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
             }
             const auto & e = cells.ext_get(j);
             if (!llama_kq_derived_yx(cells.pos_get(j), e.x, e.y, yx)) {
-                return false;
+                return out_of_range();
             }
         }
     }
