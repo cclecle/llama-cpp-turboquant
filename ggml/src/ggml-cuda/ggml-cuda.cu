@@ -1127,6 +1127,9 @@ struct ggml_backend_cuda_comm_context {
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
+
+    // hybrid (HIP, NCCL + ar_pipeline): FP32 reductions of at most this many elements take the direct-P2P kernel
+    int64_t                     hybrid_max_ne = 0;
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
@@ -1276,6 +1279,28 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
+
+// RCCL spends ~60 us per decode-sized reduction on gfx1201 (Flash-Next: ~100 per step, ~6 ms), the
+// direct-P2P kernel a few us. Small FP32 reductions go through P2P; NCCL reduces those in FP32 too
+// (below its 32768-element BF16 threshold), so the default cap only reroutes. Everything else stays on NCCL.
+// The decision depends on tensors[0] only, so every device issues the same sequence of collectives.
+static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        return true;
+    }
+    bool p2p = tensors[0]->type == GGML_TYPE_F32 && ne <= comm_ctx->hybrid_max_ne;
+    for (size_t i = 0; p2p && i < comm_ctx->backends.size(); ++i) {
+        p2p = tensors[i] != nullptr && tensors[i]->type == GGML_TYPE_F32 && ggml_nelements(tensors[i]) == ne &&
+            ggml_is_contiguously_allocated(tensors[i]) && ((uintptr_t) tensors[i]->data & 0xF) == 0 &&
+            (ggml_nbytes(tensors[i]) & 0xF) == 0;
+    }
+    if (p2p && ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
 #endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
@@ -1333,6 +1358,21 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+#ifdef GGML_USE_HIP
+        // GGML_CUDA_AR_HYBRID: max elements routed through direct P2P next to RCCL (default 32768, 0 = RCCL only)
+        const char * hyb = getenv("GGML_CUDA_AR_HYBRID");
+        const int64_t max_ne = hyb ? strtoll(hyb, nullptr, 10) : 32768;
+        if (n == 2 && max_ne > 0) {
+            ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), n);
+            if (ret->ar_pipeline) {
+                ret->hybrid_max_ne = max_ne;
+                ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
+                GGML_LOG_INFO("%s: AllReduce: RCCL, direct P2P up to %" PRId64 " FP32 elements\n", __func__, max_ne);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+#endif // GGML_USE_HIP
         return;
     }
 
