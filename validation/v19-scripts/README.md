@@ -9,6 +9,7 @@ Everything lives on the box under `/mnt/gguf/r9v/` (removing that directory undo
 |---|---|
 | `r9v-run.sh [max len]` | R9V profile `qwen38-mtp4` as a plain host process: the image's `/opt/r9v` venv + ROCm 7.14 unpacked by `scripts/fleet/oci_unpack.py`, env and `vllm serve` args transcribed from R9V `scripts/launch.sh`, container paths mapped to host ones |
 | `mkprompt.sh <out> [tokens]` | the benchmark prompt: llama.cpp docs cut to the target with the model's HF tokenizer, then a long-answer task |
+| `build-rocm714.sh` | the v18 source built against ROCm 7.14 (`/opt/rocm-7.14`, copied from R9V's image) into the temporary tree `llama-cpp-mine-v18-rocm714`, to separate the ROCm version from R9V's kernels |
 | `flashnext.sh [backends]` | the benchmark: production stopped, each backend loaded, warmed up, measured with `scripts/fleet/openai_bench.py`, VRAM/RAM sampled |
 
 R9V setup, in order: `scripts/fleet/r9v_fetch.py` (package + image parts, SHA-256 checked, our shards linked),
