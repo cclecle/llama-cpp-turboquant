@@ -12,21 +12,22 @@ trap 'systemctl start llamacpp-0 llamacpp-1 llamacpp-both; echo "ATTN_DONE produ
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 5
 [ -s corpus.txt ] || cat /opt/llamacpp/tmp-attn/docs/*.md /opt/llamacpp/tmp-attn/docs/*/*.md > corpus.txt
 
-echo "### FLASH_ATTN_EXT on ROCm0 (derived cases included), then with native q8_0 prefill"
+# SKIP=tbo skips the kernel tests (already passed)
+[ "${SKIP:-}" = tbo ] || { echo "### FLASH_ATTN_EXT on ROCm0 (derived cases included), then with native q8_0 prefill"
 for E in 'X=0' 'GGML_CUDA_FA_KV_NATIVE_PREFILL=1'; do
   env $E HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=$B timeout 3600 $B/test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 > tbo-attn.log 2>&1
   echo "[$E] $(grep -cE '^ +FLASH_ATTN_EXT.*OK' tbo-attn.log) OK, $(grep -cE '^ +FLASH_ATTN_EXT.*FAIL' tbo-attn.log) FAIL, derived OK: $(grep -E 'derived=' tbo-attn.log | grep -c OK)"
   grep -E '^ +FLASH_ATTN_EXT.*FAIL' tbo-attn.log | head -10
-done
+done; }
 
 # load a server, print the compute/KV buffers and VRAM, stop it
 load() { # <tag> <env> <server args...>
   local tag=$1 e=$2; shift 2
-  env $e HIP_VISIBLE_DEVICES=${DEV:-0} LD_LIBRARY_PATH=$B $B/llama-server "$@" --port 20095 -fit off > load.log 2>&1 &
+  env $e HIP_VISIBLE_DEVICES=${DEV:-0} LD_LIBRARY_PATH=$B $B/llama-server "$@" --port 20095 -fit off -lv 4 > load.log 2>&1 &
   local pid=$! t=0
-  while [ $t -lt 240 ] && kill -0 $pid 2>/dev/null && ! grep -q 'server is listening' load.log; do sleep 2; t=$((t+2)); done
+  while [ $t -lt 240 ] && kill -0 $pid 2>/dev/null && ! grep -q 'listening on http' load.log; do sleep 2; t=$((t+2)); done
   local vr=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -i 'Used' | grep -oE '[0-9]+$' | awk '{printf "%.2f ", $1/1e9}')
-  echo "$tag [$e] compute: $(grep -oE 'ROCm[0-9] compute buffer size = +[0-9.]+ MiB' load.log | awk '{print $1, $6}' | tr '\n' ' ') host: $(grep -oE '(ROCm_Host|CPU) compute buffer size = +[0-9.]+ MiB' load.log | awk '{print $6}' | tr '\n' ' ') vram GB: $vr $(grep -m1 -o 'kq_mask_derived *= *[a-z]*' load.log)"
+  echo "$tag [$e] compute: $(grep -oE 'ROCm[0-9] compute buffer size = +[0-9.]+ MiB' load.log | awk '{print $1, $6}' | sort -u | tr '\n' ' ') host: $(grep -oE '(ROCm_Host|CPU) compute buffer size = +[0-9.]+ MiB' load.log | awk '{print $6}' | sort -u | tr '\n' ' ') vram GB: $vr $(grep -m1 -o 'kq_mask_derived *= *[a-z]*' load.log)"
   grep -iE 'error|abort|failed' load.log | head -3
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 3
 }
