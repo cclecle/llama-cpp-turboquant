@@ -102,3 +102,34 @@ On the box, `/mnt/gguf/r9v/`:
   - The ~23 ms of GPU idle per step is the gaps between ~4,400 small kernels per token, not host work.
   - **Steps 1.2 and 1.3 are dropped** as measured not worth it. The idle lever is kernel fusion (launch count).
 - **Methodology fix:** runs are now warm (see the ROCm 7.14 correction above): `openai_bench.py` warmup 2, `cache_prompt: false`.
+
+## Same configuration as R9V (step 5): the culprit is step cost
+
+Our tiered rung set up like R9V's `qwen38-mtp4`: `--spec-type draft-mtp`, n_max 4, p_min 0, greedy, the same 32k prompt, warm, two loads each.
+
+| | tokens/step | acceptance | ms/step | decode t/s | prefill t/s |
+|---|---:|---:|---:|---:|---:|
+| ours x2 | **2.95** | 48.8% | **70-71** | 41.6 / 42.2 | 1,055 / 1,052 |
+| R9V x2 | 2.82 / 2.86 | 45.5% / 46.4% | **41-42** | 68.5 / 68.0 | 1,729 / 1,724 |
+
+- We accept more per step (the MTP head is not the problem); each step is 70% longer.
+- R9V's earlier 1,328 / 61.0 was partly cold; these warm numbers replace it.
+
+Per decode step, from kernel traces of both engines (ours: rocprofv3; R9V: vLLM's torch profiler, 24 steps). This is the busier GPU (our GPU 0; R9V rank 0, which carries 416 of 640 channels):
+
+| part | ours | R9V |
+|---|---:|---:|
+| kernels per step | ~4,740 | ~2,760 |
+| MoE (R9V incl. LRU cache plan/fill/publish) | 16.0 ms | 18.9 + 3.6 ms |
+| dense mat-vecs incl. output head | ~13.7 ms | ~9 ms (`dense_mmvq_*_reuse5`, fused HC mat-vec) |
+| all-reduce | 7.6 ms (73 us/call) | 1.7 ms (17 us/call) |
+| attention, 32k ctx | 4.6 ms (dense FA) | ~0.5 ms (sparse `_qsa_*`) |
+| idle between kernels | ~29 ms under rocprof | ~16 ms under the torch profiler |
+
+The gap is structural, not one kernel:
+1. **All-reduce + launch skew.** The meta backend cuts each decode into ~100 host-launched subgraphs with host all-reduces between them; GPU 0 waits for GPU 1 at every cut. R9V runs one graph per rank per step with the all-reduce inside it.
+2. **Attention.** `build_attn_qsa` implements the indexer's sparse attention as a full-length mask (-inf fill, set_rows of the top-k cells, add) followed by dense FA over all n_kv cells. R9V attends only the selected blocks. The cost grows with context.
+3. **Dense mat-vecs** (multi-token reuse kernels, fused HC).
+4. **~2,000 more small kernels** and their dispatch gaps.
+
+Our MoE is already cheaper than R9V's rank 0.

@@ -94,6 +94,13 @@ export VLLM_PLE_MMAP_READAHEAD=$R9V_PLE_MMAP_READAHEAD VLLM_PLE_RSS_LOG_ROWS=$R9
 export R9V_WORKER_DIAGNOSTICS=1 R9V_CONTAINER_NAME=r9v-qwen38-flash-next R9V_OBSERVABILITY_TARGET=
 export R9V_STAGE_DIAGNOSTICS=${R9V_STAGE_DIAGNOSTICS:-0} R9V_EXPECTED_GPU_BDFS=${R9V_EXPECTED_GPU_BDFS:-}
 export VLLM_CUSTOM_SCOPES_FOR_PROFILING=0 QWEN38_PROFILE_DENSE_SHAPES=0
+# R9V_TORCH_PROFILE_DIR: vLLM's torch profiler (launch.sh's R9V_PROFILER_DIR, without stacks or shapes), started and
+# stopped with POST /start_profile and /stop_profile; each worker writes a Chrome trace there
+prof=()
+if [ -n "${R9V_TORCH_PROFILE_DIR:-}" ]; then
+  mkdir -p "$R9V_TORCH_PROFILE_DIR"
+  prof=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$R9V_TORCH_PROFILE_DIR\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":false,\"torch_profiler_with_memory\":false,\"ignore_frontend\":true,\"wait_iterations\":0,\"warmup_iterations\":1,\"active_iterations\":${R9V_TORCH_PROFILE_STEPS:-12},\"max_iterations\":${R9V_TORCH_PROFILE_STEPS:-12}}")
+fi
 export GGUF_PLE_MMAP_PATH=$ple_path GGUF_PLE_MMAP_TRIM_ROWS=$R9V_PLE_MMAP_TRIM_ROWS
 
 # docker ran it with --ulimit memlock=-1. This rig is a Proxmox container capped at 8 MiB locked memory even for
@@ -115,4 +122,4 @@ exec "$RV/bin/python" -m vllm.entrypoints.cli.main serve \
   --limit-mm-per-prompt '{"image":1,"video":0}' --mm-processor-kwargs '{"min_pixels":65536,"max_pixels":262144}' \
   --mm-processor-cache-gb 0 --mm-encoder-tp-mode weights \
   "${auto_tool[@]}" --tool-call-parser "$R9V_TOOL_CALL_PARSER" --reasoning-parser "$R9V_REASONING_PARSER" \
-  --trust-remote-code --host 127.0.0.1 --port "$R9V_HOST_PORT"
+  "${prof[@]}" --trust-remote-code --host 127.0.0.1 --port "$R9V_HOST_PORT"

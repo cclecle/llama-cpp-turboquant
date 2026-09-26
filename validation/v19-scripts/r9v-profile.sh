@@ -28,5 +28,10 @@ m1=$(curl -s http://127.0.0.1:8004/metrics | grep -E '^vllm:spec_decode_num_(dra
 python3 -c "import json; d=json.load(open('$out/answer.json')); print('usage', d.get('usage'))"
 echo "request wall $(python3 -c "print(round($t2 - $t1, 2))") s"
 echo "spec before: $m0" | tr '\n' ' '; echo; echo "spec after: $m1" | tr '\n' ' '; echo
-kill -TERM -- -$SRV; sleep 20; kill -KILL -- -$SRV 2>/dev/null; sleep 5
-find $out -name '*kernel_trace.csv' | xargs ls -la
+# rocprofv3 writes each process's trace when that process exits: stop vLLM gracefully (SIGINT to the API server)
+# and wait for every traced process to finish, never SIGKILL the group early (that loses the worker traces)
+api=$(pgrep -f 'vllm.entrypoints.cli.main serve' | head -1)
+[ -n "$api" ] && kill -INT $api
+for i in $(seq 1 300); do kill -0 $SRV 2>/dev/null || break; sleep 1; done
+kill -0 $SRV 2>/dev/null && { echo "still running after 300 s, terminating"; kill -TERM -- -$SRV; sleep 60; }
+find $out -name '*kernel_trace.csv' -exec ls -la {} \;
