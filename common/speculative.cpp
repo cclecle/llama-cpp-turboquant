@@ -1780,6 +1780,73 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// LLAMA_SPEC_FAST_TOPK=0: MTP drafts go through the generic CPU sampler chain again
+static bool spec_fast_top_k_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SPEC_FAST_TOPK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The k largest logits, sorted descending, with the probabilities of the MTP draft sampler chain
+// (suppressed tokens, top_k(k), dist): the softmax over those k. One pass: a chunk whose max cannot enter the
+// current top k is skipped whole, which is almost every chunk, so a 248k vocabulary costs ~0.1 ms instead of
+// building and sorting a candidate array of the whole vocabulary on every draft token.
+static void spec_top_k_logits(const float * logits, int32_t n_vocab, const std::vector<uint8_t> & skip, int k,
+        std::vector<llama_token_data> & out) {
+    out.clear();
+    float thr = -INFINITY; // the k-th largest so far, once there are k
+
+    auto push = [&](int32_t id, float l) {
+        if (skip[id] || !(l > thr || (int) out.size() < k)) {
+            return;
+        }
+        // insertion into the short sorted list, descending
+        llama_token_data td = { id, l, 0.0f };
+        auto it = std::upper_bound(out.begin(), out.end(), td,
+                [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+        out.insert(it, td);
+        if ((int) out.size() > k) {
+            out.pop_back();
+        }
+        if ((int) out.size() == k) {
+            thr = out.back().logit;
+        }
+    };
+
+    constexpr int32_t chunk = 64;
+    int32_t i0 = 0;
+    for (; i0 + chunk <= n_vocab; i0 += chunk) {
+        float mx = logits[i0];
+        for (int32_t i = 1; i < chunk; ++i) {
+            mx = std::max(mx, logits[i0 + i]);
+        }
+        if ((int) out.size() == k && !(mx > thr)) {
+            continue;
+        }
+        for (int32_t i = 0; i < chunk; ++i) {
+            push(i0 + i, logits[i0 + i]);
+        }
+    }
+    for (; i0 < n_vocab; ++i0) {
+        push(i0, logits[i0]);
+    }
+
+    // llama_sampler_dist: softmax over the kept candidates, summed in order
+    if (!out.empty()) {
+        const float max_l = out[0].logit;
+        float cum = 0.0f;
+        for (auto & td : out) {
+            td.p = expf(td.logit - max_l);
+            cum += td.p;
+        }
+        for (auto & td : out) {
+            td.p /= cum;
+        }
+    }
+}
+
 static bool spec_model_arch_is(const llama_model * model, const char * arch) {
     char buf[64];
     const int32_t n = llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf));
@@ -1821,6 +1888,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    // spec_top_k_logits: the suppressed tokens of the draft sampler chain (-inf logit bias) and the candidates
+    std::vector<uint8_t>          fast_skip;
+    std::vector<llama_token_data> fast_cand;
 
     // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
     bool adaptive = false;
@@ -1869,6 +1940,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        // the tokens the draft sampler chain suppresses (a -inf logit bias, see common_sampler_init), for the fast path
+        {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+            fast_skip.assign(llama_vocab_n_tokens(vocab), 0);
+            int32_t n_suppress = 0;
+            const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            for (int32_t k = 0; k < n_suppress; ++k) {
+                if (suppress[k] >= 0 && suppress[k] < (llama_token) fast_skip.size()) {
+                    fast_skip[suppress[k]] = 1;
+                }
+            }
         }
 
         // offload draft sampling to the backend
@@ -2184,10 +2268,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                // the CPU chain is logit bias + top_k(10) + dist, and only the first candidate and its probability
+                // are used: take the top 10 straight from the logits instead of sorting the whole vocabulary
+                const llama_token_data_array * cur_p = nullptr;
+                llama_token_data_array fast_arr = { nullptr, 0, 0, true };
+                if (spec_fast_top_k_enabled() && backend_chains[seq_id] == nullptr) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    spec_top_k_logits(logits, (int32_t) fast_skip.size(), fast_skip, 10, fast_cand);
+                    fast_arr.data = fast_cand.data();
+                    fast_arr.size = fast_cand.size();
+                    cur_p = &fast_arr;
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    cur_p = common_sampler_get_candidates(smpl, true);
+                }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
