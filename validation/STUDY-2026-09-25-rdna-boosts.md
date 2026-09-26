@@ -97,3 +97,59 @@ All tg numbers are pooled over 6 prompts (scripts/fleet/multi-prompt.sh), with e
 - `MP_ENV_A` / `MP_ENV_B`: per-arm environment.
 - `MP_CHARS`: prompt size.
 - `MP_ARGS_B`: a second configuration on the same build.
+
+## Full rung sweep (2026-09-26)
+
+Every rung of both preset stores ran once through a scratch router that mirrors its unit (`scripts/fleet/rungsweep.sh`):
+
+- The prompt filled half the per-slot context (8k to 142k tokens).
+- Each run generated 256 greedy tokens.
+- VRAM was read after generation.
+- The text went through a gibberish check.
+- SINGLEGPU ran on both cards at once.
+
+| Store | Rungs | OK |
+|---|---|---|
+| DUALGPU | 101 | 101 |
+| SINGLEGPU | 219 | 204 |
+
+The 15 SINGLEGPU non-OK rungs were all Devstral (see below). Raw lines: `/root/work-20260926/all.txt` on the box.
+
+### Found and fixed
+
+- **`-nckvc` under `-sm tensor` aborted** (`GGML_ASSERT ret.axis != UNKNOWN`) as soon as a prompt crossed into the host KV cells.
+  - Hit on Mistral-Small-4:S at 32768 tokens per slot. It would hit Qwen3.8-27B-TurboFable:HQ at 172k.
+  - **v16 has the same bug** (Qwen3.8-27B `-sm tensor --n-cpu-kv-cells 4096 -c 8192` aborts on v16).
+  - Cause 1: the merge's log-sum-exp was a standalone leaf, so the tensor-split backend mirrored it while the FA output was split by head.
+  - Cause 2: host KV copies were always split by head, even for a model whose attention is mirrored (the EAGLE draft of an MLA target).
+  - Fix `fe49693b0`:
+    - lse = `cont(permute(sum_rows(q)))`, which inherits q's split, and FA overwrites it;
+    - host KV copies ask the model callback first;
+    - split states of unallocated tensors are memoized per query, since the recursion over them was exponential.
+  - PPL layer / layer+nckvc / tensor / tensor+nckvc: 1.4423 / 1.4438 / 1.4435 / 1.4427.
+  - `fork-regress.sh` now checks the crossing under both split modes.
+- **gemma-4 MTP assistant abort** in `llama_hparams::is_recr`. It was introduced by the fix above: the assistant reads the target KV, whose cache names carry target layer indices. The callback now leaves layers the model lacks to the caller (`2788adcda`).
+- **Devstral-Small-2: garbage on every rung**, byte-identical on v16. Its 256k window comes from its own YaRN (factor 48 over an 8192 original context). The SINGLEGPU `[*]` `rope-scaling = none` stripped it.
+  - Fixed in the preset repo (`/opt/llamacpp-config`, commit `0ffa8c9`, `rope-scaling = yarn` on its 16 rungs). Re-checked: all OK.
+  - `scripts/fleet/ctxcheck.py` flags any rung whose per-slot context exceeds the usable context. Only Devstral, plus the deliberate Muse-Glimmer `override-kv`.
+
+## WMMA above head 256 (rejected)
+
+The head 320/512/576 instances were compiled but kept off AMD by a kernel guard. Enabling them with the fork's gfx1201 rows (`pp512` t/s):
+
+| Model | d0, v17 | d0, WMMA | d32768, v17 | d32768, WMMA |
+|---|---|---|---|---|
+| gemma-4-31B, 1 GPU | 1227 | 1174 | 401 | 353 |
+| gemma-4-31B, 2 GPU tensor | 2003 | 1957 | 701 | 663 |
+| gemma-4-26B-A4B | 4054 | 3985 | 1444 | 1356 |
+| GLM-4.7-Flash | 3401 | 3404 | 864 | 862 |
+| Mistral-Small-4 (head 320) | | failed to bench | | |
+
+- FLASH_ATTN_EXT was 3846/3846 with it on.
+- The default cap is 256 again. `GGML_CUDA_FA_WMMA_MAX_HEAD` opts in.
+
+## r9 (fork release r9): typed MMA K/V store
+
+- Upstream 1884824fd (the FA swizzle refactor) is in this base and not in v16. It made the generic MMA K/V loader store through a `char *` even without swizzling, so HIP splits the 16-byte shared store. The fork measured 2-6% prefill, and 14-40% on head-256 MMA prefill.
+- Fixed in `d6d8dbfc9`.
+- Results: see below once `r9.sh` finishes.
