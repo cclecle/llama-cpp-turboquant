@@ -15,4 +15,5 @@ they call live in `scripts/fleet/`. All ran on the box from `/root/work-2026092{
 | `hd512.sh` | head 320/512/576 WMMA A/B (rejected: tile wins on gemma-4) |
 | `r9.sh` | the r9 typed-store fix A/B across families + the r5 f16 band settings |
 | `series5.sh` | band retune under MTP (v17 vs attn, 6 prompts, short and deep) + the tensor-split ppl "abort" line |
+| `moe.sh` | block 13 fused MoE gate+up MMQ: fusion tests, perplexity, prefill A/B; Qwen3.8-27B prefill rocprofv3 profile |
 | `attn.sh` | derived kq mask / native q8_0 prefill / band retune: FA tests, compute buffers, perplexity equality, prefill and decode A/B (`/opt/llamacpp/tmp-attn`) |
