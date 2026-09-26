@@ -182,3 +182,45 @@ is not in the band (vec kernel).
 
 ncols1 = 2 wins almost everywhere; q8_0 single-token decode drops 134 -> 75 us per attention layer. Taken up as a
 per-width choice below.
+
+## Attention memory: derived kq mask, native q8_0 prefill, band retune (2026-09-26)
+
+Scratch tree `/opt/llamacpp/tmp-attn`, runner `validation/v17-scripts/attn.sh`.
+
+- **Derived kq mask** (`29b12c106`, block-15 V3 extended to M-RoPE): on by default, `LLAMA_KQ_MASK_DERIVED=0` off.
+  Applies to single-stream caches (np = 1 rungs; `kv-unified = 0` with np > 1 keeps the packed mask).
+- **Native q8_0 prefill** (`0e54762e4`): opt-in, `GGML_CUDA_FA_KV_NATIVE_PREFILL=1`.
+- **Band retune** (`6aeda8cad`): ncols1 = 2 for all widths, P = 3/4 nsm for q8_0.
+
+### Correctness
+- FLASH_ATTN_EXT 4082/4082 on ROCm0 (32 new derived cases), also with native prefill on.
+- Perplexity (4 chunks of 4096, one sequence per batch) identical to the last digit, derived off vs on:
+  27B q8_0 3.2225, 27B f16 3.2234, gemma-4-31B 37.4026, 35B-A3B 3.7238, Devstral 3.7896, 27B `-nckvc 2048` 3.2201,
+  27B `-sm tensor` 3.2217, gemma-4-31B `-sm tensor` 37.5796. Native prefill: 27B 3.2225.
+
+### Memory (server load, compute buffer MiB)
+| Load | GPU | host (pinned) | VRAM per GPU |
+|---|---|---|---|
+| 27B c131072 ub1024 q8_0, packed | 928 | 296 | 24.78 GB |
+| + derived | 673 | 41 | 24.52 GB |
+| + native prefill | 245 | 41 | 24.07 GB |
+| gemma-4-31B c131072 ub1024, packed / derived | 1455 / 1196 | 303 / 44 | 25.74 / 25.47 GB |
+| 27B `-sm tensor` c262144 ub1536 f16, packed / derived | | 828 / 62 | 19.77 / 18.97 GB each |
+
+### Speed
+Prefill pp4096 t/s, d0 / d32768 (same build, env A vs B; same-config run-to-run noise ~0.5-1%):
+| | off | derived | derived + native prefill |
+|---|---|---|---|
+| 27B q8_0 | 1168 / 914 | 1152 / 916 | 1148 / 881 |
+| 27B f16 | 1152 / 920 | 1154 / 920 | |
+| gemma-4-31B | 1093 / 399.6 | 1093 / 398.7 | |
+| 35B-A3B | 2919 / 2340 | 2927 / 2349 | |
+| 27B `-sm tensor` | 1902 / 1521 | 1889 / 1525 | |
+
+The derived mask is speed-neutral. Native prefill costs 3.7% at d32768: a VRAM-for-speed trade per rung, so opt-in.
+
+Decode tg64 t/s, v17 -> attn (band retune), d0 / d16384 / d65536:
+- 27B q8_0: 25.61 / 24.26 / 21.63 -> 25.81 / 24.90 / 22.50 (+2.6% / +4.0% deep)
+- 27B f16: even (n_q = 1 f16 is not in the band); 35B-A3B: even.
+
+Tooling fix found here: `benchab.sh` picked the env by build name, so an A/B of one build against itself ran A twice.
