@@ -1281,9 +1281,9 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
 
-// RCCL spends ~60 us per decode-sized reduction on gfx1201 (Flash-Next: ~100 per step, ~6 ms), the
-// direct-P2P kernel a few us. Small FP32 reductions go through P2P; NCCL reduces those in FP32 too
-// (below its 32768-element BF16 threshold), so the default cap only reroutes. Everything else stays on NCCL.
+// Opt-in (GGML_CUDA_AR_HYBRID): small FP32 reductions go through the direct-P2P kernel, the rest stays on
+// NCCL. NCCL reduces below 32768 elements in FP32 too, so a cap up to that only reroutes (bit-identical).
+// Measured on Flash-Next decode: the P2P kernel's GPU time equals RCCL's (both wait on the peer), +1% overall.
 // The decision depends on tensors[0] only, so every device issues the same sequence of collectives.
 static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
@@ -1360,9 +1360,10 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
 #ifdef GGML_USE_HIP
-        // GGML_CUDA_AR_HYBRID: max elements routed through direct P2P next to RCCL (default 32768, 0 = RCCL only)
+        // GGML_CUDA_AR_HYBRID=<n>: route FP32 reductions of up to n elements (32768 keeps RCCL's numerics) through
+        // direct P2P next to RCCL. Off by default: +1% pooled decode on Qwen3.8-Flash-Next (A B B A), within noise.
         const char * hyb = getenv("GGML_CUDA_AR_HYBRID");
-        const int64_t max_ne = hyb ? strtoll(hyb, nullptr, 10) : 32768;
+        const int64_t max_ne = hyb ? strtoll(hyb, nullptr, 10) : 0;
         if (n == 2 && max_ne > 0) {
             ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), n);
             if (ret->ar_pipeline) {
