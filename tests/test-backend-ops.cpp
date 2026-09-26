@@ -11089,6 +11089,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // prefill MUL_MAT_ID gate + up + GLU (the fused MMQ on RDNA4): prefill widths, n % 128 == 0 and not
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
+            for (int64_t m_batch : {64, 512}) {
+                for (int64_t n : {256, 320}) {
+                    for (bool b : {false, true}) {
+                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, n, 512,
+                            true, 16, 8, b, false, true, false, {1, 1}));
+                    }
+                }
+            }
+        }
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {

@@ -4187,6 +4187,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+
+            // prefill: the batched MUL_MAT_ID pair as one MMQ kernel (see ggml_cuda_mmq_gate_supported)
+            if (ggml_cuda_mmq_gate_supported(up, gate, glu, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, gate->src[0], glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
         }
     }
 

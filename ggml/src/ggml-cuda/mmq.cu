@@ -82,8 +82,64 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// fused MoE gate+up+GLU MMQ (from rdna-boosts block 13): the instantiated types
+static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    switch (args.type_x) {
+        case GGML_TYPE_Q4_K:
+            mul_mat_q_case<GGML_TYPE_Q4_K, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            mul_mat_q_case<GGML_TYPE_Q5_K, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case<GGML_TYPE_Q6_K, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case<GGML_TYPE_Q8_0, true>(ctx, args, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+// Prefill MUL_MAT_ID gate + up + GLU as one MMQ kernel that reads both weight streams against the same
+// quantized activations and writes glu(gate, up): no gate/up intermediates, one activation quantize.
+// rdna-boosts measured +3.6-5.1% MoE prefill on gfx1201. RDNA4 only here (the J caps are gfx1201-tuned
+// and its MMQ configs have no stream-k, which the gate kernel lacks). GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1 off.
+bool ggml_cuda_mmq_gate_supported(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, int cc) {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
+    if (disabled || !GGML_CUDA_CC_IS_RDNA4(cc) || up->op != GGML_OP_MUL_MAT_ID || gate->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = up->src[0];
+    const ggml_tensor * src1 = up->src[1];
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    return src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
+        gate->src[0]->type == src0->type && ggml_are_same_shape(gate->src[0], src0) && ggml_are_same_stride(gate->src[0], src0) &&
+        ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], src0->ne[2]);
+}
+
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * gate, const ggml_tensor * glu) {
+    // with gate: src0 holds the up weights, gate the gate weights, and dst is the GLU output
+    GGML_ASSERT(!gate || (ids && glu && dst == glu));
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -272,6 +328,16 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+
+    if (gate) {
+        GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
+        mmq_args args_gate = args;
+        args_gate.x_gate    = (const char *) gate->data;
+        args_gate.glu_op    = ggml_get_glu_op(glu);
+        args_gate.glu_limit = ggml_get_op_params_f32(glu, 3);
+        ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream);
+        return;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

@@ -102,9 +102,14 @@ for ncols in [8, 16, 32, 64]:
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
+# the fused MoE gate+up+GLU MMQ (mmq.cuh DECL_MMQ_CASE_GATE)
+TYPES_MMQ_GATE = ["GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_Q8_0"]
+
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
         f.write(SOURCE_MMQ.format(type=type))
+        if type in TYPES_MMQ_GATE:
+            f.write(f"DECL_MMQ_CASE_GATE({type});\n")
 
 for type in range(1, 17):
     with open(f"mmf-instance-ncols_{type}.cu", "w") as f:
