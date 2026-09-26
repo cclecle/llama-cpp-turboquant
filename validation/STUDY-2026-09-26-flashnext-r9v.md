@@ -65,9 +65,13 @@ The same v18 source was built against ROCm 7.14, a copy of R9V's `core-7.14` in 
 | v18, ROCm 7.2.4 | 979 | 37.2 | 62.9% |
 | v18, ROCm 7.14 | **482 (-51%)** | 37.9 | 68.9% |
 
-- The newer ROCm halves our prefill, which matches the user's earlier experience with a newer ROCm. The cause was not investigated (compiler or BLAS path).
+- ~~The newer ROCm halves our prefill.~~ **SUSPECT, to re-measure (found 2026-09-26 during v19 step 1).**
+  - The same v18 code with a plain RCCL all-reduce also prefilled at 503 t/s once: that was the first run after two perplexity runs had read the whole GGUF, and the next run gave 978.
+  - The `:XL` rung keeps the 28.8 GB PLE table memory-mapped on the CPU, and prefill reads its rows for every prompt token. A cold page cache sends those reads to the NVMe and halves prefill.
+  - The ROCm 7.14 run came right after copying 19 GB into `/opt`, which also flushes the cache. The runner now measures a second, warm repetition (`openai_bench.py` warmup 2, `cache_prompt: false`).
+  - ROCm 7.14 must be re-measured warm before any conclusion.
 - Decode is unchanged, so ROCm is not R9V's decode lever.
-- **Stay on 7.2.4.** The gap is R9V's design: its expert cache/placement for decode and its grouped prefill kernel.
+- Stay on 7.2.4 for now. The decode gap is R9V's design: its expert cache and placement. Its prefill runs may also have been measured partly cold; re-measure R9V warm too.
 
 ## Artefacts
 
@@ -75,3 +79,25 @@ On the box, `/mnt/gguf/r9v/`:
 - `bench/`: `results.jsonl`, the logs, the per-second VRAM/RAM samples;
 - `rootfs/`: the unpacked runtime;
 - `ple/`: the 28.8 GB PLE table, hash-matched to R9V's pin.
+
+## v19 step 1 (branch `v19/flashnext`, tree `/opt/llamacpp/tmp-v19`, `validation/v19-scripts/step1.sh`)
+
+- **1.1 AllReduce hybrid** (`5a9fdf8c9`): small FP32 reductions go through the direct-P2P kernel next to RCCL.
+  - Cap: 32,768 elements, below RCCL's own BF16 threshold, so the numerics are unchanged. `GGML_CUDA_AR_HYBRID=0` turns it off.
+  - Perplexity at ub 8, where every reduction is decode-sized: bit-identical, 1.4516 off and on.
+  - Pooled 6-prompt decode (`:XL` args, 65k): **39.7 → 43.4 t/s**. At matched acceptance the gain is +7.1% to +9.7% (p0 201/294: 40.2 → 44.1; p2 181/262: 41.9 → 45.2).
+  - Prefill: unchanged (978 vs 979). Prefill reductions exceed the cap and stay on RCCL.
+  - Note: the P2P kernel's GPU time equals NCCL's (61 us/call, both mostly waiting for the peer GPU). The gain is RCCL's host-side cost.
+- **1.4 prefill ubatch** (config only, not applied), warm runs:
+
+  | ub | prefill t/s | decode t/s | peak VRAM GPU0/GPU1 (65k ctx) |
+  |---|---:|---:|---|
+  | 1024 (rung) | 978 | 37.9 | 26.1 / 26.4 GB |
+  | 2048 | **1,233** | 37.9 | 27.7 / 28.0 GB |
+  | 4096 | **1,387** (above R9V's 1,328) | 37.9 | 30.8 / 31.0 GB |
+
+  The prefill gap to R9V is mostly the ubatch: host experts are streamed once per ubatch. The production `:XL` rung runs at 262k ctx and is sized tighter, so fitting ub 2048/4096 there is the user's rung decision.
+- **Host profile** (gdb stack samples during decode): the server's compute thread sits in `ggml_backend_cuda_synchronize` in 38 of 40 samples. CPU sampling (1/40) and graph rebuilds (1/40) do not matter.
+  - The ~23 ms of GPU idle per step is the gaps between ~4,400 small kernels per token, not host work.
+  - **Steps 1.2 and 1.3 are dropped** as measured not worth it. The idle lever is kernel fusion (launch count).
+- **Methodology fix:** runs are now warm (see the ROCm 7.14 correction above): `openai_bench.py` warmup 2, `cache_prompt: false`.

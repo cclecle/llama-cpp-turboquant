@@ -8,8 +8,11 @@
 # its locked memory is capped at 8 MiB for ssh sessions and units alike. Run it detached, as a transient service:
 #   systemd-run --unit=flashnext-bench --collect -p WorkingDirectory=/mnt/gguf/r9v/bench \
 #     /bin/bash -c 'bash flashnext.sh > run.log 2>&1'
+# FN_ENV: env assignments for the llama servers of this run; FN_TAG: suffix for the result label;
+# FN_UB: override the rung's ubatch (and raise the batch to at least it); FN_ARGS: another args file.
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
+FN_ENV=${FN_ENV:-X=0}; FN_TAG=${FN_TAG:-}
 CARDS="0000:03:00.0 0000:07:00.0"
 SRV=
 stop_srv() { [ -n "$SRV" ] && kill -TERM -- -"$SRV" 2>/dev/null; sleep 10; [ -n "$SRV" ] && kill -KILL -- -"$SRV" 2>/dev/null; SRV=; sleep 3; }
@@ -46,29 +49,33 @@ PY
 
 for b in $BACKENDS; do
   echo "=== $b $(date +%T)"
-  rm -f $b.mem; sample $b.mem & SAMPLER=$!
+  rm -f $b$FN_TAG.mem; sample $b$FN_TAG.mem & SAMPLER=$!
   sleep 3
   if [ $b = r9v ]; then
     URL=http://127.0.0.1:8004; MODEL=qwen3.8-flash-next
-    setsid bash ./r9v-run.sh 65536 > $b.log 2>&1 & SRV=$!
+    setsid bash ./r9v-run.sh 65536 > $b$FN_TAG.log 2>&1 & SRV=$!
     up=$(wait_up $URL 3600)
   else
     URL=http://127.0.0.1:8090; MODEL=Qwen3.8-Flash-Next
-    mapfile -t A < fn-xl.args
-    for i in "${!A[@]}"; do [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536; done
+    mapfile -t A < ${FN_ARGS:-fn-xl.args}
+    for i in "${!A[@]}"; do
+      [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536
+      [ -n "${FN_UB:-}" ] && [ "${A[$i]}" = --ubatch-size ] && A[$((i + 1))]=$FN_UB
+      [ -n "${FN_UB:-}" ] && [ "${A[$i]}" = --batch-size ] && [ "${A[$((i + 1))]}" -lt "$FN_UB" ] && A[$((i + 1))]=$FN_UB
+    done
     # a *-rocm714 tree was built on /opt/rocm-7.14 and must run on it (the system linker path is 7.2.4)
     LD=; [[ $b == *rocm714 ]] && LD=/opt/rocm-7.14/lib
-    LD_LIBRARY_PATH=$LD HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" \
-      --host 127.0.0.1 --port 8090 > $b.log 2>&1 & SRV=$!
+    env $FN_ENV LD_LIBRARY_PATH=$LD HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" \
+      --host 127.0.0.1 --port 8090 > $b$FN_TAG.log 2>&1 & SRV=$!
     up=$(wait_up $URL 1200)
   fi
   echo "$b load: $up s"
   if [[ $up =~ ^[0-9]+$ ]]; then
-    python3 openai_bench.py $URL $MODEL prompt-32k.txt $b results.jsonl 2048 1
+    BENCH_SAVE_TEXT=$b$FN_TAG.answer.txt python3 openai_bench.py $URL $MODEL prompt-32k.txt $b$FN_TAG results.jsonl 2048 ${FN_WARM:-2}
   else
-    tail -30 $b.log
+    tail -30 $b$FN_TAG.log
   fi
   stop_srv
   kill $SAMPLER 2>/dev/null
-  summ $b
+  summ $b$FN_TAG
 done

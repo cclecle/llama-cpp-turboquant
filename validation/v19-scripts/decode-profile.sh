@@ -7,7 +7,7 @@ cd /mnt/gguf/r9v/bench
 b=${1:-v18}
 out=prof-decode-$b
 rm -rf $out; mkdir -p $out
-mapfile -t A < fn-xl.args
+mapfile -t A < ${DP_ARGS:-fn-xl.args}   # DP_ARGS: another args file (same layout)
 for i in "${!A[@]}"; do [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536; done
 HIP_VISIBLE_DEVICES=0,1 setsid rocprofv3 --kernel-trace --output-format csv -d $out -o trace -- \
   /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" --host 127.0.0.1 --port 8090 > $out/server.log 2>&1 &

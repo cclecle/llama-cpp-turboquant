@@ -4,8 +4,12 @@
 # every backend: temperature 0, no ignore_eos, max_tokens as given. Records the time to first token (prefill),
 # decode t/s over the generated tokens (usage counts, first token to last), the server's own timings when it
 # sends them (llama-server "timings", incl. draft acceptance), and vLLM's spec-decode counters from /metrics.
-# A short warmup request runs first so JIT/graph compilation is not billed to the measured prefill.
-import json, sys, time, urllib.request
+# warmup 1: a short request first (JIT/graph compilation). warmup 2: the full measured request once more before
+# the measured one, so the page cache is warm too (a memory-mapped PLE table read from disk halved one prefill).
+# Prompt caching is turned off per request ("cache_prompt": false; vLLM ignores the field), so the repeat is a
+# real prefill.
+# BENCH_SAVE_TEXT=<file>: also write the generated text (reasoning + answer) there, to read it for sanity.
+import json, os, sys, time, urllib.request
 
 base, model, prompt_file, label, out = sys.argv[1:6]
 max_tokens = int(sys.argv[6]) if len(sys.argv) > 6 else 2048
@@ -29,12 +33,13 @@ def metrics():
 
 def run(text, n):
     body = {'model': model, 'messages': [{'role': 'user', 'content': text}], 'max_tokens': n, 'temperature': 0,
-            'stream': True, 'stream_options': {'include_usage': True}}
+            'stream': True, 'stream_options': {'include_usage': True}, 'cache_prompt': False}
     req = urllib.request.Request(base + '/v1/chat/completions', json.dumps(body).encode(),
                                  {'Content-Type': 'application/json'})
     t0 = time.time()
     t_first = t_last = None
     usage, timings, finish, n_chunks, chars = {}, {}, None, 0, 0
+    pieces = []
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:
             line = raw.decode('utf-8', 'replace').strip()
@@ -52,12 +57,18 @@ def run(text, n):
                     t_last = now
                     n_chunks += 1
                     chars += len(piece)
+                    pieces.append(piece)
                 finish = c.get('finish_reason') or finish
+    if os.environ.get('BENCH_SAVE_TEXT') and n > 100:
+        open(os.environ['BENCH_SAVE_TEXT'], 'w').write(''.join(pieces))
     return t0, t_first, t_last, usage, timings, finish, n_chunks, chars
 
 
 if warmup:
     run('Say hello in five words.', 16)
+if warmup >= 2:
+    w = run(prompt, max_tokens)
+    print('warm-up run: ttft %.2f s, %d prompt tokens' % (w[1] - w[0], (w[3] or {}).get('prompt_tokens', 0)))
 m0 = metrics()
 t0, t_first, t_last, usage, timings, finish, n_chunks, chars = run(prompt, max_tokens)
 m1 = metrics()
