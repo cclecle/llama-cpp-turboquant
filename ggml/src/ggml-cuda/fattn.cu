@@ -745,7 +745,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    // Heads above 256 on WMMA (from rdna-boosts block 04): the cap is per arch, GGML_CUDA_FA_WMMA_MAX_HEAD overrides it.
+    // Heads above 256 on WMMA (from rdna-boosts block 04) only with GGML_CUDA_FA_WMMA_MAX_HEAD.
     // The MMA kernel instantiates logit_softcap only for heads 128/256/512.
     static const int wmma_max_head_env = [] {
         const char * env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
@@ -753,8 +753,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     }();
     float logit_softcap_wmma = 0.0f;
     memcpy(&logit_softcap_wmma, (const float *) KQV->op_params + 2, sizeof(float));
-    const int wmma_max_head = wmma_max_head_env >= 0 ? wmma_max_head_env :
-        GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 256;
+    // default 256: on gfx1201 the tile kernel wins at head 512 (gemma-4-31B pp512 @ d32768 401 vs 353 t/s)
+    const int wmma_max_head = wmma_max_head_env >= 0 ? wmma_max_head_env : 256;
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16) &&
             (logit_softcap_wmma == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512)) {
