@@ -548,12 +548,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     } else {
                         src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
                     }
-                    // a char * destination drops the half2 alignment and HIP splits the 16-byte store (rdna-boosts r9)
-                    if constexpr (swz) {
-                        ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), src);
-                    } else {
-                        ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*h2_per_chunk, src);
-                    }
+                    // rdna-boosts r9 stores through a typed half2 * here when !swz; on this tree that measured
+                    // 0.3-4% slower prefill on gfx1201 (TurboFable -sm tensor pp4096 @ d32768 1731 -> 1661)
+                    ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), src);
                 }
             }
         };
