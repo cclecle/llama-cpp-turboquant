@@ -9,7 +9,8 @@
 #   systemd-run --unit=flashnext-bench --collect -p WorkingDirectory=/mnt/gguf/r9v/bench \
 #     /bin/bash -c 'bash flashnext.sh > run.log 2>&1'
 # FN_ENV: env assignments for the llama servers of this run; FN_TAG: suffix for the result label;
-# FN_UB: override the rung's ubatch (and raise the batch to at least it); FN_ARGS: another args file.
+# FN_UB: override the rung's ubatch (and raise the batch to at least it); FN_ARGS: another args file;
+# FN_LD: LD_LIBRARY_PATH for a copied build (llama-cpp-mine-<name>/build3/bin copied out of a tree).
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
 FN_ENV=${FN_ENV:-X=0}; FN_TAG=${FN_TAG:-}
@@ -64,7 +65,8 @@ for b in $BACKENDS; do
       [ -n "${FN_UB:-}" ] && [ "${A[$i]}" = --batch-size ] && [ "${A[$((i + 1))]}" -lt "$FN_UB" ] && A[$((i + 1))]=$FN_UB
     done
     # a *-rocm714 tree was built on /opt/rocm-7.14 and must run on it (the system linker path is 7.2.4)
-    LD=; [[ $b == *rocm714 ]] && LD=/opt/rocm-7.14/lib
+    # FN_LD: a library path for a copied build (its RUNPATH still names the tree it was built in)
+    LD=${FN_LD:-}; [[ $b == *rocm714 ]] && LD=/opt/rocm-7.14/lib
     env $FN_ENV LD_LIBRARY_PATH=$LD HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" \
       --host 127.0.0.1 --port 8090 > $b$FN_TAG.log 2>&1 & SRV=$!
     up=$(wait_up $URL 1200)

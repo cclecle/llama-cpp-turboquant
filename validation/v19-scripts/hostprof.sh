@@ -12,9 +12,15 @@ env "$@" HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/b
   --host 127.0.0.1 --port 8090 > $out/server.log 2>&1 &
 SRV=$!
 until curl -sf -o /dev/null http://127.0.0.1:8090/health; do sleep 2; kill -0 $SRV 2>/dev/null || { tail $out/server.log; exit 1; }; done
-curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a very long, detailed essay about the history of the printing press, at least 3000 words."}],"max_tokens":1500,"temperature":0}' > $out/answer.json &
+# HP_PROMPT: a prompt file (e.g. prompt-32k.txt: the host costs that scale with the context), else a short request
+python3 - "${HP_PROMPT:-}" > $out/body.json <<'PY'
+import json, sys
+text = open(sys.argv[1], errors='ignore').read() if sys.argv[1] else 'Write a very long, detailed essay about the history of the printing press, at least 3000 words.'
+print(json.dumps({'messages': [{'role': 'user', 'content': text}], 'max_tokens': 1500, 'temperature': 0, 'cache_prompt': False}))
+PY
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d @$out/body.json > $out/answer.json &
 REQ=$!
-sleep 12   # past the prompt, into steady decode
+sleep ${HP_WAIT:-12}   # past the prompt, into steady decode (HP_WAIT: ~45 for a 32k prompt)
 for i in $(seq 1 $n); do
   kill -0 $REQ 2>/dev/null || break
   timeout 20 gdb -p $SRV -batch -nx -ex 'set pagination off' -ex 'thread apply all bt 30' > $out/s$i.txt 2>/dev/null

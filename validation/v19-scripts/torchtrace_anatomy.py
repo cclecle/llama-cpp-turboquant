@@ -2,7 +2,7 @@
 # torchtrace_anatomy.py : per decode step, the same numbers for both engines.
 #   torchtrace_anatomy.py torch <trace.json[.gz]> [steps]      vLLM torch-profiler trace of one worker (one GPU)
 #   torchtrace_anatomy.py rocprof <kernel_trace.csv> <steps>    our rocprofv3 trace; the decode window is everything
-#                                                                after the last long prefill evaluation (first GPU)
+#                                                                after the last prefill ubatch (first GPU)
 # Prints: kernels per step, GPU busy per step (union of kernel intervals), wall per step, idle per step, and the top
 # kernels by time per step with counts.
 import collections, csv, gzip, json, re, sys
@@ -55,13 +55,16 @@ else:
             by[r.get('Agent_Id', '')].append((int(r['Start_Timestamp']) / 1e3, int(r['End_Timestamp']) / 1e3, r['Kernel_Name']))
     agent, ev = sorted(by.items())[0]
     ev.sort()
-    # evaluations separated by > 150 us idle; the decode window starts after the last one above 4500 dispatches
+    # evaluations separated by > 150 us idle; the decode window starts after the last prefill ubatch, the last
+    # evaluation clearly bigger than the verify passes (the most common size among the big ones)
     segs, cur, last = [], [], None
     for s, e, n in ev:
         if last is not None and s - last > 150:
             segs.append(cur); cur = []
         cur.append((s, e, n)); last = e if last is None else max(last, e)
     segs.append(cur)
-    idx = max(i for i, sg in enumerate(segs) if len(sg) > 4500)
+    sizes = collections.Counter(len(sg) // 50 for sg in segs if len(sg) > 1000)
+    verify = sizes.most_common(1)[0][0]*50
+    idx = max(i for i, sg in enumerate(segs) if len(sg) > 1.08*verify + 50)
     dec = [x for sg in segs[idx + 1:] for x in sg]
     report(dec, steps, 'rocprof %s %s decode window' % (path.split('/')[-1], agent))

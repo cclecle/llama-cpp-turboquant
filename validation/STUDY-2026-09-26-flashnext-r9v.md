@@ -275,3 +275,120 @@ Every item is measured with the same-configuration protocol:
 - Recheck: tiered 1,061/42.4, tiered+ub2048 1,308/44.4, UVA+ub2048 1,229/38.4.
 - HIP knobs and variance: ±6% per load.
 - Step 5: the same-configuration comparison and both traces (sections 0 and 5).
+- Step 6: sparse QSA attention, -4.35 ms/step (section 11.1); the AllReduce wait traced to the 384/256 MoE split (11.3).
+
+## 11. Optimisation phase (from 2026-09-26 evening)
+
+Metric: **ms per speculative step** (one verify pass plus its drafts), from `step_ms.py`. Tokens/s moves with the
+acceptance, which changes with the generated text from one load to the next (0.47-0.51 in these runs).
+Same-config args (`fn-xl-tiered-r9vlike.args`: MTP 4, MTP drafts only, 32k prompt, 2,048 tokens), warm, A B B A over loads.
+
+### 11.1 Sparse QSA attention (step 6)
+
+- **What:** decode and verify batches (≤ 8 tokens per stream, `LLAMA_QSA_SPARSE`, 0 = dense) hand the indexer's top-k
+  list of each query to flash attention (`ggml_flash_attn_ext_add_kv_idx`, src[8]). The kernel gathers the listed
+  K/V rows and reads the ordinary KQ mask at each one; no n_kv-wide mask is built (fill + set_rows + add gone).
+  - CUDA/HIP: upstream's sparse mode of the mma kernel (NVIDIA-only until now), fed from src[8] instead of a mask
+    compaction, at `<256,256,ncols1=1,ncols2=16>` (one query per tile, the 12 GQA heads of a device in the 16
+    columns; new template instance). q8_0 K/V read in place.
+  - CPU reference, `test-backend-ops` (16 cases: f16/q8_0, GQA 4-24, 1-8 queries, 2 sequences, -1 entries),
+    every other backend refuses src[8], the meta backend asserts the lists are mirrored.
+- **Correctness:** perplexity at ub 8 and 8k context (so the indexer really drops cells): dense 1.3260 ± 0.0249,
+  sparse 1.3269 ± 0.0251.
+- **Speed:** dense 68.0 / 67.9 ms/step, sparse 64.0 / 63.2 → **-4.35 ms/step (-6.4%)** at 32k. The verify FA went
+  from 3.7 to 0.97 ms/step (75 us per call).
+- The AllReduce now runs on RCCL (`ncclDevKernel_Generic_4`, 105/step, 64 us): the hybrid P2P path became opt-in in
+  `41bc74fc7`, built for the first time here.
+
+### 11.2 Where the QSA layer time really went (step 5 trace, one layer of a verify pass)
+
+| step | kernels | us per layer |
+|---|---|---:|
+| index K / Q projections (BF16, 5 columns) | 2 x `mul_mat_f` (4-16 blocks only) | 97 |
+| dequantize every raw indexer key | `k_get_rows` q8_0 (16.8 MB f32) | 64 |
+| mean of the 4 block members | 4 copies + 3 adds + scale | 77 |
+| norm + rope over all 8,192 blocks | `rms_norm`, `rope_multi` (81 us: 3/4 of each block idle) | 106 |
+| score GEMM, relu, head sum, bias | | ~35 |
+| block score to cells and back | transpose, `get_rows_float`, transpose, cast, add | 82 |
+| top-k over 32k cells | radix, 4 passes | 56 |
+| dense FA + fixup (before 11.1) | | 333 |
+
+About 850 us per layer, ~10 ms per step over 12 layers (R9V: ~0.6 ms). Host side: `set_input_qsa` is O(n_kv) per
+ubatch (~0.9 ms at 33k per its own comment), not yet measured.
+
+### 11.3 The AllReduce wait is an uneven MoE split, not launch skew
+
+- Pairing the AllReduce kernels of both GPUs: the ends agree to ±5 us, the starts spread p10 -140 / p90 +157 us.
+  The pure AllReduce costs 9 us; the rest is one GPU waiting for the other.
+- By subgraph: MoE mean start skew 150 us, correlated **1.00** with the difference in GPU time; attention 32 us,
+  GDN 10 us.
+- Per layer, one GPU is always ~1.5x slower on the MoE, and the slow GPU alternates layer by layer.
+- **Cause:** the FFN split unit is `lcm(block, 128)` = 128 (`get_split_granularity`, llama-model.cpp), so the expert
+  and shared-expert width 640 = 5 units splits **384/256**, and the per-layer "rotation" swaps the sides.
+- So an in-graph AllReduce (backlog item 2) would not remove this wait. The fix is the split.
+
+### 11.4 Step 7: fused indexer, rope, BF16 mat-vec, even MoE split, MTP attention
+
+- `ggml_qsa_pool` (gather + mean + RMS norm of the cached keys, quantized rows read once) and `ggml_qsa_expand`
+  (block score to cells plus the mask) replace the generic indexer ops (`LLAMA_QSA_FUSED=0` restores them).
+- `rope_multi` packs several short rows into one block.
+- BF16 mat-vec up to 5 columns on RDNA4 (the indexer projections left `mul_mat_f`).
+- FFN split unit halves while the width does not divide evenly: 640 → 320/320.
+- MTP draft attention (1 query, 12 heads per K/V head, q8_0) on the mma kernel at (1, 16) instead of `vec`
+  (210 us per call, 4 per step; `GGML_HIP_FA_GQA16=0` restores it).
+
+- **Correctness:** test-backend-ops QSA_POOL 12/12, QSA_EXPAND 6/6, ROPE 454/454, FLASH_ATTN_EXT 4102/4102,
+  MUL_MAT bf16 151/151. Perplexity (ub 8, 8k): generic indexer 1.3262, fused 1.3228 (± 0.025; rounding-level
+  score changes move blocks across the top-k boundary).
+- **Speed** (A = the step 6 build, B = step 7, A B B A): A 62.5 / 61.6, B 55.6 / 56.8 ms/step →
+  **-5.9 ms/step (-9.4%)**; prefill 1,045 → 1,116 t/s (+6.8%: the even split and the fused indexer help ubatches too).
+- Since the start of the optimisation phase: **68.0 → 56.2 ms/step (-17%)**. R9V: 41 ms/step.
+
+### 11.5 The draft loop costs a quarter of the step (step 7 trace)
+
+- Per step (traced): verify pass 49.1 ms; 9.3 small draft evaluations 9.9 ms; **GPU idle before each draft
+  evaluation 0.7 ms, 6.6 ms per step**, plus 1.0 ms before the verify.
+- The MTP draft sampler cannot run on the backend under -sm tensor (`llama_context::set_sampler` refuses it), so
+  every draft token copies the logits and runs the generic CPU chain (logit bias + top_k(10) + dist), which builds
+  a candidate array of the whole 248k vocabulary. Only the first candidate and its probability are used.
+
+### 11.6 Step 8: kernel-count cuts (one build, env toggles)
+
+- `quantize_q8_1` reuse (a 4-entry cache of q8_1 copies keyed by the activations' root tensor and row layout, so the
+  routed and the shared experts share one copy): 668 → 549 quantizations per step.
+- q8_0 mat-vec + mat-vec + GLU now fuse at 2-8 columns (the shared expert of a verify batch; the kernel supported
+  it, the launcher did not): mul_mat_vec_q 572 → 524 per step.
+- Conv-state rollback tails copied straight from the strided view (no cont first): 440 → 259 copies per step.
+- The scale -> silu / sigmoid (-> scale) and rms norm -> scale fusions **did not run**: `ggml_cuda_can_fuse` is a
+  whitelist and did not list them (fixed for step 9).
+- So the A/B measured mostly the P2P AllReduce (B) against RCCL (A): A 54.9 / 55.6, B 54.6 / 56.3 ms/step, no gain;
+  the trace shows the P2P kernel at 37.6 us per call against RCCL's 31 us. RCCL stays the default.
+- Perplexity (ub 8, 8k): A 1.3280, B 1.3273. Kernels per step 4,594 → 4,194. Step: **~55 ms** (from 68.0).
+- Found on the way: the fork's mmvk (RDNA4 K-quant mat-vec, batch 1) skipped the SWIGLU_CLAMP gate
+  (MUL_MAT_VEC_FUSION q4_K glu_op=6 NMSE 9.5): fixed for step 9.
+
+### 11.7 Step 9: fast MTP draft top-k, the fusions really on
+
+- A = `LLAMA_SPEC_FAST_TOPK=0` and both elementwise fusions off, B = default (RCCL AllReduce in both).
+- A 54.5 / 55.1, B 53.3 / 53.7 ms/step → **-1.3 ms/step**. test-backend-ops MUL_MAT_VEC_FUSION 1613/1613, ADD 228/228.
+- Trace (B): 3,804 kernels per step (4,194 in step 8), traced wall 59.9 ms, busy 39.3, idle 20.5.
+- Host profile (gdb samples at 32k): the main thread waits in `ggml_backend_cuda_synchronize` in 58 of 60
+  samples. The GPU idle gaps (~4.4 ms per step) are wake-up and launch latency around each host sync plus the
+  blocking input uploads, not host compute: the lever is fewer syncs per step (one per draft token today).
+- Since the start of the optimisation phase: **68.0 → 53.5 ms/step (-21%)**. R9V: 41.
+
+### 11.8 Where the remaining 12.5 ms are (step 8/9 traces vs R9V rank 0)
+
+| per step | ours | R9V rank 0 |
+|---|---:|---:|
+| dense `mul_mat_vec_q` | 9.0 ms (524 calls) | 3.9 ms (192) |
+| idle (launch gaps + host syncs) | 20.5 ms traced | 16.2 ms traced |
+| AllReduce | 3.3 ms (RCCL) | 1.7 ms |
+| output head (verify + 3 drafts, full vocabulary) | 1.66 ms | 0.6 ms (once; drafts use a coarse head) |
+| attention | 1.5 ms | 0.6 ms |
+| MoE (+ R9V's LRU cache) | 15.6 ms | 22.6 ms |
+
+- Typical step (median, traced): verify 45.1 ms, 4 draft passes 8.1 ms (~2 ms each, 0.42 ms of it the head),
+  host-sync gaps 4.4 ms.
+- The hyper-connection down projection (10240 -> 320, 96 per step) runs at ~240 GB/s: RDNA4 verify batches get
+  one warp per row, which starves a matrix with few rows and a long K.
