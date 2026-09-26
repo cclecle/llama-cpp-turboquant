@@ -568,8 +568,54 @@ template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_chec
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
-        const int32_t * const __restrict__ indices) {
+        const int32_t * const __restrict__ indices, const kq_derived_t & kq) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    // derived kq mask: compute 0 / -INFINITY per cell instead of loading it (runtime branch, before the
+    // cp_async chain it cannot use). Two cells per thread step with one half2 store like the packed path,
+    // the cell {pos, yx} pairs read once per step and reused across the rows (rdna-boosts issue #30).
+    // Out-of-bounds cells hold 0.0f like the packed oob path.
+    if (kq.cell != nullptr) {
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += 2*warp_size) {
+            const int i = i0 + 2*threadIdx.x;
+
+            if (i0 + 2*warp_size > nbatch_fa && i >= nbatch_fa) {
+                break;
+            }
+
+            const bool oob0 = oob_check && i     >= i_sup;
+            const bool oob1 = oob_check && i + 1 >= i_sup;
+
+            int4 c = make_int4(0, 0, 0, 0);
+            if (!oob1) {
+                ggml_cuda_memcpy_1<sizeof(int4)>(&c, kq.cell + 2*(k_VKQ_0 + i));
+            } else if (!oob0) {
+                ggml_cuda_memcpy_1<sizeof(int2)>(&c, kq.cell + 2*(k_VKQ_0 + i));
+            }
+
+#pragma unroll
+            for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+                const int j_sram = j1 + threadIdx.y;
+
+                if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
+                    break;
+                }
+
+                const int j_vram = fastmodulo(j0 + j_sram, ne01);
+                const int lo   = kq.tok[j_vram];
+                const int hi   = kq.tok[j_vram +   kq.n_tok];
+                const int yx_t = kq.tok[j_vram + 2*kq.n_tok];
+
+                const half h0 = oob0 || kq_derived_visible(c.x, c.y, lo, hi, yx_t) ? half(0.0f) : half(-INFINITY);
+                const half h1 = oob1 || kq_derived_visible(c.z, c.w, lo, hi, yx_t) ? half(0.0f) : half(-INFINITY);
+
+                *reinterpret_cast<half2 *>(tile_mask + j_sram*(nbatch_fa + 8) + i) = __halves2half2(h0, h1);
+            }
+        }
+        return;
+    }
+
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
         static_assert(!oob_check, "OOB check incompatible with cp_async");
@@ -720,9 +766,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
-        if (ncols2 > 1 || mask_h) {
+        if (ncols2 > 1 || mask_h || kv_native.kq.cell) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices, kv_native.kq);
         }
     }
 
@@ -821,7 +867,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (ncols2 > 1 || mask_h) {
+        if (ncols2 > 1 || mask_h || kv_native.kq.cell) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -883,7 +929,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (ncols2 > 1 || mask_h) {
+        if (ncols2 > 1 || mask_h || kv_native.kq.cell) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -1069,9 +1115,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         if (!last_iter) {
-            if (ncols2 > 1 || mask_h) {
+            if (ncols2 > 1 || mask_h || kv_native.kq.cell) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr, kv_native.kq);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr,
@@ -1427,9 +1473,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool use_cp_async = true;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
-        if (ncols2 > 1 || mask_h) {
+        if (ncols2 > 1 || mask_h || kv_native.kq.cell) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr, kv_native.kq);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
             (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr,
@@ -1911,7 +1957,8 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-                            const int kv_native_K, const int kv_native_V) {
+                            const int kv_native_K, const int kv_native_V,
+                            const kq_derived_t kq_derived) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -2006,7 +2053,7 @@ static __global__ void flash_attn_ext_f16(
 
             const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
             const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-            const half   * mask_h = (const half *) (mask + nb33*(sequence % ne33));
+            const half   * mask_h = !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
             float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
             const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -2015,6 +2062,7 @@ static __global__ void flash_attn_ext_f16(
                 kv_native_V ? V + nb23*sequence + nb22*z_KV : nullptr,
                 nb11, nb21,
                 kv_native_K, kv_native_V,
+                kq_derived,
             };
             const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
             constexpr float slope = 1.0f;
@@ -2066,8 +2114,7 @@ static __global__ void flash_attn_ext_f16(
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-            (const half *) (mask + nb33*(sequence % ne33));
+        const half   * mask_h = !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -2076,6 +2123,7 @@ static __global__ void flash_attn_ext_f16(
             kv_native_V ? V + nb23*sequence + nb22*z_KV : nullptr,
             nb11, nb21,
             kv_native_K, kv_native_V,
+            kq_derived,
         };
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
         const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
@@ -2124,8 +2172,7 @@ static __global__ void flash_attn_ext_f16(
 
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-    const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-        (const half *) (mask + nb33*(sequence % ne33));
+    const half   * mask_h = !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -2134,6 +2181,7 @@ static __global__ void flash_attn_ext_f16(
         kv_native_V ? V + nb23*sequence + nb22*z_KV : nullptr,
         nb11, nb21,
         kv_native_K, kv_native_V,
+        kq_derived,
     };
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
     const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
@@ -2160,7 +2208,7 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33, kv_native_K, kv_native_V);
+              nb31, nb32, nb33, kv_native_K, kv_native_V, kq_derived);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }

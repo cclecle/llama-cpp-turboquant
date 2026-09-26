@@ -258,6 +258,11 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // derived kq mask (ggml_flash_attn_ext_add_kq_derived): whether the mask of this ubatch has the
+    // derived form, and the fill of its compact state (cells from cell_first, as set_input_kq_mask)
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(ggml_tensor * cell, ggml_tensor * tok, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -490,6 +495,11 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // derived kq mask (ggml_flash_attn_ext_add_kq_derived): whether the mask of this ubatch has the
+    // derived form, and the fill of its compact state (cells from cell_first, as set_input_kq_mask)
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(ggml_tensor * cell, ggml_tensor * tok, const llama_ubatch * ubatch, bool causal_attn, uint32_t cell_first = 0) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

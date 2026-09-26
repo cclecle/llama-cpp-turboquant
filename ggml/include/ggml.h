@@ -2524,6 +2524,18 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * lse);
 
+    // derived kq mask: the op is built with mask == NULL and derives each mask value from
+    // compact per-cell and per-token state instead (from rdna-boosts block 15, extended to M-RoPE):
+    //   cell: [2, n_kv] I32, per KV cell {pos, yx}; pos == INT32_MIN marks a cell never visible
+    //   tok:  [n_batch, 3] I32, rows {lo, hi, yx} per query token
+    // cell c is visible to token t (value 0, else -INFINITY) when
+    //   pos_c >= lo_t && (pos_c < hi_t || (pos_c == hi_t && (uint32) yx_c <= (uint32) yx_t))
+    // yx orders the cells that share a position (the M-RoPE causal clause); use 0 when unused
+    GGML_API void ggml_flash_attn_ext_add_kq_derived(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cell,
+            struct ggml_tensor * tok);
+
     // hint: attention runs split across devices (tensor split); process-wide, default false
     GGML_API void ggml_set_fa_tensor_parallel(bool enable);
     GGML_API bool ggml_get_fa_tensor_parallel(void);

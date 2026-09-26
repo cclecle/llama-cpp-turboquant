@@ -18,6 +18,25 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// derived kq mask (ggml_flash_attn_ext_add_kq_derived): with the mask tensor absent, the kernel derives
+// each mask value from cell = {pos, yx} per KV cell and tok = {lo[n_tok], hi[n_tok], yx[n_tok]} per Q row.
+// Implemented by the MMA and the tile kernels; ggml_cuda_get_best_fattn_kernel routes nothing else here.
+struct kq_derived_t {
+    const int * cell;
+    const int * tok;
+    int         n_tok;
+};
+
+// kernel selection sees the derived form as a mask: the kernel variants it picks must be the same
+static inline bool ggml_cuda_fattn_has_mask(const ggml_tensor * dst) {
+    return dst->src[3] != nullptr || dst->src[6] != nullptr;
+}
+
+static __device__ __forceinline__ bool kq_derived_visible(
+        const int pos, const int yx, const int lo, const int hi, const int yx_t) {
+    return pos >= lo && (pos < hi || (pos == hi && (unsigned) yx <= (unsigned) yx_t));
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -41,7 +60,9 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         // fattn_kv_native_type of K and V: NONE when K/V point to F16 data, else the raw cache type
-        const int kv_native_K, const int kv_native_V);
+        const int kv_native_K, const int kv_native_V,
+        // derived kq mask (ggml_flash_attn_ext_add_kq_derived), cell == nullptr unless mask is absent
+        const kq_derived_t kq_derived);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -142,6 +163,7 @@ struct fattn_kv_native_t {
     int stride_V;
     int type_K;   // fattn_kv_native_type
     int type_V;
+    kq_derived_t kq; // the derived kq mask rides along the same kernel paths
 };
 
 // dequantize the 8 elements starting at element el (a multiple of 8) of a q8_0 row, same math as dequantize_block_q8_0_f16
@@ -872,6 +894,61 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// flash_attn_mask_to_KV_max for the derived kq mask: the same KV_max, derived from the cell positions
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_derived_to_KV_max(const kq_derived_t kq, int * KV_max_ptr, const int ne30) {
+    int * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+
+    const int tid = threadIdx.x;
+    const int jt  = blockIdx.x;
+
+    __shared__ int buf_iw[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 1;
+    }
+    ggml_cuda_pdl_sync();
+    __syncthreads();
+
+    int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
+    for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
+        int4 c;
+        ggml_cuda_memcpy_1<sizeof(int4)>(&c, kq.cell + 2*(KV_max_sj + 2*tid));
+
+        int all_inf = 1;
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const int jj = min(jt*ncols1 + j, kq.n_tok - 1); // rows past the end repeat the last one
+            const int lo   = kq.tok[jj];
+            const int hi   = kq.tok[jj +   kq.n_tok];
+            const int yx_t = kq.tok[jj + 2*kq.n_tok];
+            all_inf = all_inf && !kq_derived_visible(c.x, c.y, lo, hi, yx_t) && !kq_derived_visible(c.z, c.w, lo, hi, yx_t);
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+
+        if (!all_inf) {
+            break;
+        }
+    }
+
+    KV_max_sj += FATTN_KQ_STRIDE;
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    KV_max[jt] = KV_max_sj;
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -1161,6 +1238,16 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
+    // derived kq mask (ggml_flash_attn_ext_add_kq_derived)
+    const ggml_tensor * kq_cell = dst->src[6];
+    const ggml_tensor * kq_tok  = dst->src[7];
+    GGML_ASSERT(!kq_cell || (!mask && kq_tok && kq_tok->ne[0] == Q->ne[1] && Q->ne[3] == 1));
+    const kq_derived_t kq_derived = {
+        kq_cell ? (const int *) kq_cell->data : nullptr,
+        kq_tok  ? (const int *) kq_tok->data  : nullptr,
+        kq_tok  ? (int) kq_tok->ne[0]         : 0,
+    };
+
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
     const int id  = ggml_cuda_get_device();
@@ -1275,6 +1362,17 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
+    if (!use_sparse && kq_derived.cell && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 1024) {
+        const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+
+        KV_max.alloc(ntiles_x);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_derived_to_KV_max<ncols1>, launch_params,
+            kq_derived, KV_max.ptr, int(K->ne[1] / FATTN_KQ_STRIDE));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1436,7 +1534,8 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        kv_native_K, kv_native_V
+        kv_native_K, kv_native_V,
+        kq_derived
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -237,6 +237,24 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // derived kq mask (ggml_flash_attn_ext_add_kq_derived), from rdna-boosts block 15: prefill batches of a
+    // single-sequence cache hand flash attention per-cell positions instead of an n_kv x n_tokens mask,
+    // which leaves the compute buffer. Only the CPU and CUDA/HIP backends implement it: another backend
+    // registered in the process turns it off. LLAMA_KQ_MASK_DERIVED=0 turns it off.
+    {
+        const char * env = getenv("LLAMA_KQ_MASK_DERIVED");
+        cparams.kq_mask_derived = env == nullptr || atoi(env) != 0;
+
+        for (size_t i = 0; cparams.kq_mask_derived && i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            const std::string name = ggml_backend_reg_name(reg);
+            if (ggml_backend_reg_dev_count(reg) > 0 && name != "CPU" && name != "CUDA" && name != "ROCm" && name != "BLAS") {
+                LLAMA_LOG_INFO("%s: derived kq mask off, backend %s does not implement it\n", __func__, name.c_str());
+                cparams.kq_mask_derived = false;
+            }
+        }
+    }
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
@@ -318,6 +336,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+    LLAMA_LOG_INFO("%s: kq_mask_derived       = %s\n",   __func__, cparams.kq_mask_derived ? "true" : "false");
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);

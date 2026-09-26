@@ -544,7 +544,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch, 0);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // unallocated when every flash attention took its derived form
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (self_k_idxs_host) {
         mctx->set_input_k_idxs(self_k_idxs_host, ubatch, 1);
@@ -2712,6 +2715,38 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+void llm_graph_input_kq_derived::set_input(const llama_ubatch * ubatch) {
+    // unallocated when the flash attention that would read it took the packed mask instead
+    if (!cell || !cell->buffer || !tok || !tok->buffer) {
+        return;
+    }
+
+    mctx->set_input_kq_derived(cell, tok, ubatch, causal_attn, cell_first);
+}
+
+void llm_graph_context::build_attn_inp_kq_derived(
+        ggml_tensor * kq_mask,
+        const llama_kv_cache_context * mctx_cur,
+        uint32_t cell_first) const {
+    if (kq_mask == nullptr || !cparams.kq_mask_derived || !cparams.flash_attn ||
+            kq_mask->ne[3] != 1 || !mctx_cur->kq_mask_derivable(ubatch)) {
+        return;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_kq_derived>(mctx_cur, cparams.causal_attn, cell_first);
+
+    inp->cell = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, kq_mask->ne[0]);
+    inp->tok  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kq_mask->ne[1], 3);
+    ggml_set_input(inp->cell);
+    ggml_set_input(inp->tok);
+    ggml_set_name(inp->cell, "attn_inp_kq_cell");
+    ggml_set_name(inp->tok,  "attn_inp_kq_tok");
+
+    kq_derived[kq_mask] = { inp->cell, inp->tok };
+
+    res->add_input(std::move(inp));
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2741,6 +2776,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
 
+    // the derived form of a kq mask, if it has one; MLA (K and V heads differ) keeps the packed mask for
+    // its own kernels, and so does a sparse K/V set
+    auto kq_derived_of = [&](ggml_tensor * m) -> std::pair<ggml_tensor *, ggml_tensor *> {
+        const auto it = kq_derived.find(m);
+        if (it == kq_derived.end() || k->ne[0] != v->ne[0] || v_mla || n_kv_max > 0) {
+            return { nullptr, nullptr };
+        }
+        return it->second;
+    };
+
     // positional KV split: attend the device range and the host range separately, then merge them
     // with the log-sum-exp each flash-attn call reports. the host range arrives as one view per
     // stream - a view spanning streams would make the scheduler copy the gaps between them - so
@@ -2763,8 +2808,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 vv = ggml_cast(ctx0, vv, GGML_TYPE_F16);
             }
 
-            ggml_tensor * o = ggml_flash_attn_ext(ctx0, qq, kk, vv, mm, kq_scale, max_bias, softcap);
+            const auto kd = kq_derived_of(mm);
 
+            ggml_tensor * o = ggml_flash_attn_ext(ctx0, qq, kk, vv, kd.first ? nullptr : mm, kq_scale, max_bias, softcap);
+
+            ggml_flash_attn_ext_add_kq_derived(o, kd.first, kd.second);
             ggml_flash_attn_ext_add_sinks(o, sk);
             ggml_flash_attn_ext_set_prec (o, GGML_PREC_F32);
 
@@ -2852,8 +2900,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        const auto kd = kq_derived_of(kq_mask);
+
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, kd.first ? nullptr : kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_add_kq_derived(cur, kd.first, kd.second);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -3069,6 +3120,9 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
+    build_attn_inp_kq_derived(inp->self_kq_mask,      mctx_cur);
+    build_attn_inp_kq_derived(inp->self_kq_mask_host, mctx_cur, mctx_cur->is_split() ? mctx_cur->get_n_kv_dev() : 0);
+
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
@@ -3193,6 +3247,9 @@ llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    build_attn_inp_kq_derived(inp->self_kq_mask,      mctx_cur);
+    build_attn_inp_kq_derived(inp->self_kq_mask_host, mctx_cur, mctx_cur->is_split() ? mctx_cur->get_n_kv_dev() : 0);
 
     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
 }
@@ -3722,6 +3779,13 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
+    {
+        const auto * base = mctx_cur->get_base();
+        build_attn_inp_kq_derived(inp->self_kq_mask,      base);
+        build_attn_inp_kq_derived(inp->self_kq_mask_host, base, base->is_split() ? base->get_n_kv_dev() : 0);
+        build_attn_inp_kq_derived(inp->self_kq_mask_swa,  mctx_cur->get_swa());
+    }
+
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
 
@@ -3761,6 +3825,13 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
+
+    {
+        const auto * base = mctx_cur->get_base();
+        build_attn_inp_kq_derived(inp->self_kq_mask,      base);
+        build_attn_inp_kq_derived(inp->self_kq_mask_host, base, base->is_split() ? base->get_n_kv_dev() : 0);
+        build_attn_inp_kq_derived(inp->self_kq_mask_swa,  mctx_cur->get_swa());
+    }
 
     return (llm_graph_input_attn_k_iswa *) res->add_input(std::move(inp));
 }
@@ -3919,6 +3990,12 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
+    {
+        const auto * attn = mctx_cur->get_attn();
+        build_attn_inp_kq_derived(inp_attn->self_kq_mask,      attn);
+        build_attn_inp_kq_derived(inp_attn->self_kq_mask_host, attn, attn->is_split() ? attn->get_n_kv_dev() : 0);
+    }
+
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
@@ -3929,6 +4006,12 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+
+    {
+        const auto * attn = mctx_cur->get_attn();
+        build_attn_inp_kq_derived(inp_attn->self_kq_mask,      attn);
+        build_attn_inp_kq_derived(inp_attn->self_kq_mask_host, attn, attn->is_split() ? attn->get_n_kv_dev() : 0);
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -3960,6 +4043,9 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
     }
+
+    build_attn_inp_kq_derived(inp_attn->self_kq_mask,     attn_ctx->get_base());
+    build_attn_inp_kq_derived(inp_attn->self_kq_mask_swa, attn_ctx->get_swa());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

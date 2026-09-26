@@ -206,7 +206,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -334,7 +334,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(V->ne[0] == 128);
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-            const bool use_gqa_opt = mask && max_bias == 0.0f;
+            const bool use_gqa_opt = ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f;
             GGML_ASSERT(use_gqa_opt);
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -356,7 +356,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 float max_bias = 0.0f;
                 memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-                const bool use_gqa_opt = mask && max_bias == 0.0f;
+                const bool use_gqa_opt = ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f;
                 GGML_ASSERT(use_gqa_opt);
                 GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
                 const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -375,7 +375,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-            const bool use_gqa_opt = mask && max_bias == 0.0f;
+            const bool use_gqa_opt = ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f;
             GGML_ASSERT(use_gqa_opt);
 
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -575,7 +575,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -672,7 +672,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     if (GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_mla_prefill_enabled() &&
             K->ne[0] == 576 && V->ne[0] == 512 &&
             Q->ne[1] >= MLA_PRE_BR && K->ne[2] == 1 && gqa_ratio == 20 &&
-            !dst->src[4] && K->ne[1] % MLA_PRE_BC == 0 && mask) {
+            !dst->src[4] && K->ne[1] % MLA_PRE_BC == 0 && mask) { // packed mask only
         return BEST_FATTN_KERNEL_MLA_PREFILL;
     }
 
@@ -785,6 +785,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // writes the LSE does not read. the tile kernel goes through the combine path, so use it
     // when a caller asks for the LSE.
     if (dst->src[5] && kernel == BEST_FATTN_KERNEL_MMA_F16) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
+    // a derived kq mask is implemented by the mma and the tile kernels only
+    if (dst->src[6] && kernel != BEST_FATTN_KERNEL_MMA_F16 && kernel != BEST_FATTN_KERNEL_TILE && kernel != BEST_FATTN_KERNEL_NONE) {
         return BEST_FATTN_KERNEL_TILE;
     }
 

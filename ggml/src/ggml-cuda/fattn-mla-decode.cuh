@@ -54,8 +54,9 @@ static __global__ void flash_attn_ext_mla_decode(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-                            const int kv_native_K, const int kv_native_V) {
-    GGML_UNUSED(kv_native_K); GGML_UNUSED(kv_native_V);
+                            const int kv_native_K, const int kv_native_V,
+                            const kq_derived_t kq_derived) {
+    GGML_UNUSED(kv_native_K); GGML_UNUSED(kv_native_V); GGML_UNUSED(kq_derived); // never launched with a derived mask
     ggml_cuda_pdl_lc();
 #if defined(FLASH_ATTN_AVAILABLE) && defined(GGML_USE_HIP) && defined(RDNA)
     constexpr int DKQ       = MLA_DEC_DKQ;

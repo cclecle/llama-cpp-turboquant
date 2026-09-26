@@ -45,6 +45,7 @@ struct llama_cparams {
     uint32_t n_cpu_kv_cells;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_derived;    // derive the kq mask in flash attention instead of materializing it
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

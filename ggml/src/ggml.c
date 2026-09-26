@@ -5616,6 +5616,29 @@ void ggml_flash_attn_ext_add_lse(
     a->src[5] = lse;
 }
 
+void ggml_flash_attn_ext_add_kq_derived(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cell,
+        struct ggml_tensor * tok) {
+    if (!cell) {
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] == NULL); // the derived form replaces the mask
+    GGML_ASSERT(tok != NULL);
+    GGML_ASSERT(cell->type == GGML_TYPE_I32 && tok->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cell) && ggml_is_contiguous(tok));
+    GGML_ASSERT(cell->ne[0] == 2 && cell->ne[1] == a->src[1]->ne[1]); // one {pos, yx} per K row
+    GGML_ASSERT(tok->ne[0] == a->src[0]->ne[1] && tok->ne[1] == 3);   // {lo, hi, yx} per Q row
+    GGML_ASSERT(a->src[0]->ne[3] == 1); // a single sequence
+
+    a->src[6] = cell;
+    a->src[7] = tok;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

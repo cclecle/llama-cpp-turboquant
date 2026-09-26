@@ -7793,9 +7793,11 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool lse; // also produce the log-sum-exp of the softmax denominator
+    const int derived; // derived kq mask instead of a mask tensor: 1 = positions only, 2 = with M-RoPE yx ties
 
     std::string vars() override {
-        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, lse);
+        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, lse) +
+            (derived ? "," + VAR_TO_STR(derived) : "");
     }
 
     double max_nmse_err() override {
@@ -7812,9 +7814,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool lse = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool lse = false, int derived = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), lse(lse) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), lse(lse), derived(derived) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7861,7 +7863,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
-        if (mask) {
+        if (mask && !derived) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
@@ -7877,6 +7879,15 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
         ggml_set_name(out, "out");
+
+        if (derived) {
+            GGML_ASSERT(nr23[1] == 1 && n_kv_max == 0 && max_bias == 0.0f);
+            ggml_tensor * cell = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, kv);
+            ggml_set_name(cell, "kq_cell");
+            ggml_tensor * tok = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, 3);
+            ggml_set_name(tok, "kq_tok");
+            ggml_flash_attn_ext_add_kq_derived(out, cell, tok);
+        }
 
         if (lse) {
             ggml_tensor * l = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, out->ne[1], out->ne[2], out->ne[3]);
@@ -7896,6 +7907,8 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "kq_cell") == 0 || strcmp(t->name, "kq_tok") == 0) {
+                init_kq_derived(t);
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
@@ -7910,6 +7923,32 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+
+    // a cache like the llama one: cell c holds position c/2 when derived == 2 (pairs of M-RoPE image
+    // cells share a position, ordered by yx), else c; every 7th cell is empty. The query tokens sit at
+    // the last nb positions, causal, with a sliding window of kv/2 on odd tokens and every 5th token
+    // non-causal.
+    void init_kq_derived(ggml_tensor * t) {
+        std::vector<int32_t> data(ggml_nelements(t));
+        const int32_t n_pos = derived == 2 ? (int32_t) (kv/2) : (int32_t) kv;
+        if (strcmp(t->name, "kq_cell") == 0) {
+            for (int64_t c = 0; c < kv; ++c) {
+                const bool empty = c % 7 == 3;
+                data[2*c + 0] = empty ? INT32_MIN : derived == 2 ? (int32_t) (c/2) : (int32_t) c;
+                data[2*c + 1] = derived == 2 ? (int32_t) (c % 2) : 0;
+            }
+        } else {
+            for (int64_t i = 0; i < nb; ++i) {
+                const int32_t p   = std::max<int32_t>(0, n_pos - (int32_t) nb + (int32_t) i);
+                const bool    swa = i % 2 == 1;
+                const bool    nc  = i % 5 == 4;
+                data[i]        = swa ? std::max<int32_t>(0, p - (int32_t) (kv/2) + 1) : 0;
+                data[nb + i]   = nc ? INT32_MAX : p;
+                data[2*nb + i] = derived == 2 ? (int32_t) (i % 2) : 0;
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
     }
 };
 
@@ -10874,6 +10913,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // MLA head shapes
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, {16, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, {16, 1}, 512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+
+    // derived kq mask (ggml_flash_attn_ext_add_kq_derived): prefill shapes on the mma and the tile kernels,
+    // GQA and not, f16 and q8_0 caches, a KV length past one tile, and nb >= 1024 for the KV_max scan
+    for (int derived : {1, 2}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int64_t nb : {16, 77, 1024}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1536, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, derived));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 1536, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, derived));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, derived));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 32, true, true, 0, 30.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, derived));
+            // the -nckvc device half: the tile kernel through the LSE path
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 768, 64, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true, derived));
+        }
+    }
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

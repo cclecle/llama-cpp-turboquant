@@ -370,6 +370,28 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+// derived kq mask (ggml_flash_attn_ext_add_kq_derived): the compact state that replaces one kq mask
+// in the flash attention ops, when the mask is derivable for the batch. Owned apart from the attention
+// input, so every attention input type gets it; unallocated (not filled) when nothing reads it.
+class llm_graph_input_kq_derived : public llm_graph_input_i {
+public:
+    llm_graph_input_kq_derived(const llama_kv_cache_context * mctx, bool causal_attn, uint32_t cell_first) :
+        mctx(mctx), causal_attn(causal_attn), cell_first(cell_first) {}
+    ~llm_graph_input_kq_derived() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // prefill-shaped batches only, whose graphs change shape with the KV length anyway: not reused
+    // (this also keeps the stored memory context from going stale)
+
+    ggml_tensor * cell = nullptr; // I32 [2, n_kv]    {pos, yx} per cell
+    ggml_tensor * tok  = nullptr; // I32 [n_batch, 3] {lo, hi, yx} per token
+
+    const llama_kv_cache_context * mctx;
+    const bool     causal_attn;
+    const uint32_t cell_first;
+};
+
 // V-less input for the KV cache
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
@@ -1076,6 +1098,9 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // kq masks that have a derived form in this graph: mask -> {cell, tok}
+    mutable std::map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> kq_derived;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
@@ -1088,6 +1113,12 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // register the derived form of kq_mask (cells from cell_first of mctx) when this batch allows it
+    void build_attn_inp_kq_derived(
+             ggml_tensor * kq_mask,
+             const llama_kv_cache_context * mctx,
+                uint32_t   cell_first = 0) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
