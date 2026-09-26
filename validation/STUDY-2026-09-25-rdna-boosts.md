@@ -234,3 +234,26 @@ Tooling fix found here: `benchab.sh` picked the env by build name, so an A/B of 
 | Flash-Next `-sm tensor` (afn) | 38.7 -> 42.0 (+8.5%) | 36.0 -> 37.8 (+5.0%) |
 
 No regression anywhere; acceptance unchanged or up.
+
+## Block 13: fused MoE gate+up+GLU MMQ (`a642b431e`, `moe.sh`)
+- MUL_MAT_VEC_FUSION, v17 vs attn (`tbo-diff.sh`): 1253 -> 1349 OK, the same 12 failures on both builds (the known
+  q4_K SWIGLU_CLAMP decode cases); all 96 new prefill MUL_MAT_ID cases (m 64/512) pass. MUL_MAT_ID passes.
+- Perplexity identical fused off vs on: 35B-A3B Q6_K 3.7238, AgentWorld Q5_K_S 3.7209, GLM-4.7-Flash 4.7085.
+- Prefill t/s, off -> on (ub 1024): 35B-A3B Q6_K pp512 2029 -> 2073 (+2.2%), pp2048 2937 -> 2994 (+1.9%);
+  AgentWorld Q5_K_S 3471 -> 3568 (+2.8%), 4432 -> 4575 (+3.2%); GLM-4.7-Flash 3358 -> 3443 (+2.5%), 4014 -> 4096 (+2.0%).
+  Decode unchanged (35B tg64 73.4 / 74.6). Below the fork's +3.6-5.1% but consistent; kept on.
+
+## Qwen3.8-27B prefill profile (item c: block 02 chunked GDN?)
+rocprofv3 kernel stats, llama-bench pp4096 q8_0 KV ub 1024 (the d32768 run includes the 32k fill):
+
+| kernel | d0 | d32768 |
+|---|---|---|
+| mul_mat_q | 74.1% | 66.5% |
+| flash_attn | 2.0% | 11.9% |
+| gated_delta_net | 9.9% | 8.9% |
+| quantize | 3.1% | 2.9% |
+| unary_gated_op | 3.2% | 2.9% |
+| rms_norm | 2.5% | 2.2% |
+
+GDN is 9-10% of prefill, just under the 10% bar: even a 2x faster GDN kernel buys ~5% prefill. Block 02 (~3000
+lines) is not ported; mul_mat_q (two thirds to three quarters) stays the lever, as in the July profile.
