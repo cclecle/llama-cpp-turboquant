@@ -1996,8 +1996,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // fusion for ncols_dst = 1, and up to MMVQ_MAX_BATCH_SIZE for q8_0 (a speculative verify batch through a dense
+    // GLU FFN, e.g. the qwen4exp shared expert), the only type the multi-column fused kernels are built for
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && src0->type != GGML_TYPE_Q8_0) {
         return false;
     }
 
@@ -3695,10 +3696,55 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // scale -> silu / sigmoid (-> scale), see ggml_cuda_op_scale_unary (biases allowed)
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
+            (ops.size() == 2 || ops.begin()[2] == GGML_OP_SCALE) && unary_ops.size() == 1 &&
+            (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID)) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+        if (scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||
+                (ops.size() == 3 && cgraph->nodes[node_idx + 2]->type != GGML_TYPE_F32)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // rms norm -> scale (no bias), see ggml_cuda_op_rms_norm_scale
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];
+
+        return rms_norm->src[0]->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+            ggml_get_op_params_f32(scale, 1) == 0.0f;
+    }
+
     return false;
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GGML_CUDA_FUSE_RMS_NORM_SCALE=0: run rms norm -> scale op by op
+static bool ggml_cuda_fused_rms_norm_scale_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_RMS_NORM_SCALE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// GGML_CUDA_FUSE_SCALE_UNARY=0: run scale -> silu / sigmoid (-> scale) chains op by op
+static bool ggml_cuda_fused_scale_unary_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_SCALE_UNARY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4431,6 +4477,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // rms norm then a plain scale (the gated delta net l2 norm of q and k)
+    if (ggml_cuda_fused_rms_norm_scale_enabled() && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {}) &&
+            ggml_get_op_params_f32(cgraph->nodes[i + 1], 1) == 0.0f && ggml_is_contiguous(cgraph->nodes[i + 1])) {
+        ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4456,6 +4509,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // scale -> silu / sigmoid (-> scale): the qwen4exp hyper-connection gates, silu(x/hc) and 2*sigmoid(x/hc)
+    if (ggml_cuda_fused_scale_unary_enabled()) {
+        for (ggml_unary_op uop : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
+            if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { uop }) &&
+                    ggml_cuda_scale_unary_supported(node, cgraph->nodes[i + 1])) {
+                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                return 2;
+            }
+            if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { uop }) &&
+                    ggml_cuda_scale_unary_supported(node, cgraph->nodes[i + 1])) {
+                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
+                return 1;
+            }
+        }
     }
 
     return 0;
@@ -4495,6 +4564,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+            // a reused q8_1 src1 must have been quantized in this pass: a capture holds only its own kernels
+            cuda_ctx->q8_1_reuse.invalidate();
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
@@ -4752,7 +4823,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // a quantized src1 is only known to be current within one graph evaluation
+    cuda_ctx->q8_1_reuse.invalidate();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->q8_1_reuse.invalidate();
 
     return GGML_STATUS_SUCCESS;
 }

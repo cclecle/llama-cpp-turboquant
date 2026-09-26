@@ -95,6 +95,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// fused SCALE + UNARY (silu, sigmoid) + optional SCALE: dst = s1*f(s0*x + b0) + b1
+bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tensor * unary);
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

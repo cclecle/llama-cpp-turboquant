@@ -306,6 +306,9 @@ static __global__ void mul_mat_vec_k(
                     case GGML_GLU_OP_SWIGLU_OAI:
                         result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
                         break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                        break;
                     default:
                         break;
                 }

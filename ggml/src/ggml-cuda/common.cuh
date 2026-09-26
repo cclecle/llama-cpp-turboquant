@@ -1570,6 +1570,40 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // q8_1 copies of the src1 of the last quantized mat-vecs on the main stream (ggml_cuda_mul_mat_vec_q), so that
+    // later mat-vecs on the same activations (wq/wk/wv, qkv/gate, the routed and the shared experts, ...) skip the
+    // quantization. src1 is named by its root tensor and byte range: a view of it hits, another tensor that later
+    // reuses the memory does not. The keys are valid for one graph evaluation. A buffer only grows; a replaced one is
+    // kept for the CUDA graphs that were captured with it
+    struct q8_1_reuse_entry {
+        bool                valid = false;
+        const ggml_tensor * root  = nullptr;
+        size_t              offs  = 0;
+        int64_t             ne00  = 0;    // row width
+        int64_t             nrows = 0;    // rows in (i1, i2, i3) order, which is the order of the q8_1 copy
+        size_t              row_stride = 0;
+        uint64_t            last_use   = 0;
+        std::vector<void *> bufs;
+        size_t              size  = 0;
+
+        ~q8_1_reuse_entry() {
+            for (void * b : bufs) {
+                (void) cudaFree(b);
+            }
+        }
+    };
+    struct q8_1_reuse_t {
+        static constexpr int n_entries = 4;
+        q8_1_reuse_entry entries[n_entries];
+        uint64_t         clock = 0;
+
+        void invalidate() {
+            for (auto & e : entries) {
+                e.valid = false;
+            }
+        }
+    } q8_1_reuse;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

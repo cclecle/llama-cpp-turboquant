@@ -702,6 +702,65 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused scale + unary (+ scale): dst = s1*f(s0*x + b0) + b1 */
+
+template <float (*op)(float)>
+static __global__ void scale_unary_scale_f32(const float * x, float * dst, const float s0, const float b0,
+        const float s1, const float b1, const int64_t k) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    dst[i] = op(x[i]*s0 + b0)*s1 + b1;
+}
+
+template <float (*op)(float)>
+static void scale_unary_scale_f32_cuda(const float * x, float * dst, const float s0, const float b0,
+        const float s1, const float b1, const int64_t k, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    scale_unary_scale_f32<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, s0, b0, s1, b1, k);
+}
+
+bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tensor * unary) {
+    const ggml_unary_op uop = ggml_get_unary_op(unary);
+    return (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID) &&
+        scale0->type == GGML_TYPE_F32 && scale0->src[0]->type == GGML_TYPE_F32 && unary->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(scale0->src[0]) && ggml_is_contiguous(scale0) && ggml_is_contiguous(unary);
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1) {
+    const ggml_tensor * src = scale0->src[0];
+    ggml_tensor       * dst = scale1 ? scale1 : unary;
+
+    GGML_ASSERT(ggml_cuda_scale_unary_supported(scale0, unary));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == ggml_nelements(src));
+
+    float s0, b0, s1 = 1.0f, b1 = 0.0f;
+    memcpy(&s0, (const float *) scale0->op_params + 0, sizeof(float));
+    memcpy(&b0, (const float *) scale0->op_params + 1, sizeof(float));
+    if (scale1) {
+        memcpy(&s1, (const float *) scale1->op_params + 0, sizeof(float));
+        memcpy(&b1, (const float *) scale1->op_params + 1, sizeof(float));
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const int64_t k = ggml_nelements(src);
+
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SILU:
+            scale_unary_scale_f32_cuda<op_silu>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, stream);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            scale_unary_scale_f32_cuda<op_sigmoid>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, stream);
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused scale+unary");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

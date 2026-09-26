@@ -8104,6 +8104,10 @@ struct test_mul_mat_shared_src1 : public test_case {
     test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q4_0, int64_t k = 2560, int64_t n = 5)
         : type_a(type_a), k(k), n(n) {}
 
+    double max_nmse_err() override {
+        return 5e-4; // the activations are quantized, differently from the CPU reference
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(x, "x");
@@ -11399,7 +11403,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 // multi-token batches (spec decoding)
-                                for (int64_t m_batch : { 2, 4, 8 }) {
+                                for (int64_t m_batch : { 2, 4, 5, 8 }) {
                                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
                                         use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 }

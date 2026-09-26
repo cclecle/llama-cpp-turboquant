@@ -1082,7 +1082,8 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    // fused kernels exist for one column, and for q8_0 at every width (see ggml_cuda_should_fuse_mul_mat_vec_q)
+    if constexpr (c_ncols_dst == 1 || type == GGML_TYPE_Q8_0) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1093,7 +1094,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1 (and q8_0)");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1481,6 +1482,15 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// GGML_CUDA_Q8_1_REUSE=0: quantize src1 for every mat-vec, as before (see ggml_backend_cuda_context::q8_1_reuse)
+static bool ggml_cuda_q8_1_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_Q8_1_REUSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1512,7 +1522,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (src0->type == GGML_TYPE_Q8_0 && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1580,12 +1590,74 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // reuse the q8_1 copy when the previous quantized mat-vec on the main stream had the same src1 (the plain q8_1
+    // layout does not depend on src0); other streams quantize into a pool temporary as before
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * src1_q8_1_d = nullptr;
+
+    const int64_t s11_src1 = src1->nb[1] / ts_src1;
+    const int64_t s12_src1 = src1->nb[2] / ts_src1;
+    const int64_t s13_src1 = src1->nb[3] / ts_src1;
+
+    // the rows must be evenly strided for the key: then [n, 1, T] (a MUL_MAT_ID src1) and [n, T] share a copy
+    const bool src1_rows_uniform = src1->nb[2] == src1->nb[1]*ne11 && src1->nb[3] == src1->nb[2]*ne12;
+
+    if (ctx.curr_stream_no == 0 && ggml_cuda_q8_1_reuse_enabled() && src1_rows_uniform) {
+        // follow pure views only: an in-place op's result is a view of its source but holds new data
+        const ggml_tensor * src1_root = src1;
+        size_t              src1_offs = 0;
+        while (src1_root->view_src != nullptr &&
+                (src1_root->op == GGML_OP_VIEW || src1_root->op == GGML_OP_RESHAPE ||
+                 src1_root->op == GGML_OP_PERMUTE || src1_root->op == GGML_OP_TRANSPOSE)) {
+            src1_offs += src1_root->view_offs;
+            src1_root  = src1_root->view_src;
+        }
+        auto & reuse = ctx.q8_1_reuse;
+        const int64_t nrows = ne11*ne12*ne13;
+
+        ggml_backend_cuda_context::q8_1_reuse_entry * entry = nullptr;
+        for (auto & e : reuse.entries) {
+            if (e.valid && e.root == src1_root && e.offs == src1_offs && e.ne00 == ne10 && e.nrows == nrows &&
+                    (nrows == 1 || e.row_stride == src1->nb[1])) {
+                entry = &e;
+                break;
+            }
+        }
+        if (entry == nullptr) {
+            // the least recently used (or an invalid) entry takes the new copy
+            entry = &reuse.entries[0];
+            for (auto & e : reuse.entries) {
+                if (!e.valid || (entry->valid && e.last_use < entry->last_use)) {
+                    entry = &e;
+                    if (!e.valid) {
+                        break;
+                    }
+                }
+            }
+            if (q8_1_size > entry->size) {
+                void * buf = nullptr;
+                const size_t size = std::max(q8_1_size, 2*entry->size);
+                CUDA_CHECK(cudaMalloc(&buf, size));
+                entry->bufs.push_back(buf);
+                entry->size = size;
+            }
+            entry->valid      = true;
+            entry->root       = src1_root;
+            entry->offs       = src1_offs;
+            entry->ne00       = ne10;
+            entry->nrows      = nrows;
+            entry->row_stride = src1->nb[1];
+            quantize_row_q8_1_cuda(src1_d, nullptr, entry->bufs.back(), src0->type, ne10, s11_src1, s12_src1, s13_src1,
+                ne10_padded, ne11, ne12, ne13, stream);
+        }
+        entry->last_use = ++reuse.clock;
+        src1_q8_1_d = (char *) entry->bufs.back();
+    } else {
+        src1_q8_1_d = src1_q8_1.alloc(q8_1_size);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11_src1, s12_src1, s13_src1,
+            ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1611,7 +1683,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
