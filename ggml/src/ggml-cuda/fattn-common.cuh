@@ -191,12 +191,15 @@ static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q8_0_chunk(
 // The tile kernel can only fold ncols2 = 2 there, so it re-reads every K/V element once per head pair.
 // The band runs the whole n_q <= 8 range on the WMMA kernel with the GQA group in ncols2 = 8 and a
 // round-robin KV split over a fixed P blocks, so decode and every verify width reduce in the same order.
-// GGML_HIP_FA_BAND_WMMA=0 disables it, =2 picks ncols1 = 2 (default 4). GGML_HIP_FA_BAND_WMMA_SPLIT sets P.
+// ncols1 = 2 and P = nsm (F16) or 3*nsm/4 (q8_0), fixed for all widths of a cache type (gfx1201, kv 16k, us per
+// call at n_q 1/3/5/8: q8_0 75/125/170/219 against 134/136/206/209 with the fork's ncols1 = 4, P = nsm; F16
+// n_q 3/5/8 122/141/181 against 135/189/193). GGML_HIP_FA_BAND_WMMA=0 disables the band, =4 picks ncols1 = 4.
+// GGML_HIP_FA_BAND_WMMA_SPLIT sets P.
 static inline int ggml_cuda_fattn_band_wmma_ncols1() {
     static const int ncols1 = [] {
         const char * env = getenv("GGML_HIP_FA_BAND_WMMA");
         const int v = env != nullptr ? atoi(env) : -1;
-        return v == 0 ? 0 : (v == 2 ? 2 : 4);
+        return v == 0 ? 0 : (v == 4 ? 4 : 2);
     }();
     return ncols1;
 }
@@ -1435,7 +1438,8 @@ void launch_fattn(
 
         if (band_wmma) {
             const int split_env = ggml_cuda_fattn_band_wmma_split();
-            blocks_num.y = split_env > 0 ? split_env : std::max(2, nsm);
+            const int split_def = K->type == GGML_TYPE_F16 ? nsm : 3*nsm/4;
+            blocks_num.y = split_env > 0 ? split_env : std::max(2, split_def);
         } else if (use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
