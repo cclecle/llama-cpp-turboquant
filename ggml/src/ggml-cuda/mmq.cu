@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "moe-tiered.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -130,6 +131,11 @@ bool ggml_cuda_mmq_gate_supported(const ggml_tensor * up, const ggml_tensor * ga
             return false;
     }
 
+    // tiered experts: up and gate must share the placement (one table each, or none)
+    if ((ggml_cuda_tiered_table(src0) == nullptr) != (ggml_cuda_tiered_table(gate->src[0]) == nullptr)) {
+        return false;
+    }
+
     return src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
         gate->src[0]->type == src0->type && ggml_are_same_shape(gate->src[0], src0) && ggml_are_same_stride(gate->src[0], src0) &&
         ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], src0->ne[2]);
@@ -189,6 +195,7 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        GGML_ASSERT(!ggml_cuda_tiered_table(src0)); // tiered experts are only addressable through MUL_MAT_ID
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -321,18 +328,22 @@ void ggml_cuda_mul_mat_q(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+    // tiered experts (moe-tiered.cuh): per-expert base addresses
+    args.x_table = (const char * const *) ggml_cuda_tiered_table(src0);
 
     if (gate) {
         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
         mmq_args args_gate = args;
         args_gate.x_gate    = (const char *) gate->data;
+        args_gate.x_gate_table = (const char * const *) ggml_cuda_tiered_table(gate);
+        GGML_ASSERT((args_gate.x_table == nullptr) == (args_gate.x_gate_table == nullptr));
         args_gate.glu_op    = ggml_get_glu_op(glu);
         args_gate.glu_limit = ggml_get_op_params_f32(glu, 3);
         ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream);

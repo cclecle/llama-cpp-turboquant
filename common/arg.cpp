@@ -2457,6 +2457,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HYBRID"));
     add_opt(common_arg(
+        {"--moe-hot-experts"}, "FILE",
+        "hot MoE experts per layer for the <device>_TIERED buffer type (select it with -ot, e.g.\n"
+        "-ot ffn_(gate|up|down)_exps=ROCm0_TIERED): lines \"blk.<layer> <id> <id> ...\" (scripts/fleet/moe_hotset.py).\n"
+        "the listed experts are stored in VRAM, all others in pinned host memory read in place over the bus;\n"
+        "each expert lives in one place only. GGML_CUDA_MOE_TIERED=0 makes every expert cold",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_CUDA_MOE_HOT_FILE", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_EXPERTS"));
+    add_opt(common_arg(
         {"--moe-hybrid-vram"}, "auto|MiB",
         "VRAM the class-1 experts may use, in total across devices (default: auto = every free byte\n"
         "beyond --moe-hybrid-reserve). prefer --moe-hybrid-experts, which says the same thing in the\n"

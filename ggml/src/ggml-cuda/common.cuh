@@ -1589,6 +1589,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // tiered experts (moe-tiered.cuh): per-expert base addresses of x / gate for MUL_MAT_ID, used instead of
+    // x + expert*stride_channel_x; set on every launch that has ids, fused or not
+    const void * const * x_table = nullptr;
+    const void * const * gate_table = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

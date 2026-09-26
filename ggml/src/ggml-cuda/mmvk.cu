@@ -186,9 +186,13 @@ static __global__ void mul_mat_vec_k(
     GGML_UNUSED(bs_x);
 
     typedef typename std::conditional<type == GGML_TYPE_Q6_K, block_q6_K, block_q4_K>::type blk_t;
-    const blk_t * x    = (const blk_t *) vx + (size_t) sample_x*stride_sample_x + (size_t) channel_x*stride_channel_x;
+    // tiered experts (moe-tiered.cuh): per-expert base addresses from the table
+    const bool    x_tab = ids && fusion.x_table;
+    const blk_t * x    = x_tab ? (const blk_t *) fusion.x_table[channel_x]
+                       : (const blk_t *) vx + (size_t) sample_x*stride_sample_x + (size_t) channel_x*stride_channel_x;
     const blk_t * xg   = has_fusion && fusion.gate
-                       ? (const blk_t *) fusion.gate + (size_t) sample_x*stride_sample_x + (size_t) channel_x*stride_channel_x
+                       ? (x_tab && fusion.gate_table ? (const blk_t *) fusion.gate_table[channel_x]
+                          : (const blk_t *) fusion.gate + (size_t) sample_x*stride_sample_x + (size_t) channel_x*stride_channel_x)
                        : nullptr;
     const float * y    = vy + (size_t) sample_y*stride_sample_y + (size_t) channel_y*stride_channel_y;
 

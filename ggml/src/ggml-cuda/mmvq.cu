@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvk.cuh"
+#include "moe-tiered.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -686,6 +687,12 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
+    // tiered experts: the expert's base address comes from the table instead of channel_x*stride_channel_x
+    const bool x_tab = ncols_dst == 1 && ids && fusion.x_table;
+    if (x_tab) {
+        vx = fusion.x_table[channel_x];
+    }
+
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
@@ -703,7 +710,7 @@ static __global__ void mul_mat_vec_q(
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
-        vgate         = fusion.gate;
+        vgate         = x_tab && fusion.gate_table ? fusion.gate_table[channel_x] : fusion.gate;
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
@@ -757,7 +764,7 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset = sample_x*stride_sample_x + (x_tab ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -955,7 +962,16 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    // tiered experts: per-expert base addresses from the table
+    if (fusion.x_table) {
+        vx = fusion.x_table[channel_x];
+        if constexpr (has_fusion) {
+            if (fusion.gate_table) {
+                vgate = fusion.gate_table[channel_x];
+            }
+        }
+    }
+    const int kbx_offset  = (fusion.x_table ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1531,6 +1547,14 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+    }
+
+    // tiered experts: per-expert base addresses; up and gate share one placement (same layer, same hot list)
+    fusion_local.x_table = ggml_cuda_tiered_table(src0);
+    GGML_ASSERT(ids || !fusion_local.x_table);
+    if (fusion && fusion->gate) {
+        fusion_local.gate_table = ggml_cuda_tiered_table(fusion->gate);
+        GGML_ASSERT((fusion_local.x_table == nullptr) == (fusion_local.gate_table == nullptr));
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

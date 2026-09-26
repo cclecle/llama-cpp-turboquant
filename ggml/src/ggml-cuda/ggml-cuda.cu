@@ -72,6 +72,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/moe-tiered.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2206,7 +2207,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        src0_slice.data     = ggml_cuda_tiered_table(src0) ? (char *) ggml_cuda_tiered_expert(src0, i02) : (char *) src0->data + i02*nb02;
+        src0_slice.extra    = nullptr; // the slice is one plain expert matrix
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -2250,6 +2252,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // tiered expert tensors (moe-tiered.cuh) are only readable through the MUL_MAT_ID expert table: fail loudly
+    // instead of reading data + expert*nb[2] through any other op
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (dst->src[i] && ggml_cuda_tiered_table(dst->src[i]) && !(dst->op == GGML_OP_MUL_MAT_ID && i == 0)) {
+            GGML_ABORT("%s: tiered expert tensor %s used as src[%d] of %s", __func__, dst->src[i]->name, i, ggml_op_desc(dst));
+        }
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4607,6 +4616,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                node->src[j]->buffer->buft == ggml_backend_cuda_uva_buffer_type(cuda_ctx->device) ||
+                               node->src[j]->buffer->buft == ggml_backend_cuda_tiered_buffer_type(cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -5402,6 +5412,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             }
         }
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_tiered(op->src[i]->buffer->buft) &&
+            op->src[i]->buffer->buft->device != dev) {
+            return false;
+        }
     }
 
     switch (op->op) {
@@ -5860,7 +5874,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return ((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_uva(buft)) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return ((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_uva(buft) || ggml_backend_buft_is_cuda_tiered(buft)) && buft->device == dev) ||
+        (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6023,10 +6038,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {
-    static ggml_backend_buffer_type_t extra_bufts[GGML_CUDA_MAX_DEVICES][2];
+    // the meta backend matches extra buffer types across devices by index: keep the order the same everywhere
+    static ggml_backend_buffer_type_t extra_bufts[GGML_CUDA_MAX_DEVICES][3];
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     extra_bufts[ctx->device][0] = ggml_backend_cuda_uva_buffer_type(ctx->device);
-    extra_bufts[ctx->device][1] = nullptr;
+    extra_bufts[ctx->device][1] = ggml_backend_cuda_tiered_buffer_type(ctx->device);
+    extra_bufts[ctx->device][2] = nullptr;
     return extra_bufts[ctx->device];
 }
 
