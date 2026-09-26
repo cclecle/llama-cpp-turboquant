@@ -224,3 +224,13 @@ Decode tg64 t/s, v17 -> attn (band retune), d0 / d16384 / d65536:
 - 27B f16: even (n_q = 1 f16 is not in the band); 35B-A3B: even.
 
 Tooling fix found here: `benchab.sh` picked the env by build name, so an A/B of one build against itself ran A twice.
+
+### Band retune under MTP (series 5, 6 prompts pooled, v17 -> attn)
+| Rung | short (~2.5k tok) | deep (~30k tok) |
+|---|---|---|
+| 27B f16 (a27) | 45.8 -> 47.0 (+2.6%) | 44.0 -> 45.1 (+2.5%) |
+| 27B q8_0 (a27q) | 48.2 -> 49.9 (+3.5%) | 49.5 -> 49.6 (even) |
+| TurboFable `-sm tensor` (atp) | 57.7 -> 59.1 (+2.4%) | 54.3 -> 55.5 (+2.2%) |
+| Flash-Next `-sm tensor` (afn) | 38.7 -> 42.0 (+8.5%) | 36.0 -> 37.8 (+5.0%) |
+
+No regression anywhere; acceptance unchanged or up.
