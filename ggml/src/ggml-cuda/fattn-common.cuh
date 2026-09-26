@@ -263,6 +263,47 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
         gqa_ratio > 4 && gqa_ratio <= 8 && logit_softcap == 0.0f && kv_ok;
 }
 
+// RDNA4 single-query decode, head 256 with 9-16 Q heads per K/V head, q8_0 K/V read natively (the qwen4exp MTP head
+// under a tensor split: 12). The vector kernel reads K/V once per Q head, the mma kernel at (1, 16) once for all of
+// them (kv 32k: 210 us per call with vec). GGML_HIP_FA_GQA16=0 keeps the vector kernel.
+static inline bool ggml_cuda_fattn_gqa16_decode_applies(const int cc, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_FA_GQA16");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc)) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (dst->src[4] != nullptr || dst->src[5] != nullptr || dst->src[6] != nullptr || dst->src[8] != nullptr || mask == nullptr) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    bool aligned = true;
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            aligned &= t->nb[i] % 16 == 0;
+        }
+    }
+
+    const int  gqa_ratio = Q->ne[2] / K->ne[2];
+    const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
+    const bool kv_ok     = kv_native == FATTN_KV_NATIVE_Q8_0 && ggml_cuda_fattn_kv_native_type(V) == FATTN_KV_NATIVE_Q8_0;
+
+    return aligned && kv_ok && max_bias == 0.0f && logit_softcap == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 && gqa_ratio > 8 && gqa_ratio <= 16;
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -955,6 +996,10 @@ static __global__ void flash_attn_derived_to_KV_max(const kq_derived_t kq, int *
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// the explicit lists of ggml_flash_attn_ext_add_kv_idx in the layout of ggml_cuda_flash_attn_ext_compact_mask
+void ggml_cuda_flash_attn_ext_kv_idx_lists(
+        const ggml_tensor * idx, int32_t * lists, int32_t * counts, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1352,14 +1397,23 @@ void launch_fattn(
     int32_t n_kv_max = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
-        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
-        GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
-
+        const ggml_tensor * kv_idx = KQV->src[8];
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+        if (kv_idx) {
+            // explicit lists, one per query: [n_sel, n_q, 1, n_seq]
+            GGML_ASSERT(ncols1 == 1 && mask->ne[3] == Q->ne[3]);
+            n_kv_max = kv_idx->ne[0];
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+            KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+            ggml_cuda_flash_attn_ext_kv_idx_lists(kv_idx, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, main_stream);
+        } else {
+            const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+            GGML_ASSERT(n_kv_max_query > 0);
+            n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+
+            KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.

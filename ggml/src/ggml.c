@@ -1084,6 +1084,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "QSA_POOL",
+    "QSA_EXPAND",
 
     "UNARY",
 
@@ -1101,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1201,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "qsa_pool(k, cells, w)",
+    "qsa_expand(score, blk, add)",
 
     "unary(x)",
 
@@ -1216,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5639,6 +5643,34 @@ void ggml_flash_attn_ext_add_kq_derived(
     a->src[7] = tok;
 }
 
+void ggml_flash_attn_ext_add_kv_idx(
+        struct ggml_tensor * a,
+        struct ggml_tensor * idx) {
+    if (!idx) {
+        a->src[8] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * k    = a->src[1];
+    const struct ggml_tensor * mask = a->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) a->op_params + 1, sizeof(float));
+
+    GGML_ASSERT(mask != NULL && mask->ne[0] == k->ne[1]); // read at the listed rows
+    GGML_ASSERT(a->src[4] == NULL && a->src[5] == NULL && a->src[6] == NULL);
+    GGML_ASSERT(max_bias == 0.0f);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(idx));
+    GGML_ASSERT(idx->ne[0] <= k->ne[1]);
+    GGML_ASSERT(idx->ne[1] == q->ne[1] && idx->ne[2] == 1 && idx->ne[3] == q->ne[3]);
+
+    a->src[8] = idx;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -6660,6 +6692,74 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_qsa_pool
+
+struct ggml_tensor * ggml_qsa_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * w,
+        int                   r,
+        float                 eps) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type)); // rows are contiguous
+    GGML_ASSERT(k->ne[0] % ggml_blck_size(k->type) == 0);
+    GGML_ASSERT(k->ne[3] == 1);
+
+    GGML_ASSERT(r > 0);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(cells->ne[0] % r == 0);
+    GGML_ASSERT(cells->ne[1] == k->ne[2] && cells->ne[2] == 1 && cells->ne[3] == 1);
+
+    if (w) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(w));
+        GGML_ASSERT(ggml_nelements(w) == k->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k->ne[0], cells->ne[0]/r, k->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, r);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_QSA_POOL;
+    result->src[0] = k;
+    result->src[1] = cells;
+    result->src[2] = w;
+
+    return result;
+}
+
+// ggml_qsa_expand
+
+struct ggml_tensor * ggml_qsa_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blk,
+        struct ggml_tensor  * add) {
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(score->nb[0] == sizeof(float));
+    GGML_ASSERT(score->ne[3] == 1);
+
+    GGML_ASSERT(blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(blk));
+    GGML_ASSERT(blk->ne[1] == score->ne[2] && blk->ne[2] == 1 && blk->ne[3] == 1);
+
+    GGML_ASSERT(add->type == GGML_TYPE_F32 || add->type == GGML_TYPE_F16);
+    GGML_ASSERT(add->nb[0] == ggml_type_size(add->type));
+    GGML_ASSERT(add->ne[0] == blk->ne[0] && add->ne[1] == score->ne[1] && add->ne[2] == score->ne[2] && add->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, blk->ne[0], score->ne[1], score->ne[2]);
+
+    result->op     = GGML_OP_QSA_EXPAND;
+    result->src[0] = score;
+    result->src[1] = blk;
+    result->src[2] = add;
 
     return result;
 }

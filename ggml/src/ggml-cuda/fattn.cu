@@ -127,7 +127,40 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// explicit sparse lists (ggml_flash_attn_ext_add_kv_idx): the lists in the layout the kernel reads, the n_lists counts after them
+static __global__ void flash_attn_kv_idx_to_sparse_lists(
+        const int32_t * __restrict__ idx, int32_t * __restrict__ lists, int32_t * __restrict__ counts, const int n_sel) {
+    ggml_cuda_pdl_sync();
+
+    const int list = blockIdx.x;
+
+    for (int i = threadIdx.x; i < n_sel; i += blockDim.x) {
+        lists[int64_t(list)*n_sel + i] = idx[int64_t(list)*n_sel + i];
+    }
+    if (threadIdx.x == 0) {
+        counts[list] = n_sel; // unused entries are -1, the kernel masks them
+    }
+    __syncthreads();
+
+    ggml_cuda_pdl_lc();
+}
+
+void ggml_cuda_flash_attn_ext_kv_idx_lists(
+        const ggml_tensor * idx, int32_t * lists, int32_t * counts, cudaStream_t stream) {
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx));
+    const dim3 blocks_num(idx->ne[1]*idx->ne[2]*idx->ne[3], 1, 1);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_kv_idx_to_sparse_lists, launch_params,
+        (const int32_t *) idx->data, lists, counts, int(idx->ne[0]));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+    // explicit lists are gathered at (1, 16) only, see ggml_cuda_flash_attn_ext_mma_f16
+    if (dst->src[8]) {
+        return ncols1 == 1 && ncols2 == 16;
+    }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
     return false;
@@ -307,6 +340,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // explicit sparse lists: one query per tile, so every query gathers its own list, and the GQA heads
+    // of a K/V head fill the 16 columns (partial tiles are masked). ggml_cuda_get_best_fattn_kernel_impl
+    // allows head 256 only. The same config serves single-query decode with 9-16 Q heads per K/V head
+    if (dst->src[8] || ggml_cuda_fattn_gqa16_decode_applies(cc, dst)) {
+        GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 16>(ctx, dst);
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 64:
@@ -576,6 +618,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && ggml_cuda_fattn_has_mask(dst) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool aligned_16 = true;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -583,12 +626,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
             if (t->nb[i] % 16 != 0) {
                 gqa_opt_applies = false;
+                aligned_16      = false;
                 break;
             }
         }
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    // explicit sparse lists (ggml_flash_attn_ext_add_kv_idx) exist only in the mma kernel, at (256, 256, 1, 16).
+    // n_kv needs no padding there: the K/V rows are reached through the lists only
+    if (dst->src[8]) {
+#if defined(GGML_USE_MUSA)
+        return BEST_FATTN_KERNEL_NONE;
+#endif // defined(GGML_USE_MUSA)
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+        const bool ok = (turing_mma_available(cc) || amd_wmma_available(cc)) &&
+            Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+            ggml_cuda_fattn_kv_type_supported(K->type) && ggml_cuda_fattn_kv_type_supported(V->type) &&
+            mask && mask->ne[2] == 1 && mask->ne[3] == Q->ne[3] && aligned_16 &&
+            max_bias == 0.0f && logit_softcap == 0.0f &&
+            !dst->src[4] && !dst->src[5] && !dst->src[6];
+
+        return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -679,7 +742,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     // RDNA4 decode/verify band: head 256, GQA 5..8, q8_0 K/V read natively by the WMMA kernel
-    if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+    if (ggml_cuda_fattn_band_wmma_applies(cc, dst) || ggml_cuda_fattn_gqa16_decode_applies(cc, dst)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 

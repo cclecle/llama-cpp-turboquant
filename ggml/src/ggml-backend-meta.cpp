@@ -942,8 +942,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        // src layout: [0]=Q [1]=K [2]=V [3]=mask [4]=sinks(optional)
+        // src layout: [0]=Q [1]=K [2]=V [3]=mask [4]=sinks(optional) [8]=sparse K/V lists(optional)
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // the lists name K/V rows, which every head split keeps whole
+        GGML_ASSERT(tensor->src[8] == nullptr || src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
         const bool q_head_split  = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2;
         const bool q_mirrored    = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -1309,7 +1311,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_QSA_POOL:
+            case GGML_OP_QSA_EXPAND: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

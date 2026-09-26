@@ -585,6 +585,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QSA_POOL,
+        GGML_OP_QSA_EXPAND,
 
         GGML_OP_UNARY,
 
@@ -2536,6 +2538,14 @@ extern "C" {
             struct ggml_tensor * cell,
             struct ggml_tensor * tok);
 
+    // sparse K/V: each query row attends only the K/V rows its list names, instead of all n_kv
+    //   idx: [n_sel, n_batch, 1, ne3] I32, K/V row indices of query row (i1, i3); -1 marks an unused entry
+    // the mask stays [n_kv, n_batch, ...] and is read at the listed rows, so causality still applies.
+    // a list must not name a row twice. needs the packed mask, no sinks, no lse and no ALiBi
+    GGML_API void ggml_flash_attn_ext_add_kv_idx(
+            struct ggml_tensor * a,
+            struct ggml_tensor * idx);
+
     // hint: attention runs split across devices (tensor split); process-wide, default false
     GGML_API void ggml_set_fa_tensor_parallel(bool enable);
     GGML_API bool ggml_get_fa_tensor_parallel(void);
@@ -2753,6 +2763,31 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // qwen4exp block-sparse attention (QSA) indexer: one pooled key per block of r cached indexer keys
+    //   k:     [n_embd, n_kv, ns]      F32, F16 or Q8_0 rows (stream s indexes its own rows)
+    //   cells: [r*n_blocks, ns]        I32, the r member rows of each block
+    //   w:     [n_embd]                F32 RMS norm weight, or NULL
+    //   res:   [n_embd, n_blocks, ns]  F32, rms_norm(mean_i k[cells[b*r + i]], eps) * w
+    // the members are summed in order, then scaled by 1/r
+    GGML_API struct ggml_tensor * ggml_qsa_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * w,
+            int                   r,
+            float                 eps);
+
+    // qwen4exp QSA indexer: the per-cell score is the score of the cell's block plus a per-cell term
+    //   score: [n_blocks, n_tokens, ns] F32
+    //   blk:   [n_kv, ns]               I32, the block of each cell
+    //   add:   [n_kv, n_tokens, ns]     F32 or F16, e.g. the attention mask
+    //   res:   [n_kv, n_tokens, ns]     F32, res[j, t, s] = score[blk[j, s], t, s] + add[j, t, s]
+    GGML_API struct ggml_tensor * ggml_qsa_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blk,
+            struct ggml_tensor  * add);
 
     // custom operators
 

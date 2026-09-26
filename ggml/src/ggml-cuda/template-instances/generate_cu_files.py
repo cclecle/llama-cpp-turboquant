@@ -97,7 +97,8 @@ for ncols in [8, 16, 32, 64]:
                     continue
                 if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
                     continue
-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
+                # (256, 256, 1, 16) gathers the explicit sparse K/V lists (qwen4exp QSA decode)
+                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32) and not (head_size_kq == 256 and ncols1 == 1 and ncols2 == 16):
                     continue
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))

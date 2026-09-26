@@ -1447,8 +1447,8 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
 }
 
 static ggml_openvino_op_support ggml_backend_openvino_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // this backend does not write the flash-attn log-sum-exp output
-    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+    // this backend does not write the flash-attn log-sum-exp output nor gather a sparse K/V index list
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && (op->src[5] || op->src[8])) {
         return {false, "FLASH_ATTN_EXT with a log-sum-exp output is not supported"};
     }
 

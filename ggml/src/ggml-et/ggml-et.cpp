@@ -862,8 +862,8 @@ static bool et_ggml_is_row_contiguous(const ggml_tensor * t) {
 }
 
 static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // this backend does not write the flash-attn log-sum-exp output
-    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+    // this backend does not write the flash-attn log-sum-exp output nor gather a sparse K/V index list
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && (op->src[5] || op->src[8])) {
         return false;
     }
 
