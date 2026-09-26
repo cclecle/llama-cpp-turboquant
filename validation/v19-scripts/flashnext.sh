@@ -56,7 +56,9 @@ for b in $BACKENDS; do
     URL=http://127.0.0.1:8090; MODEL=Qwen3.8-Flash-Next
     mapfile -t A < fn-xl.args
     for i in "${!A[@]}"; do [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536; done
-    HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" \
+    # a *-rocm714 tree was built on /opt/rocm-7.14 and must run on it (the system linker path is 7.2.4)
+    LD=; [[ $b == *rocm714 ]] && LD=/opt/rocm-7.14/lib
+    LD_LIBRARY_PATH=$LD HIP_VISIBLE_DEVICES=0,1 setsid /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" \
       --host 127.0.0.1 --port 8090 > $b.log 2>&1 & SRV=$!
     up=$(wait_up $URL 1200)
   fi

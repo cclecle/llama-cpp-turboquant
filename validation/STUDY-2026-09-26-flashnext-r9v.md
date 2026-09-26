@@ -56,7 +56,18 @@ was run against our v16 (production) and v18 on the same GGUF and the same rig.
   - A decode step goes to PCIe only on a cache miss. Our `:XL` rung reads the routed experts of all 16 offloaded layers from host memory on every step.
   - Its per-step time is 45 ms for 5 verified tokens against our 66 ms for 3.
 - **Prefill:** a WMMA grouped MoE kernel on 4096-token chunks (group 32). Larger chunks amortise streaming the cold experts. We run ub 1024.
-- **To rule out first:** the ROCm version (7.14 vs our 7.2.4). Next step: v18 built against R9V's unpacked ROCm 7.14, same benchmark.
+## ROCm version ruled out
+
+The same v18 source was built against ROCm 7.14, a copy of R9V's `core-7.14` in `/opt/rocm-7.14` (clang 23, `validation/v19-scripts/build-rocm714.sh`). It ran on the 7.14 runtime (`libamdhip64.so.7.14.60850` mapped) with the same benchmark:
+
+| | prefill t/s | decode t/s | acceptance |
+|---|---:|---:|---:|
+| v18, ROCm 7.2.4 | 979 | 37.2 | 62.9% |
+| v18, ROCm 7.14 | **482 (-51%)** | 37.9 | 68.9% |
+
+- The newer ROCm halves our prefill, which matches the user's earlier experience with a newer ROCm. The cause was not investigated (compiler or BLAS path).
+- Decode is unchanged, so ROCm is not R9V's decode lever.
+- **Stay on 7.2.4.** The gap is R9V's design: its expert cache/placement for decode and its grouped prefill kernel.
 
 ## Artefacts
 
