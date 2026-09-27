@@ -141,6 +141,111 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// The same maps for large batches: a block of nwaves waves per expert, wave w scanning the w-th contiguous range of
+// tokens (mm_ids_helper has one wave scan every token: 660 us per call at ubatch 4096). The ranges are merged in
+// order, so every output is the one of mm_ids_helper.
+template <int n_expert_used_template, int nwaves>
+__launch_bounds__(nwaves*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mm_ids_helper_waves(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int n_expert_used = n_expert_used_template;
+    constexpr int neu_padded    = mm_ids_pow2<n_expert_used_template>::value;
+    static_assert(n_expert_used > 0 && neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
+
+    const int expert = blockIdx.x;
+    const int warp   = threadIdx.y;
+    const int lane   = threadIdx.x;
+
+    extern __shared__ char data_mm_ids_helper[];
+    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+    __shared__ int s_prev[nwaves];
+    __shared__ int s_count[nwaves];
+
+    // wave w: tokens [t0, t1), its matches at store[t0 ...] (a token uses an expert at most once)
+    const int per_wave = (n_tokens + nwaves - 1) / nwaves;
+    const int t0 = min(n_tokens, warp*per_wave);
+    const int t1 = min(n_tokens, t0 + per_wave);
+
+    int nex_prev   = 0;
+    int it_compact = 0;
+
+    constexpr int it_step = warp_size/neu_padded;
+    constexpr int n_ahead = 8;
+    const int iex = lane % neu_padded;
+    for (int it00 = t0; it00 < t1; it00 += n_ahead*it_step) {
+        int ahead[n_ahead];
+#pragma unroll
+        for (int u = 0; u < n_ahead; ++u) {
+            const int it = it00 + u*it_step + lane / neu_padded;
+            ahead[u] = (neu_padded == n_expert_used || iex < n_expert_used) && it < t1 ? ids[it*si1 + iex] : INT_MAX;
+        }
+#pragma unroll
+        for (int u = 0; u < n_ahead; ++u) {
+            const int it = it00 + u*it_step + lane / neu_padded;
+
+            const int expert_used = ahead[u];
+            const int iex_used = expert_used == expert ? iex : -1;
+            nex_prev += expert_used < expert;
+
+            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+
+            int it_compact_add_lower = 0;
+#pragma unroll
+            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+                if (lane >= offset) {
+                    it_compact_add_lower += tmp;
+                }
+            }
+
+            if (iex_used != -1) {
+                store[t0 + it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+            }
+
+            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+        }
+    }
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    if (lane == 0) {
+        s_prev[warp]  = nex_prev;
+        s_count[warp] = it_compact;
+    }
+    __syncthreads();
+
+    int nex_total = 0;
+    int base      = 0;
+    int count     = 0;
+#pragma unroll
+    for (int w = 0; w < nwaves; ++w) {
+        nex_total += s_prev[w];
+        base      += w < warp ? s_count[w] : 0;
+        count     += s_count[w];
+    }
+
+    for (int itc = lane; itc < it_compact; itc += warp_size) {
+        const mm_ids_helper_store store_it = store[t0 + itc];
+        const int it       = store_it.it();
+        const int iex_used = store_it.iex_used();
+        const int pos      = nex_total + base + itc;
+        ids_dst[pos] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = pos;
+        } else {
+            ids_src1[pos] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+
+    if (warp != 0 || lane != 0) {
+        return;
+    }
+    expert_bounds[expert] = nex_total;
+    if (expert == static_cast<int>(gridDim.x) - 1) {
+        expert_bounds[gridDim.x] = nex_total + count;
+    }
+}
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -154,9 +259,26 @@ static void launch_mm_ids_helper(
     CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
-    const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
+
+    // large batches: 8 waves per expert over contiguous token ranges (GGML_CUDA_MMID_WAVES=0: one wave)
+    static const bool waves_enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMID_WAVES");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if constexpr (n_expert_used_template != 0) {
+        constexpr int nwaves = 8;
+        if (waves_enabled && n_tokens >= 64*nwaves) {
+            CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper_waves<n_expert_used_template, nwaves>), smpbo);
+            const dim3 block_size_waves(warp_size, nwaves, 1);
+            mm_ids_helper_waves<n_expert_used_template, nwaves><<<num_blocks, block_size_waves, nbytes_shared, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+            return;
+        }
+    }
+
+    const dim3 block_size(warp_size, 1, 1);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }

@@ -10588,6 +10588,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 40, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 260));
 
+    // MUL_MAT_ID at prefill batch sizes (mm_ids_helper over 8 waves per expert from 512 tokens), 10 of 128 experts
+    for (int64_t n : { 512, 1027, 4096 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, false, 64, n, 256));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, true, 64, 1027, 256));
+
     // a greedy draft head (GGML_HINT_ARGMAX_ONLY): the qwen4exp vocabulary half of one device, and an odd row count
     test_cases.emplace_back(new test_mul_mat_argmax_head(GGML_TYPE_Q6_K, 124160, 2560));
     test_cases.emplace_back(new test_mul_mat_argmax_head(GGML_TYPE_Q6_K,  40001, 2560));
