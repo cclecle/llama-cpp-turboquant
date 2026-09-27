@@ -7,7 +7,16 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
+// a 32-lane ballot: RDNA runs this kernel in wave32 (the host enables it on RDNA4 only)
+static __device__ __forceinline__ uint32_t fattn_ballot32(const bool pred) {
+#if defined(GGML_USE_HIP)
+    return (uint32_t) __ballot(pred);
+#else
+    return __ballot_sync(0xFFFFFFFF, pred);
+#endif // defined(GGML_USE_HIP)
+}
+
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -51,7 +60,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
                     selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
                 }
             }
-            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+            selected_warp[item] = fattn_ballot32(selected);
             warp_count += __popc(selected_warp[item]);
         }
 
@@ -103,13 +112,13 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(mask, indices, counts, n_queries, ncols1, n_kv_max, stream);
-    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+    GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
@@ -124,7 +133,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 }
 
 // explicit sparse lists (ggml_flash_attn_ext_add_kv_idx): the lists in the layout the kernel reads, the n_lists counts after them
@@ -161,10 +170,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     if (dst->src[8]) {
         return ncols1 == 1 && ncols2 == 16;
     }
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
     return false;
 #else
+#if defined(GGML_USE_HIP)
+    // RDNA4 (wave32): the mask-derived lists at (8, 8) only, the prefill tile of 12 Q heads per K/V head under a
+    // tensor split. GGML_CUDA_FA_SPARSE=0: dense masked attention
+    static const bool hip_sparse = [] {
+        const char * env = getenv("GGML_CUDA_FA_SPARSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!hip_sparse || !GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc) || ncols1 != 8 || ncols2 != 8) {
+        return false;
+    }
+#endif // defined(GGML_USE_HIP)
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
@@ -176,14 +196,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
-    // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
+    // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that.
+    // On RDNA4 the kernel stops at each list's length, and the lists of 8 neighbouring QSA queries overlap, so
+    // sparse wins from 4096 cells (step 34)
+#if defined(GGML_USE_HIP)
+    constexpr int64_t sparse_min_kv_factor = 0;
+#else
+    constexpr int64_t sparse_min_kv_factor = 2;
+#endif // defined(GGML_USE_HIP)
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    return (GGML_CUDA_CC_IS_AMD(cc) || (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc))) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        K->ne[1] >= std::max<int64_t>(4096, sparse_min_kv_factor*n_gather);
+#endif // !defined(GGML_USE_MUSA)
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -256,6 +283,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if constexpr (DKQ == 256 && DV == 256) {
+#if defined(GGML_USE_HIP)
+        // sparse prefill (the QSA mask with its n_kv_max hint): the lists of 8 queries at (8, 8), ahead of the band
+        if (use_gqa_opt && gqa_ratio > 4 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8>(ctx, dst);
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
         if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
             if (ggml_cuda_fattn_band_wmma_ncols1() == 4) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
