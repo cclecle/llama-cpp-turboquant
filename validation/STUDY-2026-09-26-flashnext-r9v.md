@@ -436,8 +436,9 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 29 | `GGML_ALLOC_PEAK` probe | ub 4096 asked 10.1 GiB/GPU: 7 GiB = 14 device copies of the KQ mask, 2 GiB indexer score + relu |
 | 30 | `ggml_qsa_expand_heads`, mask as is, shared zeros | compute buffer ub 1024 2,533 -> 909 MiB, ub 4096 10,130 -> 3,633 MiB; ub 1024 46.4 -> 46.0 ms/step, prefill 1,178, text identical; **ub 4096 fits: prefill 1,542 at 30.1 GB** |
 | 31 | mm_ids_helper 8 loads ahead; F32 GEMM library; sparse prefill attention | 1,178 -> 1,193, text identical; rocBLAS Tensile (`ROCBLAS_USE_HIPBLASLT=0`) +1% (text changes); `LLAMA_QSA_SPARSE=1024` +4.5% (text changes) |
+| 32-33 | own F32 GEMM (sgemm.cu) | router 1,034 -> 287 us, indexer 6,601 -> 1,795 us, HC 245 -> 123 us; **prefill 1,190 -> 1,280**; new reference text md5 0c8460b131f6183795627bea73282ee2 |
 
-Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb).
+Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2: both texts are coherent and diverge 868 characters in).
 
 Prefill anatomy (32k prompt, ub 1024, per GPU of ~24.7 s busy): mul_mat_q 12.3 s (MoE experts 10.2 s, bound by the
 cold experts' PCIe reads), hipBLAS F32 GEMMs 2.9 s (router 1.0 ms/call at 2.7 TFLOPS on an 8x8-tile kernel, hc_inject
