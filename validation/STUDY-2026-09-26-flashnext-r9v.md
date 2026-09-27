@@ -448,6 +448,7 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 47 | gated delta net: prefetch token t+1's inputs | 1,367-1,369 / 1,913 vs 1,372 / 1,924: no gain, texts identical; the recurrence is bound by its 2 warp reductions per token (a chunked kernel is the fix); reverted |
 | 48 | gated delta net: 4 lanes per state column (32 rows each) from 32 tokens | ub 1024 1,372 -> 1,409, **ub 4096 1,923 -> 2,000 t/s**; reference text e78f5272a0921e576d01dec29e164795 |
 | 49 | one MMQ q8_1 copy per shared activation (2-entry cache) | 1,408-1,412 vs 1,408, 2,008 vs 2,003, +40-150 MB VRAM, texts identical: hits are rare; reverted |
+| 50 | dsv4_hc_post fused into the next grouped RMS norm + weight | fires only where the fusion memory-range check allows (the allocator reuses the buffers); no gain (1,411 vs 1,410, 2,004 vs 2,005), texts identical; reverted |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1; from step 48, with the column-group delta net, e78f5272a0921e576d01dec29e164795: both texts are coherent and diverge 868 characters in).
 
@@ -504,4 +505,38 @@ tokens/step) while every step got slower. Compare ms/step, and tokens/step separ
 Measurement caveat (step 48): when the text changes, ms/step moves by about +-1 ms with the text alone (the same
 build: 45.3 at ub 1024, 47.4 at ub 4096; the delta-net change: +1.2 at ub 1024 and -1.7 at ub 4096 with decode kernels
 untouched). Decode changes need an identical text, or several prompts, to be judged below ~2 ms/step.
+
+## 12. State at the end of the session (2026-09-27) and the worklist
+
+Same config as R9V (MTP 4, greedy, 32k prompt, 65k ctx, 2x R9700, -sm tensor), today's hot set (36.7 GiB):
+
+| | start (step 0) | now | R9V |
+|---|---:|---:|---:|
+| decode ms/step | 68.0 | 45.3-46.6 (text-dependent) | 41 |
+| decode t/s | 41.9 | ~63 | 68.2 |
+| prefill t/s, ub 1024 | 1,053 | 1,410 | - |
+| prefill t/s, ub 4096 | OOM | **2,000** | 1,727 |
+
+With the 44 GiB hot set (step 21): 40.8 ms/step. Reference text md5 (ub 1024, all defaults): e78f5272a0921e576d01dec29e164795.
+
+Switches that restore an earlier path: GGML_CUDA_SGEMM=0, GGML_CUDA_FA_SPARSE=0, GGML_CUDA_GDN_COLS=0,
+GGML_CUDA_MMID_WAVES=0, GGML_CUDA_COARSE_HEAD=0, GGML_CUDA_MM_FLATTEN=0, LLAMA_QSA_FUSED=0 (the unfused indexer),
+GGML_CUDA_MOE_STAGE=1 (the losing prefill staging).
+
+User decisions (measured, no preset changed): ubatch 4096 (+42% prefill over 1024, 30.3 GB peak per card); the
+44 GiB hot set (decode ~40 ms/step; fits with ub 1024 / 2048, not with 4096).
+
+Worklist, in order of expected value:
+1. Chunked gated delta net for prefill (1.26 s of 15.4 s busy per GPU at ub 4096 before step 48; the column-group
+   kernel took part of it): the WY / chunk form turns 64-token blocks into small matrix products.
+2. Fewer passes over the 4-stream hyper-connection residual in prefill (hc_post 0.74 s, hc_pre 0.54, rms_norm 0.67
+   at ub 4096): step 50's fusion is blocked by buffer reuse; a model-level op that combines and normalises in one
+   node would avoid the allocator issue.
+3. Dense MMQ (1.5 s) and the MoE expert MMQ (4.1 s, bound by the cold experts over PCIe: a larger hot set or ubatch).
+4. Fused QSA expand + top-k (drops the [n_kv, ub] f32 expanded scores: -1 GiB at ub 4096, ~0.4% prefill).
+5. Decode: the remaining gap to R9V is mostly VRAM (hot set); in-graph all-gather would allow GPU draft sampling
+   under the tensor split (the CPU sampler costs little, step 39); multi-matrix mat-vec launches for same-input
+   matrices (small).
+6. Cleanup on the rig: /opt/llamacpp/llama-cpp-mine-v19-rocm714 and the /opt/rocm-7.14 symlink,
+   llama-cpp-mine-v19s6, /tmp files; decide what becomes the production build (production is stopped).
 
