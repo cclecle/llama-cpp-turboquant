@@ -438,6 +438,8 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 31 | mm_ids_helper 8 loads ahead; F32 GEMM library; sparse prefill attention | 1,178 -> 1,193, text identical; rocBLAS Tensile (`ROCBLAS_USE_HIPBLASLT=0`) +1% (text changes); `LLAMA_QSA_SPARSE=1024` +4.5% (text changes) |
 | 32-33 | own F32 GEMM (sgemm.cu) | router 1,034 -> 287 us, indexer 6,601 -> 1,795 us, HC 245 -> 123 us; **prefill 1,190 -> 1,280**; new reference text md5 0c8460b131f6183795627bea73282ee2 |
 | 34 | sparse masked FA on RDNA4 (lists per 8 queries) | ub 1024 1,281 -> 1,332; **ub 4096 1,722 -> 1,814 (R9V 1,727)**; reference text 15c95895521e9ee4fc6aa67dc23f6ff1 |
+| 35 | decode anatomy after steps 29-34 | per step (traced): MoE 16.0, dense mat-vec 8.3 (524 calls), RCCL 3.0, draft heads 4 x 418 us, FA 1.5, idle 14.9 ms |
+| 36-38 | coarse-to-exact draft head (`GGML_HINT_ARGMAX_ONLY`), MTP eh_proj as one matrix | head: 46.1 -> 45.3 ms/step at 2.88 tok/step, text identical (R9V's blocks 0,5 lost 3% acceptance; any pair without block 0 keeps it); eh_proj: prefill 1,338 -> 1,355 |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1: both texts are coherent and diverge 868 characters in).
 
@@ -476,4 +478,15 @@ Prefill F32 GEMMs (step 31, `stage_trace.py --kernels`): every one runs a hipBLA
 tile. The router (M 512, N 1024, K 2560) takes 1.0 ms per call at 2.7 TFLOPS, 1.49 s per GPU per 32k prefill; the
 skinny hyper-connection GEMMs (M <= 8 and M = 24, long K) take 216 and 66 us per call, 0.8 s per GPU. rocBLAS's own
 Tensile kernels are no better (+1%), so these need our own kernels.
+
+Draft head (steps 36-38). The MTP draft head computed the full Q6_K vocabulary half per device (418 us) for a
+single-token greedy draft. With `GGML_HINT_ARGMAX_ONLY` the backend ranks every row with 2 of its 10 Q6_K blocks,
+computes the exact dot product for the best 8,192 rows per device and returns -inf for the others; under the tensor
+split each device keeps its own best rows, so no cross-device merge is needed. The verify head stays exact, and the
+text is byte-identical in every arm: only draft tokens can change. Every row exact (q8_1 input) keeps 2.89
+tokens/step, so the rounding is harmless; the ranking blocks matter: R9V's 0,5 dropped acceptance to 2.79-2.84, and
+every pair without block 0 (1,6 2,7 3,7 3,8 4,9) keeps 2.87-2.88. Default 2,7 with 8,192 rows.
+
+The MTP eh_proj multiplies an unbatched [5120 -> 2560] weight with [5120, 4 streams, n_tokens]: the batched
+mat-vec read the weight once per token (12 ms per 1024-token ubatch). One matrix of 4*n_tokens columns instead.
 
