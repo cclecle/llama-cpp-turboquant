@@ -87,6 +87,26 @@ if sys.argv[1] == '--timeline':
         print(f'{(t - t0)/1e6:9.2f} ms  {kind:5s} {txt}')
     sys.exit(0)
 
+if sys.argv[1] == '--kernels':
+    # stage_trace.py --kernels <prof dir> <agent> <regex>: the matching kernels inside the prefill window by full name
+    # and grid: count, total, mean
+    rows, cps = load(sys.argv[2])
+    ag = sys.argv[3]; rx = re.compile(sys.argv[4])
+    mm = [r for r in rows if 'mul_mat_q<' in r['Kernel_Name']]
+    first = min(int(r['Start_Timestamp']) for r in mm)
+    last = max(int(r['End_Timestamp']) for r in mm)
+    by = collections.defaultdict(lambda: [0, 0])
+    for r in rows:
+        s, e = int(r['Start_Timestamp']), int(r['End_Timestamp'])
+        if r['Agent_Id'] != ag or not (first <= s <= last) or not rx.search(r['Kernel_Name']):
+            continue
+        key = (r['Kernel_Name'][:110], r.get('Grid_Size_X', '?'), r.get('Grid_Size_Y', '?'), r.get('Grid_Size_Z', '?'),
+               r.get('Workgroup_Size_X', '?'))
+        by[key][0] += 1; by[key][1] += e - s
+    for key, (n, t) in sorted(by.items(), key=lambda kv: -kv[1][1])[:20]:
+        print(f'{t/1e9:7.3f} s {n:6d} x {t/n/1e3:8.1f} us  grid {key[1]}x{key[2]}x{key[3]} wg {key[4]}  {key[0]}')
+    sys.exit(0)
+
 if sys.argv[1] == '--ubatch':
     # stage_trace.py --ubatch <prof dir> <agent> <expert mmq per ubatch>: per ubatch (every n-th expert mul_mat_q) the
     # wall time and the idle time, and where in the ubatch (expert mmq index) the idle gaps sit

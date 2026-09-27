@@ -70,34 +70,46 @@ static __global__ void mm_ids_helper(
         // Implementation optimized for specific numbers of experts used:
         // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
         static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
-        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
-            const int it = it0 + threadIdx.x / neu_padded;
-
-            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-                ids[it*si1 + iex] : INT_MAX;
-            const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
-
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
-
-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
-            int it_compact_add_lower = 0;
+        // the loop is bound by the latency of its one load per step: load n_ahead steps' ids first. A step past
+        // n_tokens reads INT_MAX, which changes nothing below.
+        constexpr int it_step = warp_size/neu_padded;
+        constexpr int n_ahead = 8;
+        const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
+        for (int it00 = 0; it00 < n_tokens; it00 += n_ahead*it_step) {
+            int ahead[n_ahead];
 #pragma unroll
-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-                    it_compact_add_lower += tmp;
+            for (int u = 0; u < n_ahead; ++u) {
+                const int it = it00 + u*it_step + threadIdx.x / neu_padded;
+                ahead[u] = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ? ids[it*si1 + iex] : INT_MAX;
+            }
+#pragma unroll
+            for (int u = 0; u < n_ahead; ++u) {
+                const int it = it00 + u*it_step + threadIdx.x / neu_padded;
+
+                const int expert_used = ahead[u];
+                const int iex_used = expert_used == expert ? iex : -1;
+                nex_prev += expert_used < expert;
+
+                // Whether the threads at this token position have used the expert:
+                const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+
+                // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
+                int it_compact_add_lower = 0;
+#pragma unroll
+                for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+                    const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+                    if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+                        it_compact_add_lower += tmp;
+                    }
                 }
-            }
 
-            if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
-            }
+                if (iex_used != -1) {
+                    store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                }
 
-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+                // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
+                it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            }
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
