@@ -9,6 +9,8 @@
 # Prompt caching is turned off per request ("cache_prompt": false; vLLM ignores the field), so the repeat is a
 # real prefill.
 # BENCH_SAVE_TEXT=<file>: also write the generated text (reasoning + answer) there, to read it for sanity.
+# BENCH_SERVER_SAMPLING=1: send no temperature, so the server's own sampling (the preset's) applies.
+# BENCH_RUNS=N: N measured requests, one result line each (sampled runs differ: pool them).
 import json, os, sys, time, urllib.request
 
 base, model, prompt_file, label, out = sys.argv[1:6]
@@ -34,6 +36,8 @@ def metrics():
 def run(text, n):
     body = {'model': model, 'messages': [{'role': 'user', 'content': text}], 'max_tokens': n, 'temperature': 0,
             'stream': True, 'stream_options': {'include_usage': True}, 'cache_prompt': False}
+    if os.environ.get('BENCH_SERVER_SAMPLING') == '1':
+        del body['temperature']
     req = urllib.request.Request(base + '/v1/chat/completions', json.dumps(body).encode(),
                                  {'Content-Type': 'application/json'})
     t0 = time.time()
@@ -69,25 +73,28 @@ if warmup:
 if warmup >= 2:
     w = run(prompt, max_tokens)
     print('warm-up run: ttft %.2f s, %d prompt tokens' % (w[1] - w[0], (w[3] or {}).get('prompt_tokens', 0)))
-m0 = metrics()
-t0, t_first, t_last, usage, timings, finish, n_chunks, chars = run(prompt, max_tokens)
-m1 = metrics()
-pt, ct = usage.get('prompt_tokens'), usage.get('completion_tokens')
-ttft = t_first - t0
-dec = (ct - 1) / (t_last - t_first) if ct and ct > 1 and t_last > t_first else None
-res = {'label': label, 'prompt_tokens': pt, 'completion_tokens': ct, 'finish': finish, 'ttft_s': round(ttft, 3),
-       'prefill_tps': round(pt / ttft, 1) if pt else None, 'decode_tps': round(dec, 2) if dec else None,
-       'total_s': round(t_last - t0, 2), 'chunks': n_chunks, 'chars': chars}
-if timings:
-    res['server'] = {k: timings.get(k) for k in ('prompt_n', 'prompt_ms', 'prompt_per_second', 'predicted_n',
-                                                 'predicted_ms', 'predicted_per_second', 'draft_n', 'draft_n_accepted')}
-    if timings.get('draft_n'):
-        res['accept'] = round(timings['draft_n_accepted'] / timings['draft_n'], 3)
-spec = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
-if spec:
-    res['vllm_spec'] = spec
-    drafts = spec.get('vllm:spec_decode_num_draft_tokens_total')
-    if drafts:
-        res['accept'] = round(spec.get('vllm:spec_decode_num_accepted_tokens_total', 0) / drafts, 3)
-print(json.dumps(res))
-open(out, 'a').write(json.dumps(res) + '\n')
+n_runs = int(os.environ.get('BENCH_RUNS', '1'))
+for i_run in range(n_runs):
+    run_label = label if n_runs == 1 else '%s-r%d' % (label, i_run + 1)
+    m0 = metrics()
+    t0, t_first, t_last, usage, timings, finish, n_chunks, chars = run(prompt, max_tokens)
+    m1 = metrics()
+    pt, ct = usage.get('prompt_tokens'), usage.get('completion_tokens')
+    ttft = t_first - t0
+    dec = (ct - 1) / (t_last - t_first) if ct and ct > 1 and t_last > t_first else None
+    res = {'label': run_label, 'prompt_tokens': pt, 'completion_tokens': ct, 'finish': finish, 'ttft_s': round(ttft, 3),
+           'prefill_tps': round(pt / ttft, 1) if pt else None, 'decode_tps': round(dec, 2) if dec else None,
+           'total_s': round(t_last - t0, 2), 'chunks': n_chunks, 'chars': chars}
+    if timings:
+        res['server'] = {k: timings.get(k) for k in ('prompt_n', 'prompt_ms', 'prompt_per_second', 'predicted_n',
+                                                     'predicted_ms', 'predicted_per_second', 'draft_n', 'draft_n_accepted')}
+        if timings.get('draft_n'):
+            res['accept'] = round(timings['draft_n_accepted'] / timings['draft_n'], 3)
+    spec = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
+    if spec:
+        res['vllm_spec'] = spec
+        drafts = spec.get('vllm:spec_decode_num_draft_tokens_total')
+        if drafts:
+            res['accept'] = round(spec.get('vllm:spec_decode_num_accepted_tokens_total', 0) / drafts, 3)
+    print(json.dumps(res))
+    open(out, 'a').write(json.dumps(res) + '\n')

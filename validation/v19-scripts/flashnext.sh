@@ -12,6 +12,7 @@
 # FN_UB: override the rung's ubatch (and raise the batch to at least it); FN_ARGS: another args file;
 # FN_LD: LD_LIBRARY_PATH for a copied build (llama-cpp-mine-<name>/build3/bin copied out of a tree).
 # FN_LOAD_ONLY=1: load the server and stop it again (no benchmark), e.g. to read its load log.
+# FN_CTX: the context size (default 65536).
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
 FN_ENV=${FN_ENV:-X=0}; FN_TAG=${FN_TAG:-}
@@ -61,7 +62,7 @@ for b in $BACKENDS; do
     URL=http://127.0.0.1:8090; MODEL=Qwen3.8-Flash-Next
     mapfile -t A < ${FN_ARGS:-fn-xl.args}
     for i in "${!A[@]}"; do
-      [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536
+      [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=${FN_CTX:-65536}
       [ -n "${FN_UB:-}" ] && [ "${A[$i]}" = --ubatch-size ] && A[$((i + 1))]=$FN_UB
       [ -n "${FN_UB:-}" ] && [ "${A[$i]}" = --batch-size ] && [ "${A[$((i + 1))]}" -lt "$FN_UB" ] && A[$((i + 1))]=$FN_UB
     done
