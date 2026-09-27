@@ -261,7 +261,8 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 /* gated ops */
 
 template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+        block_q8_1 * q8_out, const int q8_row_blocks) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -274,18 +275,30 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
     ggml_cuda_pdl_sync();
-    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+    const T v = (T)(op((float)x[j0]) * (float)g[j1]);
+    dst[i] = v;
+    // q8_out (F32 only): the q8_1 copy for the mat-vecs that follow (n % 32 == 0: a warp holds one block of one row)
+    if constexpr (std::is_same_v<T, float>) {
+        if (q8_out) {
+            quantize_q8_1_warp32(v, q8_out + (i / n)*q8_row_blocks + (i % n)/QK8_1, (i % n) % QK8_1);
+        }
+    } else {
+        GGML_UNUSED_VARS(q8_out, q8_row_blocks);
+    }
 }
 
 template <float (*op)(float), typename T>
-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream,
+        block_q8_1 * q8_out = nullptr) {
+    static_assert(CUDA_GLU_BLOCK_SIZE % QK8_1 == 0, "whole q8_1 blocks per warp");
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1,
+        q8_out, (int) (GGML_PAD(n, MATRIX_ROW_PADDING)/QK8_1));
 }
 
 template <float (*op)(float)>
-void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out = nullptr) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     void * src0_d = src0->data;
@@ -334,7 +347,34 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
-        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream,
+            (block_q8_1 *) q8_out);
+    }
+}
+
+bool ggml_cuda_glu_q8_supported(const ggml_tensor * dst) {
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU:
+        case GGML_GLU_OP_GEGLU:
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF:
+        case GGML_GLU_OP_GEGLU_QUICK:
+            return dst->type == GGML_TYPE_F32 && dst->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+                dst->ne[0] % QK8_1 == 0;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_op_glu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out) {
+    GGML_ASSERT(ggml_cuda_glu_q8_supported(dst));
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU:       ggml_cuda_op_unary_gated<op_relu>(ctx, dst, q8_out);       break;
+        case GGML_GLU_OP_GEGLU:       ggml_cuda_op_unary_gated<op_gelu>(ctx, dst, q8_out);       break;
+        case GGML_GLU_OP_SWIGLU:      ggml_cuda_op_unary_gated<op_silu>(ctx, dst, q8_out);       break;
+        case GGML_GLU_OP_GEGLU_ERF:   ggml_cuda_op_unary_gated<op_gelu_erf>(ctx, dst, q8_out);   break;
+        case GGML_GLU_OP_GEGLU_QUICK: ggml_cuda_op_unary_gated<op_gelu_quick>(ctx, dst, q8_out); break;
+        default: GGML_ABORT("unsupported glu op");
     }
 }
 

@@ -126,3 +126,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// A gated unary op (F32, rows of a multiple of 32) that also writes the q8_1 copy of its output (ggml_cuda_q8_1_reuse_produce)
+bool ggml_cuda_glu_q8_supported(const ggml_tensor * dst);
+void ggml_cuda_op_glu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out);

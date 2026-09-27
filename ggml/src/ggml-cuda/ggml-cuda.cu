@@ -3995,6 +3995,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // single ops that also write the q8_1 copy of their output for the quantized mat-vecs that follow; decided before
+    // the copy is registered, since a registered copy must be written (-1: node i computed alone)
+    if ((node->op == GGML_OP_DSV4_HC_PRE && node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % QK8_1 == 0) ||
+            (node->op == GGML_OP_GLU && ggml_cuda_glu_q8_supported(node))) {
+        if (void * q8 = ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i)) {
+            if (node->op == GGML_OP_DSV4_HC_PRE) {
+                ggml_cuda_op_dsv4_hc_pre(*cuda_ctx, node, q8);
+            } else {
+                ggml_cuda_op_glu_q8(*cuda_ctx, node, q8);
+            }
+            return -1;
+        }
+    }
+
     if (node->op == GGML_OP_CPY) {
         ggml_tensor * cpys[GGML_CUDA_CPY_MULTI_MAX];
         int n_cpys = 0;
@@ -4925,8 +4939,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // the nodes a fusion consumed after node i; -1: node i was computed alone
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                if (nodes_to_skip < 0) {
+                    continue;
+                }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
