@@ -540,3 +540,14 @@ Worklist, in order of expected value:
 6. Cleanup on the rig: /opt/llamacpp/llama-cpp-mine-v19-rocm714 and the /opt/rocm-7.14 symlink,
    llama-cpp-mine-v19s6, /tmp files; decide what becomes the production build (production is stopped).
 
+## 13. The Flash-Next ladder retuned on v19 (2026-09-27, interactive with the user)
+
+The method and the full table are in `validation/PLAYBOOK-rung-tuning.md`. Summary: every rung uses tiered experts
+and MTP n-max 3 + the n-gram drafters; :XL 1 x 262k (36.7 GiB, ub 1408), :L 1 x 196k (36.7 GiB, ub 2048), :M 2 x
+131k (36.7 GiB, ub 1408; the 128k single-slot :M with 40 GiB / ub 2240 kept commented out), :S 3 x 65k (40 GiB,
+ub 2304), and the :VISION variants with hot set and ubatch cut until card 0 (which holds the mmproj) has ~1 GB free.
+Findings: `-nckvc` is refused for qwen4exp; MTP n-max 3 beats 2 by 6% at temperature 0 and ties at the preset's 0.6;
+the vision encoder costs +1.27 GB on card 0 only; production prefill ran at 540 t/s until `checkpoint-min-step`
+went from 1024 to 2048 (1,650-1,700 t/s), a cost the benchmark missed because it sent `cache_prompt: false`.
+Config store commits: e2790a5, 6d9c1ac, d44b40c, 7337b7d, be87b45.
+

@@ -241,3 +241,49 @@ Rules that follow:
 6. Speed: A B B A on the server metric (ms per step), with an env toggle per change.
 7. Confirm in a new trace that the change did what was intended. Twice here it had not: a fusion missing from the
    whitelist, and a build that had failed.
+
+## 13. Lessons of steps 29-50 (2026-09-27): what won, what lost, and why
+
+What won:
+
+- **Do not trust the library for odd shapes.** hipBLASLt ran every F32 GEMM of the prefill on 8x8 / 16x16 macro
+  tiles on gfx1201 (router 512 x 1024 x 2560 at 2.7 TFLOPS). A plain register-tiled SGEMM (`sgemm.cu`: 64 x 64 tile,
+  4 x 4 per thread, float4 loads with a register prefetch) was 3.6x faster. Two details matter:
+  - deterministic split-k (partials summed in split order) for short, wide shapes, so the result does not depend on
+    scheduling;
+  - a tile height that follows M (16 / 32 / 64 rows), or a 4-row matrix wastes most of its FMAs.
+- **Look for upstream paths gated off for HIP.** The sparse masked flash attention was NVIDIA-only; the port needed
+  only a 32-lane ballot (`__ballot` on HIP returns 64 bits) and an RDNA4 threshold (NVIDIA's gate wanted a context of
+  twice the worst-case union; our kernel stops at each list's length). +5% prefill.
+- **One wave per X doing a long serial scan is latency-bound.** `mm_ids_helper` gave each expert one wave that scanned
+  every route (660 us at 4096 tokens). Eight waves over contiguous token ranges, merged in order, keep every output
+  identical and run ~8x faster.
+- **Recurrences: count what bounds them.** Prefetching the next token's inputs in the gated delta net changed
+  nothing: the loop was bound by its two 5-step warp sums per token, not by loads. Remapping to 4 lanes per state
+  column with 32 contiguous rows each (2 shuffle steps, float4 rows) gave +3-4% prefill.
+- **A weight shared across channels must not go through a batched mat-vec**, which reads it once per channel
+  (12 ms per ubatch for the MTP eh_proj). Flatten to one matrix of all columns; route through a reshape view of the
+  real tensor so view-root caches still see it.
+- **Coarse-to-exact for an argmax-only output** (`GGML_HINT_ARGMAX_ONLY`): rank rows with a partial dot product, exact
+  for the best rows. Under a tensor split each device ranks its own rows. The ranking blocks must be chosen by
+  measurement: R9V's blocks 0,5 lost 3% draft acceptance on this model, any pair without block 0 kept it.
+
+What lost, and why:
+
+- **Perf loops lie about memory-bound kernels.** An 8 MB matrix stays in the 64 MB infinity cache in
+  `test-backend-ops perf` (attn_gate 13 us there, 25 us in the decode trace). Four waves per row looked fine in the
+  loop and lost 2-3 ms per step in real decode.
+- **Flash-decoding with lane = 8 dims** (12 warp reductions per cell, one block per list chunk) lost to the mma
+  kernel at 5 queries (76 vs 57 us): per-block fixed costs and per-cell reductions against matrix cores.
+- **Sharing one MMQ q8_1 copy** between consumers of an activation: correct, but hits were rare (+0.25%), for up to
+  150 MB of VRAM.
+- **A combine fused into the next norm** (dsv4_hc_post -> rms_norm -> mul) fired only where the fusion memory-range
+  check allowed it: the allocator reuses those buffers.
+
+Traps:
+
+- `ggml_cuda_kernel_launch` passes every argument explicitly: adding a parameter with a default to a kernel breaks
+  every launch site.
+- Shell heredocs and nested Python strings turn `\x00` or `\x89` into real bytes: build byte strings with
+  `bytes([...])`, or write edit scripts to a file.
+- A tokens/s gain with a changed text can be an acceptance gain while every step got slower: read ms/step.
