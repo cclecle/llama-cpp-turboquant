@@ -177,6 +177,188 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+static __device__ __forceinline__ uint64_t top_k_ballot(const bool pred) {
+    return __ballot(pred);
+}
+
+// One block per row for rows of up to TOP_K_ROW_THREADS*e_max columns. The row is loaded once into registers as
+// order-preserving keys, four 8-bit radix passes find the k-th largest key with shared-memory histograms (one per
+// warp), and the selected columns are written in ascending column order, the ties at the threshold taking the lowest
+// columns. One launch instead of the eleven of the multi-block path, and the same list on every run: that path
+// writes through atomic counters, so the order of the list (and which of the tied columns are kept) changed from run
+// to run, and the sparse QSA attention accumulates its cells in list order (a different greedy text on every load).
+// Warp w owns the columns [w*e*warp_size, (w+1)*e*warp_size), element i of a lane is column
+// w*e*warp_size + i*warp_size + lane (e = ceil(ncols / TOP_K_ROW_THREADS)), so the reads stay coalesced and column
+// order is warp, then element, then lane.
+#define TOP_K_ROW_THREADS 1024
+
+template <int e_max>
+static __global__ void __launch_bounds__(TOP_K_ROW_THREADS, 1) top_k_row(
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = TOP_K_ROW_THREADS / warp_size;
+    constexpr int NBINS     = 256;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int         * row_dst = dst + (size_t) blockIdx.x * k;
+
+    __shared__ int hist[nwarps][NBINS];
+    __shared__ int bins[NBINS];
+    __shared__ int warp_counts[nwarps];
+    __shared__ int s_bin;
+    __shared__ int s_rank;
+
+    const int e    = (ncols + TOP_K_ROW_THREADS - 1) / TOP_K_ROW_THREADS;
+    const int base = warp*e*warp_size + lane;
+
+    uint32_t key[e_max];
+#pragma unroll
+    for (int i = 0; i < e_max; ++i) {
+        const int col = base + i*warp_size;
+        key[i] = i < e && col < ncols ? top_k_float_to_ordered(row_src[col]) : 0;
+    }
+    const auto valid = [&](const int i) {
+        return i < e && base + i*warp_size < ncols;
+    };
+
+    // the k-th largest key, 8 bits per pass; rank = how many keys equal to the prefix so far are still needed
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      rank   = k;
+    for (int shift = 32 - 8; shift >= 0; shift -= 8) {
+        for (int j = tid; j < nwarps*NBINS; j += TOP_K_ROW_THREADS) {
+            (&hist[0][0])[j] = 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < e_max; ++i) {
+            if (valid(i) && (key[i] & pmask) == prefix) {
+                atomicAdd(&hist[warp][(key[i] >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+        if (tid < NBINS) {
+            int c = 0;
+#pragma unroll
+            for (int w = 0; w < nwarps; ++w) {
+                c += hist[w][tid];
+            }
+            bins[tid] = c;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            // lane l holds the bins 255 - l*per_lane ... from the top; the crossing lane walks its bins
+            constexpr int per_lane = NBINS / warp_size;
+            int local[per_lane];
+            int sum = 0;
+#pragma unroll
+            for (int j = 0; j < per_lane; ++j) {
+                local[j] = bins[NBINS - 1 - (lane*per_lane + j)];
+                sum += local[j];
+            }
+            const int incl = warp_prefix_inclusive_sum<int, warp_size>(sum);
+            const int excl = incl - sum;
+            if (excl < rank && rank <= incl) {
+                int acc = excl;
+#pragma unroll
+                for (int j = 0; j < per_lane; ++j) {
+                    if (acc + local[j] >= rank) {
+                        s_bin  = NBINS - 1 - (lane*per_lane + j);
+                        s_rank = rank - acc;
+                        break;
+                    }
+                    acc += local[j];
+                }
+            }
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_bin << shift;
+        pmask  |= (uint32_t) (NBINS - 1) << shift;
+        rank    = s_rank;
+        __syncthreads();
+    }
+    const uint32_t thr = prefix;
+
+    const uint64_t lanes_below = (((uint64_t) 1) << lane) - 1;
+
+    // the ties before each warp (column order), then the selected columns before each warp
+    int n_eq = 0;
+#pragma unroll
+    for (int i = 0; i < e_max; ++i) {
+        n_eq += __popcll(top_k_ballot(valid(i) && key[i] == thr));
+    }
+    if (lane == 0) {
+        warp_counts[warp] = n_eq;
+    }
+    __syncthreads();
+    int eq_run = 0;
+    for (int w = 0; w < warp; ++w) {
+        eq_run += warp_counts[w];
+    }
+    __syncthreads();
+
+    const int eq_base = eq_run;
+    int n_sel = 0;
+#pragma unroll
+    for (int i = 0; i < e_max; ++i) {
+        const bool     eq    = valid(i) && key[i] == thr;
+        const uint64_t m_eq  = top_k_ballot(eq);
+        const bool     sel   = (valid(i) && key[i] > thr) || (eq && eq_run + __popcll(m_eq & lanes_below) < rank);
+        n_sel  += __popcll(top_k_ballot(sel));
+        eq_run += __popcll(m_eq);
+    }
+    if (lane == 0) {
+        warp_counts[warp] = n_sel;
+    }
+    __syncthreads();
+    int pos = 0;
+    for (int w = 0; w < warp; ++w) {
+        pos += warp_counts[w];
+    }
+
+    eq_run = eq_base;
+#pragma unroll
+    for (int i = 0; i < e_max; ++i) {
+        const bool     eq    = valid(i) && key[i] == thr;
+        const uint64_t m_eq  = top_k_ballot(eq);
+        const bool     sel   = (valid(i) && key[i] > thr) || (eq && eq_run + __popcll(m_eq & lanes_below) < rank);
+        const uint64_t m_sel = top_k_ballot(sel);
+        if (sel) {
+            row_dst[pos + __popcll(m_sel & lanes_below)] = base + i*warp_size;
+        }
+        pos    += __popcll(m_sel);
+        eq_run += __popcll(m_eq);
+    }
+}
+
+// false when the row is too long for top_k_row
+static bool top_k_row_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TOP_K_ROW"); // 0: always the multi-block radix select
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const int e = (ncols + TOP_K_ROW_THREADS - 1) / TOP_K_ROW_THREADS;
+    if (!enabled || e > 64) {
+        return false;
+    }
+    const dim3 grid(nrows);
+    const dim3 block(TOP_K_ROW_THREADS);
+    if (e <= 8) {
+        top_k_row<8><<<grid, block, 0, stream>>>(src, dst, ncols, k);
+    } else if (e <= 16) {
+        top_k_row<16><<<grid, block, 0, stream>>>(src, dst, ncols, k);
+    } else if (e <= 32) {
+        top_k_row<32><<<grid, block, 0, stream>>>(src, dst, ncols, k);
+    } else {
+        top_k_row<64><<<grid, block, 0, stream>>>(src, dst, ncols, k);
+    }
+    return true;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
@@ -260,7 +442,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        if (!top_k_row_cuda(src0_d, dst_d, ncols, nrows, k, stream)) {
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        }
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
