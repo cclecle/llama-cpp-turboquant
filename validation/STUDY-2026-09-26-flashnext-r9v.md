@@ -540,6 +540,29 @@ Worklist, in order of expected value:
 6. Cleanup on the rig: /opt/llamacpp/llama-cpp-mine-v19-rocm714 and the /opt/rocm-7.14 symlink,
    llama-cpp-mine-v19s6, /tmp files; decide what becomes the production build (production is stopped).
 
+R9V distillation: what of R9V's engine was ported, and what is left. R9V's kernels are in
+`/mnt/gguf/r9v/src/runtimes/qwen38-flash-next-gfx1201-v1/retained-mtp4/kernels/` on the rig.
+
+| R9V technique (kernel) | status |
+|---|---|
+| tiered experts with a catalog-ranked hot set (`tiered_iq_moe_hip.cu`) | ported (`moe-tiered.cu`, `moe_hotset.py` on R9V's catalog) |
+| 4096-token prefill chunks | done as ubatch 4096 (it fits since step 30) |
+| sparse QSA attention from the indexer's top-k | ported (decode lists, step 7; prefill mask lists, step 34) |
+| deterministic decode | done (one-kernel top-k, step 14) |
+| coarse-to-exact draft head (`draft_indexed_q6.cu`) | ported (step 36-38; R9V's ranking blocks lost acceptance here, blocks 2,7 used) |
+| **dense verify mat-vecs reading the weights once for 5 tokens (`dense_mmvq_hip.cu`, `q8_mmvq5.cu`)** | **left**: the biggest decode gap (8.3 ms, 524 calls per step vs R9V 3.9 ms, 192 calls); ours already reads the weights once per call, so the gap is call count and DRAM efficiency (~55%): study R9V's grouping of matrices per launch |
+| **fused hyper-connection mat-vec / mix (`hc_mmq4.cu`, `hc_mixmmq4.cu`, `hc_mixmmq45.cu`)** | **left**: ours runs hc down / up / inject as separate mat-vecs plus hc_pre / hc_post (~2 ms per step, ~200 launches) |
+| **WMMA grouped MoE for prefill (`r9v_moe_wmma.cu`)** | **left**: our expert MMQ is 4.1 s per GPU at ub 4096, partly the cold experts over PCIe |
+| **LRU expert cache in VRAM (`cache80_prepare.cu`, `cache192_prepare.cu`)** | **left, needs the user's approval** (copies of experts in VRAM, against the one-residency rule) |
+| **dedicated sparse decode attention (~14 us per call vs our ~57 us)** | **left**: a lane-per-dims flash-decoding kernel lost (step 43); R9V's kernel should be read before a second try |
+| **the rank-weighted draft (`draft_w2_rank.cu`)** | **left, not studied** |
+| block-FP8 MTP head | **left, not measured** (our head is Q8_0 / Q6_K) |
+| in-graph all-reduce | not needed: the AR wait was the uneven MoE split (fixed, step 7) |
+
+Our own open items from the same campaign: `-nckvc` for qwen4exp (host KV headroom on its rungs), a
+`checkpoint-min-step 4096` test (prefill with prompt caching), the chunked gated delta net (the rdna-boosts block 02
+patch is in `validation/rdna-boosts-patches/`), and in-graph all-gather for GPU draft sampling under the tensor split.
+
 ## 13. The Flash-Next ladder retuned on v19 (2026-09-27, interactive with the user)
 
 The method and the full table are in `validation/PLAYBOOK-rung-tuning.md`. Summary: every rung uses tiered experts
