@@ -13,6 +13,7 @@
 # FN_LD: LD_LIBRARY_PATH for a copied build (llama-cpp-mine-<name>/build3/bin copied out of a tree).
 # FN_LOAD_ONLY=1: load the server and stop it again (no benchmark), e.g. to read its load log.
 # FN_CTX: the context size (default 65536).
+# FN_IMAGE=1: after the benchmark, one request with a 1344x1344 image (a vision rung's encoder peak).
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
 FN_ENV=${FN_ENV:-X=0}; FN_TAG=${FN_TAG:-}
@@ -78,6 +79,22 @@ for b in $BACKENDS; do
     :
   elif [[ $up =~ ^[0-9]+$ ]]; then
     BENCH_SAVE_TEXT=$b$FN_TAG.answer.txt python3 openai_bench.py $URL $MODEL prompt-32k.txt $b$FN_TAG results.jsonl 2048 ${FN_WARM:-2}
+    if [ "${FN_IMAGE:-0}" = 1 ]; then
+      python3 - $URL $MODEL <<'PY2'
+import base64, json, sys, time, urllib.request, zlib, struct
+w = h = 1344
+raw = b''.join(bytes([0]) + bytes(((x * 7 + y * 13) ^ (x * y)) & 255 for x in range(w * 3)) for y in range(h))
+def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+png = bytes([137, 80, 78, 71, 13, 10, 26, 10]) + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b'')
+url = 'data:image/png;base64,' + base64.b64encode(png).decode()
+body = {'model': sys.argv[2], 'max_tokens': 32, 'temperature': 0, 'messages': [{'role': 'user', 'content': [
+    {'type': 'text', 'text': 'Describe this image in one sentence.'}, {'type': 'image_url', 'image_url': {'url': url}}]}]}
+t0 = time.time()
+r = json.load(urllib.request.urlopen(urllib.request.Request(sys.argv[1] + '/v1/chat/completions', json.dumps(body).encode(),
+    {'Content-Type': 'application/json'}), timeout=600))
+print('image request: %.1f s, prompt tokens %s' % (time.time() - t0, r.get('usage', {}).get('prompt_tokens')))
+PY2
+    fi
   else
     tail -30 $b$FN_TAG.log
   fi
