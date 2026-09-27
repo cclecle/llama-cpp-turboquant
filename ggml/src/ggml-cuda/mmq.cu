@@ -335,22 +335,24 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
-    // tiered experts (moe-tiered.cuh): per-expert base addresses
-    args.x_table = (const char * const *) ggml_cuda_tiered_table(src0);
+    // tiered experts (moe-tiered.cuh): per-expert base addresses, the cold ones staged in VRAM for a prefill ubatch
+    args.x_table = (const char * const *) ggml_cuda_tiered_table_prefill(src0, ne12, stream);
 
     if (gate) {
         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
         mmq_args args_gate = args;
         args_gate.x_gate    = (const char *) gate->data;
-        args_gate.x_gate_table = (const char * const *) ggml_cuda_tiered_table(gate);
+        args_gate.x_gate_table = (const char * const *) ggml_cuda_tiered_table_prefill(gate, ne12, stream);
         GGML_ASSERT((args_gate.x_table == nullptr) == (args_gate.x_gate_table == nullptr));
         args_gate.glu_op    = ggml_get_glu_op(glu);
         args_gate.glu_limit = ggml_get_op_params_f32(glu, 3);
         ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream);
+        ggml_cuda_tiered_prefill_launched(src0, ne12, stream);
         return;
     }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_tiered_prefill_launched(src0, ne12, stream);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

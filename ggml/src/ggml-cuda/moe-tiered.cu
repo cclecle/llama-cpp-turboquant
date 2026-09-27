@@ -129,11 +129,91 @@ struct tiered_tensor {
     size_t  expert_bytes = 0;
     int64_t n_expert     = 0;
     size_t  n_hot        = 0;
+    size_t  cold_size    = 0;                 // bytes of the cold block (with its row padding)
+    int     device       = -1;
+    int     layer        = -1;                // blk.<layer>, -1 if the name has none
+    bool    is_down      = false;             // ffn_down_exps: the last expert matmul of its layer
+    const void ** d_table_staged[4] = {};     // per staging area: the table with the cold experts there (prefill)
 
     bool  hot(int64_t e)            const { return slot[e] >= 0; }
     char * host(int64_t e)          const { return cold_host + (size_t) (-1 - slot[e])*expert_bytes; }
     char * dev(int64_t e)           const { return (char *) h_table[e]; }
 };
+
+// Prefill staging (see ggml_cuda_tiered_table_prefill). The tiered tensors of every device, and per device the
+// staging area, its copy stream and the layer it holds.
+struct stage_member {
+    tiered_tensor * t;
+    size_t          off;   // in the staging area
+};
+
+struct stage_state {
+    static constexpr int max_areas = 4;
+    std::mutex mutex;
+    std::vector<tiered_tensor *> tensors;      // registered at init
+    bool         ready   = false;              // set up (or failed: n_areas == 0)
+    int          n_areas = 0;                  // staging areas, each one layer's cold experts (GGML_CUDA_MOE_STAGE_AREAS)
+    std::vector<int> layers;                   // the layers with cold experts, ascending
+    std::map<int, std::vector<stage_member>> members;
+    size_t       size   = 0;                   // of one area
+    char *       buf    = nullptr;             // n_areas areas
+    void **      tables = nullptr;             // the staged tables of all tensors for every area, one allocation
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  ev_staged  [max_areas] = {};  // after the copies into the area
+    cudaEvent_t  ev_released[max_areas] = {};  // after the last expert matmul that read the area
+    bool         released   [max_areas] = {};  // ev_released holds a matmul the next copy has to wait for
+    int          area_layer [max_areas];       // the layer an area holds or is being filled with, -1 free
+
+    int area_of(int layer) const {
+        for (int a = 0; a < n_areas; ++a) {
+            if (area_layer[a] == layer) {
+                return a;
+            }
+        }
+        return -1;
+    }
+};
+
+stage_state g_stage[GGML_CUDA_MAX_DEVICES];
+
+struct stage_state_init {
+    stage_state_init() {
+        for (auto & st : g_stage) {
+            for (int a = 0; a < stage_state::max_areas; ++a) {
+                st.area_layer[a] = -1;
+            }
+        }
+    }
+} g_stage_init;
+
+// back to "not set up": the next prefill sets the staging up again over the tensors registered then. Waits for the
+// copies in flight, which read the cold blocks of the tensors (a buffer being freed, or new tensors being placed).
+void stage_reset(stage_state & st, int device) {
+    if (st.stream) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(st.stream));
+    }
+    if (st.buf) {
+        CUDA_CHECK(cudaFree(st.buf));
+        CUDA_CHECK(cudaFree(st.tables));
+    }
+    for (tiered_tensor * t : st.tensors) {
+        for (auto & tab : t->d_table_staged) {
+            tab = nullptr;
+        }
+    }
+    st.buf     = nullptr;
+    st.tables  = nullptr;
+    st.size    = 0;
+    st.n_areas = 0;
+    st.layers.clear();
+    st.members.clear();
+    for (int a = 0; a < stage_state::max_areas; ++a) {
+        st.area_layer[a] = -1;
+        st.released[a]   = false;
+    }
+    st.ready   = false;
+}
 
 struct tiered_buffer_context {
     int    device;
@@ -141,6 +221,15 @@ struct tiered_buffer_context {
     std::vector<std::unique_ptr<tiered_tensor>> tensors;
 
     ~tiered_buffer_context() {
+        {
+            // the prefill staging may still copy from these cold blocks: stop it and forget these tensors first
+            stage_state & st = g_stage[device];
+            std::lock_guard<std::mutex> lock(st.mutex);
+            stage_reset(st, device);
+            for (auto & t : tensors) {
+                st.tensors.erase(std::remove(st.tensors.begin(), st.tensors.end(), t.get()), st.tensors.end());
+            }
+        }
         for (auto & t : tensors) {
             if (t->cold_host) {
                 CUDA_CHECK(cudaFreeHost(t->cold_host));
@@ -149,6 +238,7 @@ struct tiered_buffer_context {
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
+
 
 // placement totals per device, printed once at the first MUL_MAT_ID that reads a table
 std::atomic<size_t> g_hot_bytes[GGML_CUDA_MAX_DEVICES];
@@ -193,6 +283,12 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
     info->expert_bytes = l.expert_bytes;
     info->n_expert     = l.n_expert;
     info->n_hot        = l.hot.size();
+    info->cold_size    = l.cold_size;
+    info->device       = ctx->device;
+    if (sscanf(tensor->name, "blk.%d.", &info->layer) != 1) {
+        info->layer = -1;
+    }
+    info->is_down      = strstr(tensor->name, "ffn_down_exps") != nullptr;
     info->hot_dev      = (char *) tensor->data;
     info->d_table      = (const void **) ((char *) tensor->data + l.table_off);
 
@@ -251,6 +347,14 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
     g_tensors   [ctx->device] += 1;
 
     tensor->extra = info.get();
+    {
+        stage_state & st = g_stage[ctx->device];
+        std::lock_guard<std::mutex> lock(st.mutex);
+        if (st.ready) {
+            stage_reset(st, ctx->device); // a model loaded after a prefill: set up again with its tensors
+        }
+        st.tensors.push_back(info.get());
+    }
     ctx->tensors.push_back(std::move(info));
     return GGML_STATUS_SUCCESS;
 }
@@ -521,6 +625,164 @@ const void * ggml_cuda_tiered_expert(const ggml_tensor * t, int64_t expert) {
     const tiered_tensor * info = tiered_info(t);
     GGML_ASSERT(info != nullptr && expert >= 0 && expert < info->n_expert);
     return info->h_table[expert];
+}
+
+namespace {
+
+bool stage_enabled(int64_t n_tokens) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_STAGE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    static const int64_t min_tokens = [] {
+        const char * env = getenv("GGML_CUDA_MOE_STAGE_MIN_TOKENS");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 256;
+    }();
+    return enabled && n_tokens >= min_tokens;
+}
+
+// the staging area of a device: one layer's cold experts, the largest layer's size; a staged table per tensor
+void stage_setup(stage_state & st, int device) {
+    st.ready = true;
+    size_t n_ptrs = 0;
+    for (tiered_tensor * t : st.tensors) {
+        if (t->cold_size == 0 || t->layer < 0) {
+            continue;
+        }
+        auto & m = st.members[t->layer];
+        size_t off = 0;
+        for (const stage_member & x : m) {
+            off = std::max(off, GGML_PAD(x.off + x.t->cold_size, 256));
+        }
+        m.push_back({t, off});
+        st.size = std::max(st.size, GGML_PAD(off + t->cold_size, 256));
+        n_ptrs += t->n_expert;
+    }
+    for (const auto & it : st.members) {
+        st.layers.push_back(it.first);
+    }
+    if (st.size == 0) {
+        return;
+    }
+    // two areas by default: the next layer but one is copied while the next one is read, so a copy has about two
+    // layers of compute to hide behind (with one area it had only the part of a layer before its expert matmuls)
+    static const int n_areas = [] {
+        const char * env = getenv("GGML_CUDA_MOE_STAGE_AREAS");
+        return std::max(1, std::min(env ? atoi(env) : 2, stage_state::max_areas));
+    }();
+    ggml_cuda_set_device(device);
+    if (cudaMalloc((void **) &st.buf, n_areas*st.size) != cudaSuccess ||
+            cudaMalloc((void **) &st.tables, n_areas*n_ptrs*sizeof(void *)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (st.buf) {
+            CUDA_CHECK(cudaFree(st.buf));
+        }
+        st.buf = nullptr;
+        GGML_LOG_WARN("%s: no VRAM for the prefill staging of the cold experts on %s%d (%d x %.1f MiB), they are read in place\n",
+            __func__, GGML_CUDA_NAME, device, n_areas, st.size/1048576.0);
+        return;
+    }
+    st.n_areas = n_areas;
+    if (st.stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking));
+        for (int a = 0; a < stage_state::max_areas; ++a) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&st.ev_staged[a],   cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&st.ev_released[a], cudaEventDisableTiming));
+        }
+    }
+    for (int a = 0; a < stage_state::max_areas; ++a) {
+        st.area_layer[a] = -1;
+        st.released[a]   = false;
+    }
+    void ** next = st.tables;
+    std::vector<const void *> h;
+    for (int a = 0; a < n_areas; ++a) {
+        char * area = st.buf + (size_t) a*st.size;
+        for (auto & it : st.members) {
+            for (const stage_member & m : it.second) {
+                tiered_tensor * t = m.t;
+                h.assign(t->h_table.begin(), t->h_table.end());
+                for (int64_t e = 0; e < t->n_expert; ++e) {
+                    if (!t->hot(e)) {
+                        h[e] = area + m.off + (size_t) (-1 - t->slot[e])*t->expert_bytes;
+                    }
+                }
+                CUDA_CHECK(cudaMemcpy(next, h.data(), t->n_expert*sizeof(void *), cudaMemcpyHostToDevice));
+                t->d_table_staged[a] = (const void **) next;
+                next += t->n_expert;
+            }
+        }
+    }
+    GGML_LOG_INFO("%s: prefill staging of the cold experts on %s%d: %zu layers, %d x %.1f MiB\n", __func__, GGML_CUDA_NAME, device,
+        st.layers.size(), n_areas, st.size/1048576.0);
+}
+
+} // namespace
+
+const void * const * ggml_cuda_tiered_table_prefill(const ggml_tensor * t, int64_t n_tokens, cudaStream_t stream) {
+    const void * const * table = ggml_cuda_tiered_table(t);
+    tiered_tensor * info = (tiered_tensor *) tiered_info(t);
+    if (info == nullptr || info->cold_size == 0 || info->layer < 0 || !stage_enabled(n_tokens)) {
+        return table;
+    }
+    stage_state & st = g_stage[info->device];
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!st.ready) {
+        stage_setup(st, info->device);
+    }
+    const int a = st.n_areas > 0 ? st.area_of(info->layer) : -1;
+    if (a < 0) {
+        return table; // not staged: read in place
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, st.ev_staged[a], 0));
+    return (const void * const *) info->d_table_staged[a];
+}
+
+void ggml_cuda_tiered_prefill_launched(const ggml_tensor * t, int64_t n_tokens, cudaStream_t stream) {
+    tiered_tensor * info = (tiered_tensor *) tiered_info(t);
+    if (info == nullptr || !info->is_down || info->layer < 0 || !stage_enabled(n_tokens)) {
+        return;
+    }
+    stage_state & st = g_stage[info->device];
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!st.ready) {
+        stage_setup(st, info->device);
+    }
+    if (st.n_areas == 0 || st.layers.empty()) {
+        return;
+    }
+    // this layer's area is free once its last expert matmul is done
+    const int own = st.area_of(info->layer);
+    if (own >= 0) {
+        CUDA_CHECK(cudaEventRecord(st.ev_released[own], stream));
+        st.released  [own] = true;
+        st.area_layer[own] = -1;
+    }
+    // fill the free areas with the next layers in order (after the last layer: the first ones, the next ubatch)
+    int layer = info->layer;
+    for (int k = 0; k < st.n_areas; ++k) {
+        auto it = std::upper_bound(st.layers.begin(), st.layers.end(), layer);
+        layer = it == st.layers.end() ? st.layers.front() : *it;
+        if (layer == info->layer) {
+            break; // fewer layers than areas
+        }
+        if (st.area_of(layer) >= 0) {
+            continue;
+        }
+        const int a = st.area_of(-1);
+        if (a < 0) {
+            break;
+        }
+        if (st.released[a]) {
+            CUDA_CHECK(cudaStreamWaitEvent(st.stream, st.ev_released[a], 0));
+        }
+        char * area = st.buf + (size_t) a*st.size;
+        for (const stage_member & m : st.members[layer]) {
+            CUDA_CHECK(cudaMemcpyAsync(area + m.off, m.t->cold_host, m.t->cold_size, cudaMemcpyHostToDevice, st.stream));
+        }
+        CUDA_CHECK(cudaEventRecord(st.ev_staged[a], st.stream));
+        st.area_layer[a] = layer;
+    }
 }
 
 int ggml_cuda_tiered_is_hot(const ggml_tensor * t, int64_t expert) {
