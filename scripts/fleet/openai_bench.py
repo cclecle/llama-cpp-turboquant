@@ -11,6 +11,8 @@
 # BENCH_SAVE_TEXT=<file>: also write the generated text (reasoning + answer) there, to read it for sanity.
 # BENCH_SERVER_SAMPLING=1: send no temperature, so the server's own sampling (the preset's) applies.
 # BENCH_RUNS=N: N measured requests, one result line each (sampled runs differ: pool them).
+# BENCH_CACHE_PROMPT=1: prompt caching on, as clients use it (context checkpoints then run during the prefill;
+#   the repeat then reuses the cache, so use it with warmup 1).
 import json, os, sys, time, urllib.request
 
 base, model, prompt_file, label, out = sys.argv[1:6]
@@ -38,6 +40,8 @@ def run(text, n):
             'stream': True, 'stream_options': {'include_usage': True}, 'cache_prompt': False}
     if os.environ.get('BENCH_SERVER_SAMPLING') == '1':
         del body['temperature']
+    if os.environ.get('BENCH_CACHE_PROMPT') == '1':
+        body['cache_prompt'] = True
     req = urllib.request.Request(base + '/v1/chat/completions', json.dumps(body).encode(),
                                  {'Content-Type': 'application/json'})
     t0 = time.time()
