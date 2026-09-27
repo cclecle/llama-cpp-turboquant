@@ -440,6 +440,9 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 34 | sparse masked FA on RDNA4 (lists per 8 queries) | ub 1024 1,281 -> 1,332; **ub 4096 1,722 -> 1,814 (R9V 1,727)**; reference text 15c95895521e9ee4fc6aa67dc23f6ff1 |
 | 35 | decode anatomy after steps 29-34 | per step (traced): MoE 16.0, dense mat-vec 8.3 (524 calls), RCCL 3.0, draft heads 4 x 418 us, FA 1.5, idle 14.9 ms |
 | 36-38 | coarse-to-exact draft head (`GGML_HINT_ARGMAX_ONLY`), MTP eh_proj as one matrix | head: 46.1 -> 45.3 ms/step at 2.88 tok/step, text identical (R9V's blocks 0,5 lost 3% acceptance; any pair without block 0 keeps it); eh_proj: prefill 1,338 -> 1,355 |
+| 39 | GPU draft sampling under the tensor split (`set_sampler` guard lifted) | the sampler meets vocabulary-split logits: meta backend asserts; host samples show the CPU sampler costs nothing (55/60 in synchronize); dropped |
+| 40-42 | verify mat-vecs by name; 4 waves per row for more of them | at 5 columns ~55% of DRAM bandwidth, but 4 waves per row lose in real decode (45.3 -> 47.1 / 48.6 ms/step); perf loops mislead (8 MB matrices stay in the 64 MB infinity cache) |
+| 43 | flash-decoding over the QSA lists (lane = 8 dims, 12 warp reductions per cell) | 1 query 30.6 vs 40.7 us, 5 queries 75.6 vs 57.1 us (mma); per-block fixed cost + per-cell reductions; dropped |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1: both texts are coherent and diverge 868 characters in).
 
@@ -489,4 +492,7 @@ every pair without block 0 (1,6 2,7 3,7 3,8 4,9) keeps 2.87-2.88. Default 2,7 wi
 
 The MTP eh_proj multiplies an unbatched [5120 -> 2560] weight with [5120, 4 streams, n_tokens]: the batched
 mat-vec read the weight once per token (12 ms per 1024-token ubatch). One matrix of 4*n_tokens columns instead.
+
+Trap (step 42): with a changed text, tokens/s can rise because the new text accepts more drafts (3.27 vs 2.88
+tokens/step) while every step got slower. Compare ms/step, and tokens/step separately.
 
