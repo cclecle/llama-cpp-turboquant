@@ -433,6 +433,8 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 25 | ubatch 2048 / 4096 (user's decision) | prefill 1,386 (+20%) at 30.75 GB; 4096 OOM |
 | 26-27 | prefill staging of cold experts, one area | expert matmuls 10.5 -> 4.7 s per GPU, but copies (~26 GB/s) not hidden: prefill 1,152 -> 1,030 |
 | 28 | staging with 2 and 3 areas | 1,030 / 1,027 vs 1,152 (off): more areas change nothing; staging stays off (see below) |
+| 29 | `GGML_ALLOC_PEAK` probe | ub 4096 asked 10.1 GiB/GPU: 7 GiB = 14 device copies of the KQ mask, 2 GiB indexer score + relu |
+| 30 | `ggml_qsa_expand_heads`, mask as is, shared zeros | compute buffer ub 1024 2,533 -> 909 MiB, ub 4096 10,130 -> 3,633 MiB; ub 1024 46.4 -> 46.0 ms/step, prefill 1,178, text identical; **ub 4096 fits: prefill 1,542 at 30.1 GB** |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb).
 
@@ -451,4 +453,19 @@ It also moves more bytes than the in-place reads: 12.3 s of copies per GPU for a
 in-place penalty for the routed ones only. Upper bound even if the side effects vanished: the 5.8 s. Staging stays in
 the tree with `GGML_CUDA_MOE_STAGE` default off. Levers left for prefill: fewer passes over the cold experts (larger
 ubatch, R9V prefills in 4096-token chunks) and fewer cold bytes (hot set), both limited by VRAM, hence step 29.
+
+The compute buffer (steps 29-30). `GGML_ALLOC_PEAK=N` (ggml-alloc.c) logs the N largest tensors alive when each
+buffer reached its size. At ub 4096 (65k ctx) the 10.1 GiB per GPU were:
+- 7 GiB: 14 copies of the [65536 x 4096] f16 KQ mask. Each QSA layer passed `ggml_reshape_3d(kq_mask)` to
+  qsa_expand; each reshape is a new tensor, the scheduler uploads a device copy per tensor, and its copies are graph
+  outputs (never freed). The mask was also uploaded 14 times per ubatch.
+- 2 GiB: the indexer score [16384, 4 heads x 4096] f32 and its relu, both alive, then the head sum and the bias add.
+- 9-13 x 32 MiB: one zero source per layer for the dense mask's set_rows, each a leaf alive from the graph start.
+
+`ggml_qsa_expand_heads` computes, per cell, ((relu(s0) + relu(s1)) + relu(s2)) + relu(s3) + bias + mask in the
+unfused graph's order (HIP builds without fast-math, so the sums round the same), and takes the 4D mask as it is.
+Result: ub 1024 compute buffer 2,533 -> 909 MiB, peak VRAM 27.8 -> 26.2 GB per card; ub 2048 1,817 MiB (27.5 GB
+peak, prefill 1,422); ub 4096 3,633 MiB (30.1 GB peak, prefill 1,542, was OOM). What is left at ub 4096: the score
+mul_mat (1 GiB), the expanded per-cell scores (1 GiB, read only by the top-k), the mask copy (512 MiB), the block
+bias (256 MiB).
 

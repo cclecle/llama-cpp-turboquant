@@ -89,6 +89,14 @@ Rules that follow:
   - For data that must outlive one op, use a context-owned buffer that only grows. Keep replaced buffers, because
     captured graphs still point at them.
 - **`cudaMalloc` during capture** is allowed in the relaxed capture mode ggml uses.
+- **Find what fills a compute buffer with `GGML_ALLOC_PEAK=N`.** It lists the N largest tensors alive when each buffer
+  reached its size. The first use found 7 of 10.1 GiB at ubatch 4096 in 14 copies of one input:
+  - Every `ggml_reshape`/`ggml_view` of a graph input is a distinct tensor. When a GPU node uses it, the scheduler
+    uploads a device copy of that view, one per view, even though all of them share the same host data.
+  - The copies are flagged as graph outputs, so none is freed before the graph ends.
+  - Fix: build the view once per graph, or make the op accept the input's own shape.
+  - Same pattern with a per-layer `ggml_new_tensor` + `ggml_fill` constant: every copy is a leaf, allocated from the
+    start of the graph until its layer. Share one per graph.
 - **Multiple streams** (the concurrent-events path) can race on any context-owned scratch. Restrict such caches to the
   main stream.
 - **Generic pointers can point into LDS,** and ggml's `vec_dot_*` functions work on an LDS copy of quant blocks.
@@ -159,8 +167,13 @@ Rules that follow:
     ubatch routes to. The cold ones are the least routed.
   - hipMemcpyAsync from pinned memory reached only ~26 GB/s per GPU with both GPUs copying (host-memory-bound).
   - With one staging area, the copy of layer L+1 must fit between layer L's expert matmuls and layer L+1's, which is
-    too short on the light layers. Measure the copy rate and the window before designing. Several areas widen the
-    window; staging only the likely-routed experts shrinks the bytes.
+    too short on the light layers. Measure the copy rate and the window before designing.
+  - **Verdict (step 28): 1, 2 and 3 areas all lose the same ~10%.** The trace showed the copies hidden (no gap above
+    0.3 ms mid-prefill). The loss came from the link itself: while the DMA fills PCIe, everything else that crosses it
+    slows down. That includes the AQL dispatch packets and kernel arguments, which live in host memory, and the
+    GPU-to-GPU all-reduce. It showed as 160 ms of sub-millisecond idle gaps per ubatch (12 ms without the DMA), and
+    small kernels and RCCL got slower. **On this rig, any extra PCIe traffic during compute costs more than it hides.**
+    Compare per-ubatch idle time and per-kernel time deltas (`stage_trace.py`), not just the copy/compute overlap.
 
 ## 8. Cross-GPU synchronisation
 
