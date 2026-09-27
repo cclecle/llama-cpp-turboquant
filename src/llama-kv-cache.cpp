@@ -1356,7 +1356,14 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_N_PAD (a multiple of 256): a coarser pad. Every time n_kv grows, the graph is rebuilt and allocated
+    // again and a HIP/CUDA backend re-captures every graph it runs (on HIP ~160 us each, ~200 per growth for
+    // Qwen3.8-Flash-Next under -sm tensor); the cells past the used ones are masked.
+    static const uint32_t n_pad_env = [] {
+        const char * env = getenv("LLAMA_KV_N_PAD");
+        return env ? (uint32_t) GGML_PAD(std::max(atoi(env), 256), 256) : 256u;
+    }();
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

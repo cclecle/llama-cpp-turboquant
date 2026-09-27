@@ -790,12 +790,96 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// LLAMA_HOST_TIMING=1: where the host time of the decode loop goes, to find the host work the GPUs wait for. Per
+// decode call, verify batches and single tokens apart, averaged every 256 calls: the time since the previous decode
+// returned (sampling, draft logic, server; the part spent waiting in synchronize() shown apart), then inside the
+// call the batch preparation, the memory apply, the graph reuse check or build, the scheduler allocation, the input
+// upload, the compute submission, and the output handling.
+namespace {
+struct llama_host_timing {
+    enum { BETWEEN, SYNC, PRE, APPLY, BUILD, ALLOC, INPUTS, SUBMIT, POST, N_PH };
+    const bool enabled = getenv("LLAMA_HOST_TIMING") != nullptr;
+    int64_t t_mark   = 0;
+    int64_t t_last   = 0;
+    int64_t sync_acc = 0;
+    int64_t cur[N_PH] = {0};
+    int     cur_builds = 0;
+    bool    cur_multi  = false;
+    int64_t sum[2][N_PH] = {{0}};
+    int64_t n[2]      = {0};
+    int64_t builds[2] = {0};
+    int64_t calls     = 0;
+
+    int64_t lap() {
+        const int64_t t = ggml_time_us();
+        const int64_t d = t - t_mark;
+        t_mark = t;
+        return d;
+    }
+
+    void begin(bool multi) {
+        const int64_t t = ggml_time_us();
+        for (int64_t & c : cur) {
+            c = 0;
+        }
+        cur[BETWEEN] = t_last ? t - t_last : 0;
+        cur[SYNC]    = sync_acc;
+        sync_acc     = 0;
+        cur_builds   = 0;
+        cur_multi    = multi;
+        t_mark       = t;
+    }
+
+    void end() {
+        cur[POST] += lap();
+        t_last = t_mark;
+        const int k = cur_multi ? 1 : 0;
+        for (int i = 0; i < N_PH; ++i) {
+            sum[k][i] += cur[i];
+        }
+        n[k]++;
+        builds[k] += cur_builds;
+        if (++calls % 256 != 0) {
+            return;
+        }
+        for (int c = 0; c < 2; ++c) {
+            if (n[c] == 0) {
+                continue;
+            }
+            const double m = 1.0/n[c];
+            LLAMA_LOG_WARN("host timing, %s: %" PRId64 " calls, us per call: between %.0f (in sync %.0f), pre %.0f, "
+                "apply %.0f, build %.0f (%.2f builds), alloc %.0f, inputs %.0f, submit %.0f, post %.0f\n",
+                c ? "batches" : "single tokens", n[c], sum[c][BETWEEN]*m, sum[c][SYNC]*m, sum[c][PRE]*m,
+                sum[c][APPLY]*m, sum[c][BUILD]*m, builds[c]*m, sum[c][ALLOC]*m, sum[c][INPUTS]*m, sum[c][SUBMIT]*m,
+                sum[c][POST]*m);
+            for (int i = 0; i < N_PH; ++i) {
+                sum[c][i] = 0;
+            }
+            n[c] = 0;
+            builds[c] = 0;
+        }
+    }
+};
+
+llama_host_timing & host_timing() {
+    static llama_host_timing t;
+    return t;
+}
+} // namespace
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        llama_host_timing & ht = host_timing();
+        const int64_t t0 = ht.enabled ? ggml_time_us() : 0;
+        ggml_backend_sched_synchronize(sched.get());
+        if (ht.enabled) {
+            ht.sync_acc += ggml_time_us() - t0;
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1415,12 +1499,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_host_timing & ht = host_timing();
+    if (ht.enabled) {
+        ht.cur[llama_host_timing::PRE] += ht.lap();
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    if (ht.enabled) {
+        ht.cur[llama_host_timing::APPLY] += ht.lap();
+    }
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1458,13 +1549,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (ht.enabled) {
+            ht.cur[llama_host_timing::BUILD] += ht.lap();
+            ht.cur_builds++;
+        }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (ht.enabled) {
+            ht.cur[llama_host_timing::ALLOC] += ht.lap();
+        }
 
         gf_res_prev_active = res;
+    }
+    if (ht.enabled) {
+        ht.cur[llama_host_timing::BUILD] += ht.lap(); // the reuse check, when the graph is reused
     }
 
     // set the input data for the input tensors
@@ -1476,8 +1577,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (ht.enabled) {
+        ht.cur[llama_host_timing::INPUTS] += ht.lap();
+    }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ht.enabled) {
+        ht.cur[llama_host_timing::SUBMIT] += ht.lap();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1729,6 +1836,20 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    struct host_timing_scope {
+        llama_host_timing & ht;
+        explicit host_timing_scope(llama_host_timing & ht, bool multi) : ht(ht) {
+            if (ht.enabled) {
+                ht.begin(multi);
+            }
+        }
+        ~host_timing_scope() {
+            if (ht.enabled) {
+                ht.end();
+            }
+        }
+    } host_timing_scope_(host_timing(), batch_inp.tokens.size() > 1);
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

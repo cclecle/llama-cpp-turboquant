@@ -3012,6 +3012,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // GGML_CUDA_GRAPH_DEBUG=1: why a captured graph has to be re-captured (the first node that changed, up to
+            // 20000 lines: graph sizes and times tell the bursts, where the whole buffer moved, from the steady cases)
+            static const bool debug = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+            static int n_logged = 0;
+            if (debug && !res && graph->warmup_complete && n_logged < 20000) {
+                n_logged++;
+                const ggml_cuda_graph::node_properties & old = graph->node_props[i];
+                const char * what = "other";
+                if (old.node.data != prop.node.data) {
+                    what = "data";
+                } else if (memcmp(old.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0) {
+                    what = "ne";
+                } else if (memcmp(old.node.op_params, prop.node.op_params, sizeof(prop.node.op_params)) != 0) {
+                    what = "op_params";
+                } else if (memcmp(old.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0) {
+                    what = "src data";
+                } else if (memcmp(old.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0) {
+                    what = "src ne";
+                }
+                GGML_LOG_WARN("cuda graph %p (%d nodes): node %d %s '%s' changed: %s\n", graph_key, cgraph->n_nodes, i,
+                    ggml_op_desc(cgraph->nodes[i]), cgraph->nodes[i]->name, what);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
