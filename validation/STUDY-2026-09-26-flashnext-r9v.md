@@ -446,8 +446,9 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 45 | prefill anatomy at ub 4096 (per GPU, 18.4 s window, 15.4 s busy) | MoE experts 4.1 s, dense MMQ 1.5, GDN 1.26, sgemm 1.05, RCCL 1.0, mm_ids_helper 0.86, FA 0.82, quantize 0.76, HC post/pre 0.74/0.54, rms_norm 0.67 |
 | 46 | mm_ids_helper over 8 waves per expert | ub 1024 1,358 -> 1,372, **ub 4096 1,854 -> 1,924 t/s**, texts identical |
 | 47 | gated delta net: prefetch token t+1's inputs | 1,367-1,369 / 1,913 vs 1,372 / 1,924: no gain, texts identical; the recurrence is bound by its 2 warp reductions per token (a chunked kernel is the fix); reverted |
+| 48 | gated delta net: 4 lanes per state column (32 rows each) from 32 tokens | ub 1024 1,372 -> 1,409, **ub 4096 1,923 -> 2,000 t/s**; reference text e78f5272a0921e576d01dec29e164795 |
 
-Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1: both texts are coherent and diverge 868 characters in).
+Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1; from step 48, with the column-group delta net, e78f5272a0921e576d01dec29e164795: both texts are coherent and diverge 868 characters in).
 
 Prefill anatomy (32k prompt, ub 1024, per GPU of ~24.7 s busy): mul_mat_q 12.3 s (MoE experts 10.2 s, bound by the
 cold experts' PCIe reads), hipBLAS F32 GEMMs 2.9 s (router 1.0 ms/call at 2.7 TFLOPS on an 8x8-tile kernel, hc_inject
@@ -498,4 +499,8 @@ mat-vec read the weight once per token (12 ms per 1024-token ubatch). One matrix
 
 Trap (step 42): with a changed text, tokens/s can rise because the new text accepts more drafts (3.27 vs 2.88
 tokens/step) while every step got slower. Compare ms/step, and tokens/step separately.
+
+Measurement caveat (step 48): when the text changes, ms/step moves by about +-1 ms with the text alone (the same
+build: 45.3 at ub 1024, 47.4 at ub 4096; the delta-net change: +1.2 at ub 1024 and -1.7 at ub 4096 with decode kernels
+untouched). Decode changes need an identical text, or several prompts, to be judged below ~2 ms/step.
 
