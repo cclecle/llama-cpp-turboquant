@@ -447,6 +447,7 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 46 | mm_ids_helper over 8 waves per expert | ub 1024 1,358 -> 1,372, **ub 4096 1,854 -> 1,924 t/s**, texts identical |
 | 47 | gated delta net: prefetch token t+1's inputs | 1,367-1,369 / 1,913 vs 1,372 / 1,924: no gain, texts identical; the recurrence is bound by its 2 warp reductions per token (a chunked kernel is the fix); reverted |
 | 48 | gated delta net: 4 lanes per state column (32 rows each) from 32 tokens | ub 1024 1,372 -> 1,409, **ub 4096 1,923 -> 2,000 t/s**; reference text e78f5272a0921e576d01dec29e164795 |
+| 49 | one MMQ q8_1 copy per shared activation (2-entry cache) | 1,408-1,412 vs 1,408, 2,008 vs 2,003, +40-150 MB VRAM, texts identical: hits are rare; reverted |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1; from step 48, with the column-group delta net, e78f5272a0921e576d01dec29e164795: both texts are coherent and diverge 868 characters in).
 
