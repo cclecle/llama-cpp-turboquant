@@ -413,3 +413,29 @@ ubatch (~0.9 ms at 33k per its own comment), not yet measured.
 - Next: the draft loop (needs a split-aware top-k in the meta backend for an unrolled draft graph or a coarse head),
   fewer and wider dense mat-vecs, the sparse FA config (75 us vs R9V's 14 us), the MoE weighted-reduction fusion that
   does not match on this graph, the GDN gate chains.
+
+### 11.11 Steps 11-27 (2026-09-26 night to 2026-09-27)
+
+Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot set of 36.7 GiB unless noted):
+
+| step | change | result |
+|---|---|---|
+| 11-12 | MoE reuse kernel (one block per distinct expert) | lost (MoE 15.5 -> 22.4 ms; VRAM spill, serialized loads), dropped |
+| 12 | meta backend allocation dependencies | the fused MoE weighted sum runs in decode; costs nothing |
+| 13 | ROCm 7.14 runtime / full build; HIP runtime knobs | decode +1-2 ms, prefill +3% (7.14); knobs: no effect |
+| 14 | deterministic one-kernel top-k | 52.6 -> 49.4; **decode deterministic** (same text every load) |
+| 15 | staged uploads (no blocking copy per input) | 49.3 -> 47.6, text byte-identical |
+| 15 | F32 mat-vec tune (rows per block, wide blocks) | kernels -0.8 ms/step, step time unchanged (host-bound) |
+| 16-18 | graph packet capture knob, KV pad 2048 | no gain (re-captures are cheap bursts every 256 tokens) |
+| 19-24 | q8_1 written by producers (norm, gates, HC mix, output gate), copy runs | 47.6 -> 46.4, 3,477 -> 3,115 kernels/step |
+| 21 | hot set 44 GiB (user's decision) | **40.8 ms/step, decode 71 t/s, prefill 1,283**, 31.6 of 32.6 GB per card |
+| 24 | FA RDNA config sweep (256/256/16 cols) | baseline best; a dedicated sparse decode kernel parked |
+| 25 | ubatch 2048 / 4096 (user's decision) | prefill 1,386 (+20%) at 30.75 GB; 4096 OOM |
+| 26-27 | prefill staging of cold experts, one area | expert matmuls 10.5 -> 4.7 s per GPU, but copies (~26 GB/s) not hidden: prefill 1,152 -> 1,030 |
+
+Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb).
+
+Prefill anatomy (32k prompt, ub 1024, per GPU of ~24.7 s busy): mul_mat_q 12.3 s (MoE experts 10.2 s, bound by the
+cold experts' PCIe reads), hipBLAS F32 GEMMs 2.9 s (router 1.0 ms/call at 2.7 TFLOPS on an 8x8-tile kernel, hc_inject
+216 us, gated delta net alpha/beta, indexer scores), dense FA 1.9 s, gated delta net 1.2 s, RCCL 0.95 s, mm_ids_helper
+0.94 s (3 calls per layer with the same ids; each of its 512 blocks scans every route).

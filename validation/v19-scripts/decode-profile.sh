@@ -5,14 +5,15 @@
 # are an order of magnitude slower than VRAM ones). Production must already be stopped; it is left stopped.
 # DP_ARGS: args file; DP_PROMPT: prompt file (default: a short essay request); DP_TOKENS: tokens to generate (512);
 # DP_TAG: output directory suffix. DP_HIP=1: also trace the host's HIP calls (--hip-runtime-trace, for
-# hostgap_anatomy.py: what the host does while the GPUs idle).
+# hostgap_anatomy.py: what the host does while the GPUs idle). DP_EXTRA: more rocprofv3 flags (--memory-copy-trace);
+# DP_ENV: env assignments for the server.
 cd /mnt/gguf/r9v/bench
 b=${1:-v18}
 out=prof-decode-$b${DP_TAG:-}
 rm -rf $out; mkdir -p $out
 mapfile -t A < ${DP_ARGS:-fn-xl.args}   # DP_ARGS: another args file (same layout)
 for i in "${!A[@]}"; do [ "${A[$i]}" = --ctx-size ] && A[$((i + 1))]=65536; done
-HIP_VISIBLE_DEVICES=0,1 setsid rocprofv3 --kernel-trace ${DP_HIP:+--hip-runtime-trace} --output-format csv -d $out -o trace -- \
+env ${DP_ENV:-X=0} HIP_VISIBLE_DEVICES=0,1 setsid rocprofv3 --kernel-trace ${DP_HIP:+--hip-runtime-trace} ${DP_EXTRA:-} --output-format csv -d $out -o trace -- \
   /opt/llamacpp/llama-cpp-mine-$b/build3/bin/llama-server "${A[@]}" --host 127.0.0.1 --port 8090 > $out/server.log 2>&1 &
 SRV=$!
 t0=$(date +%s)
