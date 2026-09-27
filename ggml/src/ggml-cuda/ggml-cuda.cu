@@ -48,6 +48,7 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sgemm.cuh"
+#include "ggml-cuda/argmax-head.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -2141,6 +2142,38 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+    if (hint == GGML_HINT_ARGMAX_ONLY && ggml_cuda_should_use_argmax_head(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc)) {
+        ggml_cuda_mul_mat_argmax_head(ctx, src0, src1, dst);
+        return;
+    }
+
+    // a weight shared by every channel against short column groups (the qwen4exp MTP eh_proj: [5120, 4 streams,
+    // n_tokens]) is one matrix of ne11*ne12*ne13 columns; the batched mat-vec path reads the weight once per channel.
+    // The flat src1 is a reshape of the real one, so caches keyed on the view root still see src1.
+    static const bool mm_flatten = [] {
+        const char * env = getenv("GGML_CUDA_MM_FLATTEN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (mm_flatten && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] > 1 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && hint == GGML_HINT_NONE) {
+        ggml_tensor src1_2d = *src1;
+        src1_2d.ne[1] = src1->ne[1]*src1->ne[2]*src1->ne[3];
+        src1_2d.ne[2] = 1;
+        src1_2d.ne[3] = 1;
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1];
+        src1_2d.nb[3] = src1_2d.nb[2];
+        src1_2d.op        = GGML_OP_RESHAPE;
+        src1_2d.view_src  = const_cast<ggml_tensor *>(src1);
+        src1_2d.view_offs = 0;
+        ggml_tensor dst_2d = *dst;
+        dst_2d.ne[1] = src1_2d.ne[1];
+        dst_2d.ne[2] = 1;
+        dst_2d.ne[3] = 1;
+        dst_2d.nb[2] = dst_2d.nb[1]*dst_2d.ne[1];
+        dst_2d.nb[3] = dst_2d.nb[2];
+        ggml_cuda_mul_mat(ctx, src0, &src1_2d, &dst_2d);
         return;
     }
 

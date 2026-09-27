@@ -2833,6 +2833,56 @@ struct test_rms_norm_mul_rope : public test_case {
 };
 
 // GGML_OP_ARGMAX
+// GGML_OP_MUL_MAT with GGML_HINT_ARGMAX_ONLY (a greedy draft head): only the argmax of the logits must match. The
+// input carries its energy in the ranking blocks (0 and 5 of 10), as a real head's ranking agrees with the full dot
+// product; with random weights and an even input a 2-block ranking would miss the argmax by design
+struct test_mul_mat_argmax_head : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, m, k);
+    }
+
+    test_mul_mat_argmax_head(ggml_type type_a = GGML_TYPE_Q6_K, int64_t m = 40000, int64_t k = 2560)
+        : type_a(type_a), m(m), k(k) {}
+
+    // compare the argmax only: the hinted logits are -INFINITY outside the candidates by design
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * logits = ggml_mul_mat(ctx, a, b);
+        ggml_mul_mat_set_hint(logits, GGML_HINT_ARGMAX_ONLY);
+
+        ggml_tensor * out = ggml_argmax(ctx, logits);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(4321);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") == 0) {
+                std::vector<float> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    const int64_t blk = i / 256;
+                    data[i] = u(gen) * (blk == 0 || blk == 5 ? 1.0f : 0.02f);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10537,6 +10587,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 40, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 260));
+
+    // a greedy draft head (GGML_HINT_ARGMAX_ONLY): the qwen4exp vocabulary half of one device, and an odd row count
+    test_cases.emplace_back(new test_mul_mat_argmax_head(GGML_TYPE_Q6_K, 124160, 2560));
+    test_cases.emplace_back(new test_mul_mat_argmax_head(GGML_TYPE_Q6_K,  40001, 2560));
+    // a weight shared by every channel, short column groups (the qwen4exp MTP eh_proj, flattened to one matrix)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 4, 5120, {1, 1}, { 5, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 4, 5120, {1, 1}, {64, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
 

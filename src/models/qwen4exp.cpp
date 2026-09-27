@@ -689,7 +689,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (head_s == nullptr && n_tokens == 1) {
+        // a single-token draft only needs its argmax: the backend may rank the vocabulary coarsely and compute the
+        // best rows exactly (the verify head of the target stays exact)
+        cur = ggml_mul_mat(ctx0, head_w, cur);
+        ggml_mul_mat_set_hint(cur, GGML_HINT_ARGMAX_ONLY);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

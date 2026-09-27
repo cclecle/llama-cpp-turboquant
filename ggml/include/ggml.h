@@ -454,6 +454,9 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // only the largest value of each dst column is used (a greedy draft head): a backend may compute the others
+        // approximately or return -INFINITY for them; the exact path is always correct
+        GGML_HINT_ARGMAX_ONLY      = 2,
     };
 
     // model file types
