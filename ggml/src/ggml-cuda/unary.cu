@@ -1,4 +1,5 @@
 #include "unary.cuh"
+#include "quantize.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -706,21 +707,30 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 template <float (*op)(float)>
 static __global__ void scale_unary_scale_f32(const float * x, float * dst, const float s0, const float b0,
-        const float s1, const float b1, const int64_t k) {
+        const float s1, const float b1, const int64_t k, block_q8_1 * q8_out, const int64_t ncols, const int q8_row_blocks) {
     const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
         return;
     }
 
-    dst[i] = op(x[i]*s0 + b0)*s1 + b1;
+    const float v = op(x[i]*s0 + b0)*s1 + b1;
+    dst[i] = v;
+    // q8_out: the q8_1 copy for the mat-vecs that follow (ncols % 32 == 0: a warp holds one block of one row)
+    if (q8_out) {
+        const int64_t row = i / ncols;
+        const int64_t col = i - row*ncols;
+        quantize_q8_1_warp32(v, q8_out + row*q8_row_blocks + col/QK8_1, col % QK8_1);
+    }
 }
 
 template <float (*op)(float)>
 static void scale_unary_scale_f32_cuda(const float * x, float * dst, const float s0, const float b0,
-        const float s1, const float b1, const int64_t k, cudaStream_t stream) {
+        const float s1, const float b1, const int64_t k, block_q8_1 * q8_out, const int64_t ncols, cudaStream_t stream) {
+    static_assert(CUDA_NEG_BLOCK_SIZE % QK8_1 == 0, "whole q8_1 blocks per warp");
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
-    scale_unary_scale_f32<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, s0, b0, s1, b1, k);
+    scale_unary_scale_f32<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, s0, b0, s1, b1, k,
+        q8_out, ncols, (int) (GGML_PAD(ncols, MATRIX_ROW_PADDING)/QK8_1));
 }
 
 bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tensor * unary) {
@@ -730,7 +740,7 @@ bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tens
         ggml_is_contiguous(scale0->src[0]) && ggml_is_contiguous(scale0) && ggml_is_contiguous(unary);
 }
 
-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1) {
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1, void * q8_out) {
     const ggml_tensor * src = scale0->src[0];
     ggml_tensor       * dst = scale1 ? scale1 : unary;
 
@@ -750,10 +760,12 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
 
     switch (ggml_get_unary_op(unary)) {
         case GGML_UNARY_OP_SILU:
-            scale_unary_scale_f32_cuda<op_silu>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, stream);
+            scale_unary_scale_f32_cuda<op_silu>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k,
+                (block_q8_1 *) q8_out, dst->ne[0], stream);
             break;
         case GGML_UNARY_OP_SIGMOID:
-            scale_unary_scale_f32_cuda<op_sigmoid>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, stream);
+            scale_unary_scale_f32_cuda<op_sigmoid>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k,
+                (block_q8_1 *) q8_out, dst->ne[0], stream);
             break;
         default:
             GGML_ABORT("Unsupported unary op for fused scale+unary");

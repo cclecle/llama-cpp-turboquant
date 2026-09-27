@@ -426,6 +426,68 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     return spitch >= width && dpitch >= width;
 }
 
+// A run of copies with one layout in one launch, blockIdx.y = the copy (see ggml_cuda_cpy_multi)
+struct ggml_cuda_cpy_multi_ptrs {
+    const char * src[GGML_CUDA_CPY_MULTI_MAX];
+    char       * dst[GGML_CUDA_CPY_MULTI_MAX];
+};
+
+template <typename T>
+static __global__ void cpy_multi(const ggml_cuda_cpy_multi_ptrs p, const int64_t ne,
+                                 const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                 const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                 const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    *(T *) (p.dst[blockIdx.y] + dst_offset) = *(const T *) (p.src[blockIdx.y] + x_offset);
+}
+
+void ggml_cuda_cpy_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * cpys, const int n) {
+    GGML_ASSERT(n >= 1 && n <= GGML_CUDA_CPY_MULTI_MAX);
+    const ggml_tensor * src0 = cpys[0]->src[0];
+    const ggml_tensor * src1 = cpys[0]->src[1];
+    GGML_ASSERT(src0->type == src1->type && ggml_blck_size(src0->type) == 1);
+
+    ggml_cuda_cpy_multi_ptrs p = {};
+    for (int c = 0; c < n; ++c) {
+        p.src[c] = (const char *) cpys[c]->src[0]->data;
+        p.dst[c] = (char *) cpys[c]->src[1]->data;
+    }
+    const int64_t ne = ggml_nelements(src0);
+    GGML_TENSOR_BINARY_OP_LOCALS01;
+    const dim3 grid((ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE, n);
+    cudaStream_t stream = ctx.stream();
+    switch (ggml_type_size(src0->type)) {
+        case 4:
+            cpy_multi<uint32_t><<<grid, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(p, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+            break;
+        case 2:
+            cpy_multi<uint16_t><<<grid, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(p, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+            break;
+        default:
+            GGML_ABORT("ggml_cuda_cpy_multi: unsupported element size");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));

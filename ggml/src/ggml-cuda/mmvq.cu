@@ -1496,6 +1496,85 @@ static bool ggml_cuda_q8_1_reuse_enabled() {
     return enabled;
 }
 
+// The q8_1 reuse entry for src1 (keyed by the root of its pure views, the offset and the row layout), inserted
+// (least recently used, grown to q8_1_size) when there is none; inserted: the copy is still to be written
+static ggml_backend_cuda_context::q8_1_reuse_entry * ggml_cuda_q8_1_reuse_entry(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src1, const size_t q8_1_size, bool & inserted) {
+    // follow pure views only: an in-place op's result is a view of its source but holds new data
+    const ggml_tensor * src1_root = src1;
+    size_t              src1_offs = 0;
+    while (src1_root->view_src != nullptr &&
+            (src1_root->op == GGML_OP_VIEW || src1_root->op == GGML_OP_RESHAPE ||
+             src1_root->op == GGML_OP_PERMUTE || src1_root->op == GGML_OP_TRANSPOSE)) {
+        src1_offs += src1_root->view_offs;
+        src1_root  = src1_root->view_src;
+    }
+    auto & reuse = ctx.q8_1_reuse;
+    const int64_t ne10  = src1->ne[0];
+    const int64_t nrows = src1->ne[1]*src1->ne[2]*src1->ne[3];
+
+    ggml_backend_cuda_context::q8_1_reuse_entry * entry = nullptr;
+    for (auto & e : reuse.entries) {
+        if (e.valid && e.root == src1_root && e.offs == src1_offs && e.ne00 == ne10 && e.nrows == nrows &&
+                (nrows == 1 || e.row_stride == src1->nb[1])) {
+            entry = &e;
+            break;
+        }
+    }
+    inserted = entry == nullptr;
+    if (entry == nullptr) {
+        // the least recently used (or an invalid) entry takes the new copy
+        entry = &reuse.entries[0];
+        for (auto & e : reuse.entries) {
+            if (!e.valid || (entry->valid && e.last_use < entry->last_use)) {
+                entry = &e;
+                if (!e.valid) {
+                    break;
+                }
+            }
+        }
+        if (q8_1_size > entry->size) {
+            void * buf = nullptr;
+            const size_t size = std::max(q8_1_size, 2*entry->size);
+            CUDA_CHECK(cudaMalloc(&buf, size));
+            entry->bufs.push_back(buf);
+            entry->size = size;
+        }
+        entry->valid      = true;
+        entry->root       = src1_root;
+        entry->offs       = src1_offs;
+        entry->ne00       = ne10;
+        entry->nrows      = nrows;
+        entry->row_stride = src1->nb[1];
+    }
+    entry->last_use = ++reuse.clock;
+    return entry;
+}
+
+void * ggml_cuda_q8_1_reuse_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const ggml_tensor * as) {
+    if (ctx.curr_stream_no != 0 || !ggml_cuda_q8_1_reuse_enabled() || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+            t->ne[0] % QK8_1 != 0) {
+        return nullptr;
+    }
+    // the consumer's view of t, which keys the entry: all of t from its start, contiguous, and with rows whose q8_1
+    // blocks are those of t in the same order (the same row width, or no row padding in either)
+    size_t offs = 0;
+    for (const ggml_tensor * v = as; v != t; v = v->view_src) {
+        if (v->view_src == nullptr) {
+            return nullptr;
+        }
+        offs += v->view_offs;
+    }
+    if (offs != 0 || !ggml_is_contiguous(as) || ggml_nelements(as) != ggml_nelements(t) || ggml_nrows(as) > MMVQ_MAX_BATCH_SIZE ||
+            (as->ne[0] != t->ne[0] && (as->ne[0] % MATRIX_ROW_PADDING != 0 || t->ne[0] % MATRIX_ROW_PADDING != 0))) {
+        return nullptr;
+    }
+    const size_t q8_1_size = ggml_nrows(as) * GGML_PAD(as->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+    bool inserted = false;
+    // an entry that already exists for t is overwritten: t is being written again
+    return ggml_cuda_q8_1_reuse_entry(ctx, as, q8_1_size, inserted)->bufs.back();
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1643,54 +1722,12 @@ void ggml_cuda_mul_mat_vec_q(
     const bool src1_rows_uniform = src1->nb[2] == src1->nb[1]*ne11 && src1->nb[3] == src1->nb[2]*ne12;
 
     if (ctx.curr_stream_no == 0 && ggml_cuda_q8_1_reuse_enabled() && src1_rows_uniform) {
-        // follow pure views only: an in-place op's result is a view of its source but holds new data
-        const ggml_tensor * src1_root = src1;
-        size_t              src1_offs = 0;
-        while (src1_root->view_src != nullptr &&
-                (src1_root->op == GGML_OP_VIEW || src1_root->op == GGML_OP_RESHAPE ||
-                 src1_root->op == GGML_OP_PERMUTE || src1_root->op == GGML_OP_TRANSPOSE)) {
-            src1_offs += src1_root->view_offs;
-            src1_root  = src1_root->view_src;
-        }
-        auto & reuse = ctx.q8_1_reuse;
-        const int64_t nrows = ne11*ne12*ne13;
-
-        ggml_backend_cuda_context::q8_1_reuse_entry * entry = nullptr;
-        for (auto & e : reuse.entries) {
-            if (e.valid && e.root == src1_root && e.offs == src1_offs && e.ne00 == ne10 && e.nrows == nrows &&
-                    (nrows == 1 || e.row_stride == src1->nb[1])) {
-                entry = &e;
-                break;
-            }
-        }
-        if (entry == nullptr) {
-            // the least recently used (or an invalid) entry takes the new copy
-            entry = &reuse.entries[0];
-            for (auto & e : reuse.entries) {
-                if (!e.valid || (entry->valid && e.last_use < entry->last_use)) {
-                    entry = &e;
-                    if (!e.valid) {
-                        break;
-                    }
-                }
-            }
-            if (q8_1_size > entry->size) {
-                void * buf = nullptr;
-                const size_t size = std::max(q8_1_size, 2*entry->size);
-                CUDA_CHECK(cudaMalloc(&buf, size));
-                entry->bufs.push_back(buf);
-                entry->size = size;
-            }
-            entry->valid      = true;
-            entry->root       = src1_root;
-            entry->offs       = src1_offs;
-            entry->ne00       = ne10;
-            entry->nrows      = nrows;
-            entry->row_stride = src1->nb[1];
+        bool inserted = false;
+        ggml_backend_cuda_context::q8_1_reuse_entry * entry = ggml_cuda_q8_1_reuse_entry(ctx, src1, q8_1_size, inserted);
+        if (inserted) {
             quantize_row_q8_1_cuda(src1_d, nullptr, entry->bufs.back(), src0->type, ne10, s11_src1, s12_src1, s13_src1,
                 ne10_padded, ne11, ne12, ne13, stream);
         }
-        entry->last_use = ++reuse.clock;
         src1_q8_1_d = (char *) entry->bufs.back();
     } else {
         src1_q8_1_d = src1_q8_1.alloc(q8_1_size);

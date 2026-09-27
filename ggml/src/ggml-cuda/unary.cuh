@@ -97,7 +97,8 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 
 // fused SCALE + UNARY (silu, sigmoid) + optional SCALE: dst = s1*f(s0*x + b0) + b1
 bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tensor * unary);
-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1);
+// q8_out: the q8_1 copy of the output to write as well (ggml_cuda_q8_1_reuse_produce), or nullptr
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1, void * q8_out = nullptr);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));

@@ -16,3 +16,9 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// The q8_1 copy of t (contiguous F32, rows of a multiple of 32 values) that the next quantized mat-vecs reading t
+// through the view `as` (t itself, or a reshape of all of it, at most MMVQ_MAX_BATCH_SIZE rows) take from
+// ctx.q8_1_reuse in this graph evaluation instead of quantizing: the producer of t writes it along with t
+// (quantize_q8_1_warp32), in t's rows. nullptr: nothing to write (reuse off, another stream, an unsupported shape).
+void * ggml_cuda_q8_1_reuse_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const ggml_tensor * as);

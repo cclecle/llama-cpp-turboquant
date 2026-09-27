@@ -16,6 +16,28 @@ typedef void (*quantize_cuda_t)(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// One q8_1 block from the 32 consecutive lanes that hold its values (iqs = the lane's index in the block), with the
+// math of quantize_q8_1: a producer that writes the q8_1 copy of its own output (see ggml_cuda_q8_1_reuse_produce)
+// gives the mat-vecs the same bytes as the standalone quantization. All 32 lanes must take part.
+static __device__ __forceinline__ void quantize_q8_1_warp32(const float xi, block_q8_1 * y, const int iqs) {
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y->qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y->ds = make_half2(d, sum);
+}
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

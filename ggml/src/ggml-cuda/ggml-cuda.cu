@@ -3896,6 +3896,96 @@ static bool ggml_cuda_fused_scale_unary_enabled() {
     return enabled;
 }
 
+// The q8_1 copy of nodes[i_out] for the quantized mat-vecs that follow it (within a few nodes), for its producer to
+// write with its output (ggml_cuda_q8_1_reuse_produce), or nullptr. Removes the quantize kernel of each of those
+// inputs (Qwen3.8-Flash-Next: ~195 of 484 per verify pass). GGML_CUDA_FUSE_Q8_1=0: the mat-vecs quantize.
+static void * ggml_cuda_q8_1_for_consumers(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i_out) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_Q8_1");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+    const ggml_tensor * t = cgraph->nodes[i_out];
+    for (int j = i_out + 1; j < cgraph->n_nodes && j <= i_out + 24; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if ((n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) || n->src[1] == nullptr || !ggml_is_quantized(n->src[0]->type)) {
+            continue;
+        }
+        const ggml_tensor * r = n->src[1];
+        while (r->view_src != nullptr &&
+                (r->op == GGML_OP_VIEW || r->op == GGML_OP_RESHAPE || r->op == GGML_OP_PERMUTE || r->op == GGML_OP_TRANSPOSE)) {
+            r = r->view_src;
+        }
+        if (r == t) {
+            return ggml_cuda_q8_1_reuse_produce(*cuda_ctx, t, n->src[1]);
+        }
+    }
+    return nullptr;
+}
+
+// The consecutive GGML_OP_CPY nodes from nodes[i] (views and no-ops between them skipped) that ggml_cuda_cpy_multi
+// can run in one launch; *n_cpys = how many, returns the index of the last one (i: none).
+// GGML_CUDA_FUSE_CPY_MULTI=0: one launch per copy.
+static int ggml_cuda_cpy_multi_run(const ggml_cgraph * cgraph, int i, ggml_tensor ** cpys, int * n_cpys) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_CPY_MULTI");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    *n_cpys = 0;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!enabled || a->op != GGML_OP_CPY || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return i;
+    }
+    const ggml_tensor * s0 = a->src[0];
+    const ggml_tensor * d0 = a->src[1];
+    if (s0->type != d0->type || ggml_blck_size(s0->type) != 1 ||
+            (ggml_type_size(s0->type) != 4 && ggml_type_size(s0->type) != 2) ||
+            !ggml_backend_buffer_is_cuda(s0->buffer) || !ggml_backend_buffer_is_cuda(d0->buffer)) {
+        return i;
+    }
+    const auto same_layout = [](const ggml_tensor * x, const ggml_tensor * y) {
+        return x->type == y->type && ggml_are_same_shape(x, y) &&
+            x->nb[0] == y->nb[0] && x->nb[1] == y->nb[1] && x->nb[2] == y->nb[2] && x->nb[3] == y->nb[3];
+    };
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data;
+        const char * y0 = (const char *) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    cpys[0] = cgraph->nodes[i];
+    int n    = 1;
+    int last = i;
+    for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_CPY_MULTI_MAX; ++j) {
+        ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if (b->op != GGML_OP_CPY || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                !same_layout(b->src[0], s0) || !same_layout(b->src[1], d0) ||
+                !ggml_backend_buffer_is_cuda(b->src[0]->buffer) || !ggml_backend_buffer_is_cuda(b->src[1]->buffer)) {
+            break;
+        }
+        // the copies run concurrently: a destination may overlap no other copy's source or destination
+        bool independent = true;
+        for (int c = 0; c < n && independent; ++c) {
+            independent = !overlap(cpys[c]->src[1], b->src[0]) && !overlap(b->src[1], cpys[c]->src[0]) &&
+                !overlap(cpys[c]->src[1], b->src[1]);
+        }
+        if (!independent) {
+            break;
+        }
+        cpys[n++] = b;
+        last = j;
+    }
+    if (n < 2) {
+        return i;
+    }
+    *n_cpys = n;
+    return last;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3904,6 +3994,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CPY) {
+        ggml_tensor * cpys[GGML_CUDA_CPY_MULTI_MAX];
+        int n_cpys = 0;
+        const int last = ggml_cuda_cpy_multi_run(cgraph, i, cpys, &n_cpys);
+        if (n_cpys > 1) {
+            ggml_cuda_cpy_multi(*cuda_ctx, cpys, n_cpys);
+            return last - i;
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4624,7 +4724,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i + 1));
         return 1;
     }
 
@@ -4667,12 +4767,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         for (ggml_unary_op uop : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
             if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { uop }) &&
                     ggml_cuda_scale_unary_supported(node, cgraph->nodes[i + 1])) {
-                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                    ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i + 2));
                 return 2;
             }
             if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { uop }) &&
                     ggml_cuda_scale_unary_supported(node, cgraph->nodes[i + 1])) {
-                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
+                ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr,
+                    ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i + 1));
                 return 1;
             }
         }
