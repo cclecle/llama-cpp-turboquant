@@ -1,0 +1,60 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index a35de2cbf..934b9cffb 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1645,6 +1645,55 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
+ 
++    // Issue #30 TODO 21: F16 staging scratch for a native-capable (q8_0/q4_0/bf16) K/V operand at
++    // prefill.  A prefill stages (the conversion is amortised over many query rows, and the F16
++    // tiles then feed the cp_async pipeline) while decode/verify reads the raw cache, so this
++    // buffer is only ever touched by a multi-token graph -- which is never CUDA-graph captured (see
++    // the prefill skip in ggml_backend_cuda_graph_compute).  It is therefore safe to allocate it
++    // here instead of reserving it in the compute graph, where the reserve sizes it for n_ctx (up
++    // to ~800 MiB per GPU at a 200k context) even though the real scratch tracks the prefix length.
++    // One arena per stream (concurrent streams can be staging at the same time), bounding the
++    // retained memory to ~1.25x the largest request: the generic pool retains every distinct size,
++    // and this request grows with the prefix, so a long prefill would leave ~150 buffers cached.
++    // The growth policy is not a performance lever (exact-fit realloc measured the same).
++    char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
++    size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
++    bool   fattn_stage_oom_warned                  = false;
++
++    // Try to make the per-stream staging arena hold at least `size` bytes.  Returns the arena
++    // (possibly larger than requested) on success, or nullptr when the device has no room for the
++    // transient: the previous arena is kept so a later, smaller request can still be served.
++    //
++    // A nullptr must not abort the compute: the arena is a deep-prefill *speed* buffer, not a
++    // correctness requirement (the caller falls back to reading the raw K/V cache, which is what
++    // decode/verify does anyway).  The allocation is deliberately not part of the compute-graph
++    // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
++    // less free memory at the first deep prefill than the fit projected; failing here must degrade
++    // to the native read, not kill the run.
++    void * fattn_stage_try_get(int stream_no, size_t size) {
++        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
++        if (size > fattn_stage_size[stream_no]) {
++            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
++            char * new_arena = nullptr;
++            if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
++                (void) cudaGetLastError(); // clear the sticky error
++                if (!fattn_stage_oom_warned) {
++                    fattn_stage_oom_warned = true;
++                    GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
++                                  "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
++                                  __func__, new_size >> 20);
++                }
++                return nullptr;
++            }
++            if (fattn_stage[stream_no] != nullptr) {
++                CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
++            }
++            fattn_stage[stream_no]      = new_arena;
++            fattn_stage_size[stream_no] = new_size;
++        }
++        return fattn_stage[stream_no];
++    }
++
+     ~ggml_backend_cuda_context();
+ 
+     cudaStream_t stream(int device, int stream) {

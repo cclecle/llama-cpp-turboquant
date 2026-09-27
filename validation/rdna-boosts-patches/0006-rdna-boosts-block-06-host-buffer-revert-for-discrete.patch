@@ -1,0 +1,2404 @@
+From 7a1b640ba3109640b0f925b73984ead00e2c73f2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sat, 29 Aug 2026 08:14:24 -0500
+Subject: [PATCH 06/15] rdna-boosts: block 06: host-buffer revert for discrete
+ GPUs
+
+On the 050dde50c baseline this block reverted PR #24233 (restore
+prop.integrated on HIP builds): integrated=true enables the CUDA host-buffer
+path (zero-copy UMA weights) on APUs, which corrupts full-model results under
+async execution on this box (PPL 5.9243 -> 8.51+ without HIP_LAUNCH_BLOCKING).
+
+Re-based 2026-09-08 onto master 9113cc188: upstream itself reverted #24233 in
+#28604 (2026-09-08), making forced-integrated-false the upstream default.  The
+functional delta of this block is therefore now upstream; the block is retained
+so the fork keeps its 14-block structure and carries only the rationale marker
+comment above the (now unconditional) integrated = false line, guarding against
+re-landing prop.integrated without re-testing this box.
+
+Amended 2026-09-18 with the FA instance build fix: the MMA template instances are generated
+per (ncols1, ncols2, head size) instead of per (ncols1, ncols2), and the head-512 instances are
+listed first in the backend source order so they are not the tail of the build.  Build-time only:
+identical explicit instantiations, identical symbols.  Also mirrors the ordering in the CUDA
+backend's CMakeLists.txt.
+---
+ common/fit.cpp                                | 208 +++++++++++++++++-
+ docs/multi-gpu.md                             |   4 +-
+ ggml/include/ggml-backend.h                   |   9 +
+ ggml/src/ggml-backend-meta.cpp                |   8 +-
+ ggml/src/ggml-cuda/CMakeLists.txt             |   6 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
+ ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_1-ncols2_16-dkq576-dv512.cu |   5 +
+ ...stance-ncols1_1-ncols2_32-dkq320-dv256.cu} |   1 -
+ ...nstance-ncols1_1-ncols2_32-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_1-ncols2_8.cu |  12 -
+ ...nstance-ncols1_16-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_1.cu |  10 -
+ ...nstance-ncols1_16-ncols2_2-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq512-dv512.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_2.cu |  11 -
+ ...nstance-ncols1_16-ncols2_4-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq512-dv512.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq576-dv512.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_4.cu |  12 -
+ ...stance-ncols1_2-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_2-ncols2_16-dkq576-dv512.cu |   5 +
+ ...stance-ncols1_2-ncols2_32-dkq320-dv256.cu} |   1 -
+ ...nstance-ncols1_2-ncols2_32-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_2-ncols2_4.cu |  12 -
+ ...instance-ncols1_2-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_2-ncols2_8.cu |  12 -
+ ...nstance-ncols1_32-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_32-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_32-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_32-ncols2_1.cu |  10 -
+ ...nstance-ncols1_32-ncols2_2-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq512-dv512.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_32-ncols2_2.cu |  11 -
+ ...stance-ncols1_4-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_4-ncols2_16-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_2.cu |  11 -
+ ...instance-ncols1_4-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_4.cu |  12 -
+ ...instance-ncols1_4-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_8.cu |  12 -
+ ...nstance-ncols1_64-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_64-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_64-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_64-ncols2_1.cu |  10 -
+ ...instance-ncols1_8-ncols2_1-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_1-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_1-dkq256-dv256.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_1.cu |  10 -
+ ...instance-ncols1_8-ncols2_2-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_2.cu |  11 -
+ ...instance-ncols1_8-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_4.cu |  12 -
+ ...instance-ncols1_8-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_8.cu |  12 -
+ .../template-instances/generate_cu_files.py   |  46 ++--
+ ggml/src/ggml-hip/CMakeLists.txt              |   6 +
+ 150 files changed, 869 insertions(+), 214 deletions(-)
+ rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq192-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_2-ncols2_16.cu => fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq192-dv128.cu} (79%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq576-dv512.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_2-ncols2_32.cu => fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq320-dv256.cu} (79%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq192-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_4-ncols2_16.cu => fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq192-dv128.cu} (79%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq192-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq112-dv112.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq128-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq192-dv128.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq256-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq96-dv96.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
+
+diff --git a/common/fit.cpp b/common/fit.cpp
+index faa595f84..e9462c579 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -180,9 +180,6 @@ static void common_params_fit_impl(
+         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+-    }
+     constexpr int64_t MiB = 1024*1024;
+     typedef std::vector<llama_device_memory_data> dmds_t;
+     const llama_model_params default_mparams = llama_model_default_params();
+@@ -290,6 +287,211 @@ static void common_params_fit_impl(
+         }
+     }
+ 
++    // ===== tensor split (-sm tensor / LLAMA_SPLIT_MODE_TENSOR) =====
++    //
++    // Under tensor split every GPU wraps into a single Meta device, so the layer-granular algorithm
++    // below (whole layers per device, layer counts written into tensor_split) does not apply.  The
++    // measurement above therefore yields one Meta entry whose components have mixed meaning:
++    //   - model   is the whole offloaded tensor set, counted once (a per-device total once split)
++    //   - context and compute are per-device: the Meta buffer reports its largest sub-buffer
++    // The fit estimates total device memory as model + n_devices * (context + compute), assigns
++    // tensor_split proportional to each device's free memory minus its margin (so the loader's
++    // proportional sharding leaves every device at the same fill fraction), then reduces n_ctx and,
++    // if needed, n_gpu_layers until the estimate fits the summed targets.
++    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
++        std::vector<ggml_backend_dev_t> tdevs; // the "simple" devices behind the Meta wrapper
++        for (ggml_backend_dev_t dev : devs) {
++            if (ggml_backend_dev_is_meta(dev)) {
++                const size_t n_dev = ggml_backend_meta_dev_n_devs(dev);
++                for (size_t i = 0; i < n_dev; i++) {
++                    tdevs.push_back(ggml_backend_meta_dev_simple_dev(dev, i));
++                }
++            } else {
++                tdevs.push_back(dev);
++            }
++        }
++        if (tdevs.empty()) {
++            throw common_params_fit_exception("no devices behind the Meta device, abort");
++        }
++        const size_t ntd = tdevs.size();
++        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
++            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
++        }
++        if (!tensor_split) {
++            throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
++        }
++        // per-device target = free memory minus the requested margin
++        std::vector<int64_t> ttarget(ntd);
++        int64_t target_sum = 0;
++        for (size_t id = 0; id < ntd; id++) {
++            size_t free = 0;
++            size_t total = 0;
++            ggml_backend_dev_memory(tdevs[id], &free, &total);
++            ttarget[id] = std::max<int64_t>(0, (int64_t) free - (int64_t) margins_s[id]);
++            target_sum += ttarget[id];
++            LOG_TRC("%s: tensor split: device %zu target %" PRId64 " MiB (free %" PRId64 " MiB, margin %zu MiB)\n",
++                __func__, id, ttarget[id]/MiB, (int64_t) free/MiB, margins_s[id]/MiB);
++        }
++
++        // A user-pinned -ts is honored: the fit keeps the requested balance and only chooses
++        // n_ctx / n_gpu_layers so that balance fits.  Without one, the split is pinned
++        // proportional to the targets.
++        bool ts_pinned = false;
++        std::vector<double> ratio(ntd, 0.0);
++        if (mparams->tensor_split) {
++            double sum = 0.0;
++            for (size_t id = 0; id < ntd; id++) {
++                ratio[id] = std::max(0.0, (double) mparams->tensor_split[id]);
++                sum += ratio[id];
++            }
++            if (sum > 0.0) {
++                ts_pinned = true;
++                for (size_t id = 0; id < ntd; id++) {
++                    ratio[id] /= sum;
++                }
++                LOG_TRC("%s: tensor split: honoring the user tensor_split ratios\n", __func__);
++            }
++        }
++        if (!ts_pinned) {
++            // tensor_split proportional to the target, so the loader shards the model in the same
++            // ratio.  Only the ratios matter; use MiB so the values stay small and print cleanly
++            // (llama-fit-params renders tensor_split as uint32_t).
++            double sum = 0.0;
++            for (size_t id = 0; id < ntd; id++) {
++                sum += (double) ttarget[id];
++            }
++            for (size_t id = 0; id < ntd; id++) {
++                tensor_split[id] = (float) (ttarget[id] / MiB);
++                ratio[id] = sum > 0.0 ? (double) ttarget[id] / sum : 0.0;
++            }
++            for (size_t id = ntd; id < llama_max_devices(); id++) {
++                tensor_split[id] = 0.0f;
++            }
++            mparams->tensor_split = tensor_split;
++        }
++
++        // The estimate is a per-device total: a device holding ratio r gets r * D, so the fit must
++        // satisfy r_i * D <= target_i for every used device, i.e. D <= min_i(target_i / r_i).
++        // With the auto split (r_i = target_i / sum(target)) that is exactly sum(target), so the
++        // two cases share one budget.
++        int64_t budget = target_sum;
++        for (size_t id = 0; id < ntd; id++) {
++            if (ratio[id] > 0.0) {
++                budget = std::min<int64_t>(budget, (int64_t) ((double) ttarget[id] / ratio[id]));
++            }
++        }
++
++        // total device memory estimate; the Meta buffer reports the largest sub-buffer for
++        // context/compute, so counting them once per device is the safe (slightly high) direction
++        auto estimate = [&](const dmds_t & dmds) -> int64_t {
++            int64_t model = 0;
++            int64_t ctx   = 0;
++            int64_t comp  = 0;
++            for (size_t id = 0; id < nd; id++) {
++                model += dmds[id].mb.model;
++                ctx   += dmds[id].mb.context;
++                comp  += dmds[id].mb.compute;
++            }
++            return model + (int64_t) ntd * (ctx + comp);
++        };
++        // the Meta devices of the main and extra models are distinct objects, so add_extra_memory()
++        // could not attribute the extra model to the main Meta entry -- do it here
++        auto extra_estimate = [&]() -> int64_t {
++            if (extra == nullptr) {
++                return 0;
++            }
++            extra->cparams->n_ctx = cparams->n_ctx;
++            std::vector<ggml_backend_dev_t> devs_extra;
++            uint32_t ngl_extra = 0;
++            uint32_t nct_extra = 0;
++            uint32_t nex_extra = 0;
++            dmds_t measured;
++            try {
++                measured = common_get_device_memory_data_impl(
++                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
++            } catch (const std::runtime_error & e) {
++                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
++                return 0;
++            }
++            int64_t model = 0;
++            int64_t ctx   = 0;
++            int64_t comp  = 0;
++            for (size_t id = 0; id + 1 < measured.size(); id++) {
++                model += measured[id].mb.model;
++                ctx   += measured[id].mb.context;
++                comp  += measured[id].mb.compute;
++            }
++            if (extra->shares_model) {
++                model = 0; // the extra context runs on the main model's weights
++            }
++            return model + (int64_t) ntd * (ctx + comp);
++        };
++
++        int64_t used_total = estimate(dmds_full) + extra_estimate();
++        if (ts_pinned) {
++            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB effective budget "
++                "(sum of targets %" PRId64 " MiB, pinned tensor_split)\n",
++                __func__, ntd, used_total/MiB, budget/MiB, target_sum/MiB);
++        } else {
++            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB target\n",
++                __func__, ntd, used_total/MiB, budget/MiB);
++        }
++
++        if (used_total <= budget) {
++            LOG_TRC("%s: tensor split: no changes needed\n", __func__);
++            return;
++        }
++
++        // reduce the context size first
++        if (n_ctx_auto && n_ctx_max > n_ctx_min_total) {
++            const uint32_t n_ctx_save = cparams->n_ctx;
++            cparams->n_ctx = n_ctx_min_total;
++            dmds_t dmds_min = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            const int64_t used_min = estimate(dmds_min) + extra_estimate();
++            cparams->n_ctx = n_ctx_save;
++
++            if (used_min <= budget && used_total > used_min) {
++                const uint32_t n_ctx = n_ctx_min_total + (uint32_t) (
++                    (int64_t) (n_ctx_max - n_ctx_min_total) * (budget - used_min) / (used_total - used_min));
++                const uint32_t align = 256 * n_streams;
++                cparams->n_ctx = std::max(std::min(n_ctx, n_ctx_max) - std::min(n_ctx, n_ctx_max) % align, n_ctx_min_total);
++                LOG_TRC("%s: tensor split: context size reduced from %" PRIu32 " to %" PRIu32 "\n",
++                    __func__, n_ctx_max, cparams->n_ctx);
++                return;
++            }
++            LOG_TRC("%s: tensor split: context reduction alone is not enough (needs %" PRId64 " MiB at the minimum context), reducing the offloaded layers\n",
++                __func__, used_min/MiB);
++        } else if (!n_ctx_auto) {
++            LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
++        }
++
++        // reduce the number of offloaded layers with a binary search over the estimate
++        uint32_t ngl_lo = 0;
++        uint32_t ngl_hi = hp_ngl + 1;
++        uint32_t ngl_best = 0;
++        int64_t  used_best = 0;
++        while (ngl_lo <= ngl_hi) {
++            const uint32_t ngl_mid = ngl_lo + (ngl_hi - ngl_lo) / 2;
++            mparams->n_gpu_layers = (int32_t) ngl_mid;
++            dmds_t dmds_ngl = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            const int64_t used = estimate(dmds_ngl) + extra_estimate();
++            LOG_TRC("%s: tensor split: n_gpu_layers=%" PRIu32 " -> %" PRId64 " MiB\n", __func__, ngl_mid, used/MiB);
++            if (used <= budget) {
++                ngl_best  = ngl_mid;
++                used_best = used;
++                ngl_lo    = ngl_mid + 1;
++            } else if (ngl_mid == 0) {
++                break;
++            } else {
++                ngl_hi = ngl_mid - 1;
++            }
++        }
++        mparams->n_gpu_layers = (int32_t) ngl_best;
++        LOG_TRC("%s: tensor split: offloading %" PRIu32 " layers, estimated use %" PRId64 " MiB\n",
++            __func__, ngl_best, used_best/MiB);
++        return;
++    }
++
+     std::vector<std::string> dev_names;
+     {
+         dev_names.reserve(nd);
+diff --git a/docs/multi-gpu.md b/docs/multi-gpu.md
+index 0d9eea7c2..25afa37b7 100644
+--- a/docs/multi-gpu.md
++++ b/docs/multi-gpu.md
+@@ -43,7 +43,7 @@ Set with `--split-mode` / `-sm`.
+ | `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
+ | `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
+ | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
+-| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
++| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. Supported in both `layer` and `tensor` split modes. In `tensor` split the fit assigns `--tensor-split` proportional to each device's free memory minus its target margin and reduces `--ctx-size` / `--n-gpu-layers` as needed. |
+ 
+ As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
+ 
+@@ -121,7 +121,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs)
+ | Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+ | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
+ | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
+-| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
++| CUDA OOM at startup or during prefill in `--split-mode tensor` | With `--fit` on (the default), raise `--fit-target` to reserve more headroom per device; the fit reduces `--ctx-size` and, if needed, `--n-gpu-layers`. With `--fit off`, reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
+ | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
+ | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
+ | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36..5a9e96ea6 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -404,6 +404,15 @@ extern "C" {
+     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+ 
++    // returns true if the device was created by ggml_backend_meta_device()
++    GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
++
++    // number of "simple" devices wrapped by a meta device
++    GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t dev);
++
++    // the index-th "simple" device wrapped by a meta device
++    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
++
+     //
+     // Utils
+     //
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 7c1c0b864..302d4bd16 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -82,7 +82,7 @@ struct ggml_backend_meta_device_context {
+     }
+ };
+ 
+-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
++bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+ 
+ static const char * ggml_backend_meta_device_get_name(ggml_backend_dev_t dev) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+@@ -195,17 +195,17 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .event_synchronize    = */ nullptr,
+ };
+ 
+-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
++bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
+ }
+ 
+-static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
++size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+     return meta_dev_ctx->simple_devs.size();
+ }
+ 
+-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
++ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 2254090cb..9fd309bbb 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -103,9 +103,15 @@ if (CUDAToolkit_FOUND)
+     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+ 
+     file(GLOB   GGML_SOURCES_CUDA "*.cu")
++    # The 512-head flash-attn MMA instances are by far the longest single compiles (~130 s each);
++    # list them first so make's FIFO dispatch starts them at t=0 instead of leaving them as the tail
++    # of the build (the same as the generated per-head/per-type split -- this is build order only).
++    file(GLOB   SRCS_FA_HEAVY "template-instances/fattn-mma*-dkq512-*.cu")
++    list(INSERT GGML_SOURCES_CUDA 0 ${SRCS_FA_HEAVY})
+     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
++    list(REMOVE_ITEM SRCS ${SRCS_FA_HEAVY})
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+     file(GLOB   SRCS "template-instances/mmq*.cu")
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 62631e987..1d6d763f5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -306,6 +306,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+ 
+         info.default_tensor_split[id] = total_vram;
+         total_vram += device_vram;
++        // Fork divergence from PR #24233 (restored prop.integrated on HIP builds): the CUDA
++        // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
++        // results under async execution on this box (PPL 5.9243 -> 8.51+ without
++        // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
++        // forced-integrated-false the upstream default again; this marker guards against
++        // re-landing prop.integrated without re-testing that box.
+         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+         info.devices[id].nsm        = prop.multiProcessorCount;
+         info.devices[id].smpb       = prop.sharedMemPerBlock;
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu
+similarity index 79%
+rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu
+index b2661b931..1699a4908 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu
+@@ -3,4 +3,3 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(192, 128, 1, 16);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
+new file mode 100644
+index 000000000..fb26abeb0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu
+similarity index 79%
+rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu
+index 8fc3b1797..409ade3fc 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu
+@@ -3,4 +3,3 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(320, 256, 1, 32);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 1, 32);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq576-dv512.cu
+new file mode 100644
+index 000000000..1f554d81e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 1, 32);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq112-dv112.cu
+new file mode 100644
+index 000000000..eb9d9e8a0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq128-dv128.cu
+new file mode 100644
+index 000000000..3be2bf84a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq192-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq192-dv128.cu
+new file mode 100644
+index 000000000..4ee5863e6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq192-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(192, 128, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq256-dv256.cu
+new file mode 100644
+index 000000000..c87bb1882
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq512-dv512.cu
+new file mode 100644
+index 000000000..d0fb5e1a2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq64-dv64.cu
+new file mode 100644
+index 000000000..4a3468473
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq80-dv80.cu
+new file mode 100644
+index 000000000..4dd83b2af
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq96-dv96.cu
+new file mode 100644
+index 000000000..b9ae22954
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
+deleted file mode 100644
+index 6ae77bec8..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(192, 128, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 1, 8);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 1, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq112-dv112.cu
+new file mode 100644
+index 000000000..4f564e4c9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq128-dv128.cu
+new file mode 100644
+index 000000000..2f171cc59
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq256-dv256.cu
+new file mode 100644
+index 000000000..c81382a57
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq64-dv64.cu
+new file mode 100644
+index 000000000..b3917c1bd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq80-dv80.cu
+new file mode 100644
+index 000000000..d245afd1d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq96-dv96.cu
+new file mode 100644
+index 000000000..18cdd143d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
+deleted file mode 100644
+index 9d3cfd8ed..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 16, 1);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 16, 1);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 16, 1);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 16, 1);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 16, 1);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 16, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq112-dv112.cu
+new file mode 100644
+index 000000000..dd24cbb0d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq128-dv128.cu
+new file mode 100644
+index 000000000..c50d0e821
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq256-dv256.cu
+new file mode 100644
+index 000000000..5fb8693c0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq512-dv512.cu
+new file mode 100644
+index 000000000..d2291225c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq64-dv64.cu
+new file mode 100644
+index 000000000..affafcf60
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq80-dv80.cu
+new file mode 100644
+index 000000000..93861d97c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq96-dv96.cu
+new file mode 100644
+index 000000000..3ada2f336
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
+deleted file mode 100644
+index 0c1a37fd0..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
++++ /dev/null
+@@ -1,11 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 16, 2);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 16, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq112-dv112.cu
+new file mode 100644
+index 000000000..44ae9c4d5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq128-dv128.cu
+new file mode 100644
+index 000000000..043447bbe
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq256-dv256.cu
+new file mode 100644
+index 000000000..9708e115f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq512-dv512.cu
+new file mode 100644
+index 000000000..eeae88afe
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq576-dv512.cu
+new file mode 100644
+index 000000000..c07de3323
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq64-dv64.cu
+new file mode 100644
+index 000000000..1f3a49ee4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq80-dv80.cu
+new file mode 100644
+index 000000000..f469f19f0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq96-dv96.cu
+new file mode 100644
+index 000000000..8fefcff2f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
+deleted file mode 100644
+index d2415bfa9..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 16, 4);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 16, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq192-dv128.cu
+similarity index 79%
+rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq192-dv128.cu
+index fd41e71b1..aae3da8ba 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq192-dv128.cu
+@@ -3,4 +3,3 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(192, 128, 2, 16);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 2, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq576-dv512.cu
+new file mode 100644
+index 000000000..f011a208c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 2, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq320-dv256.cu
+similarity index 79%
+rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq320-dv256.cu
+index abd2b21ce..e63f9aba0 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq320-dv256.cu
+@@ -3,4 +3,3 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(320, 256, 2, 32);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 2, 32);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq576-dv512.cu
+new file mode 100644
+index 000000000..264751d65
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 2, 32);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq112-dv112.cu
+new file mode 100644
+index 000000000..7ae8b5488
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq128-dv128.cu
+new file mode 100644
+index 000000000..a2a3d4c04
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq256-dv256.cu
+new file mode 100644
+index 000000000..cf3fe3ecc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq512-dv512.cu
+new file mode 100644
+index 000000000..a21e87e01
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq576-dv512.cu
+new file mode 100644
+index 000000000..aaeb9a701
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq64-dv64.cu
+new file mode 100644
+index 000000000..c58ba7969
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq80-dv80.cu
+new file mode 100644
+index 000000000..835a10219
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq96-dv96.cu
+new file mode 100644
+index 000000000..5cb225a70
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
+deleted file mode 100644
+index 8eec1d74e..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 2, 4);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 2, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq112-dv112.cu
+new file mode 100644
+index 000000000..7573dac01
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq128-dv128.cu
+new file mode 100644
+index 000000000..5ef717223
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq192-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq192-dv128.cu
+new file mode 100644
+index 000000000..322d55d09
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq192-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(192, 128, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq256-dv256.cu
+new file mode 100644
+index 000000000..6aba4ed42
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq512-dv512.cu
+new file mode 100644
+index 000000000..61d548a43
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq64-dv64.cu
+new file mode 100644
+index 000000000..a3ad8b838
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq80-dv80.cu
+new file mode 100644
+index 000000000..415352179
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq96-dv96.cu
+new file mode 100644
+index 000000000..9b9bf0ebe
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
+deleted file mode 100644
+index 9f4bef11a..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(192, 128, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 2, 8);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 2, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq112-dv112.cu
+new file mode 100644
+index 000000000..e32457c27
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq128-dv128.cu
+new file mode 100644
+index 000000000..cab6128dd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq256-dv256.cu
+new file mode 100644
+index 000000000..0c759e827
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq64-dv64.cu
+new file mode 100644
+index 000000000..c484caf72
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq80-dv80.cu
+new file mode 100644
+index 000000000..4c559b879
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq96-dv96.cu
+new file mode 100644
+index 000000000..951b7cb00
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
+deleted file mode 100644
+index 0543532ea..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 32, 1);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 32, 1);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 32, 1);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 32, 1);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 32, 1);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 32, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq112-dv112.cu
+new file mode 100644
+index 000000000..5a9d1ceff
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq128-dv128.cu
+new file mode 100644
+index 000000000..a0035a929
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq256-dv256.cu
+new file mode 100644
+index 000000000..3abcc246c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq512-dv512.cu
+new file mode 100644
+index 000000000..621853f52
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq64-dv64.cu
+new file mode 100644
+index 000000000..59bbb1180
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq80-dv80.cu
+new file mode 100644
+index 000000000..db293d876
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq96-dv96.cu
+new file mode 100644
+index 000000000..e426e2662
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
+deleted file mode 100644
+index d5a4d160a..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
++++ /dev/null
+@@ -1,11 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 32, 2);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 32, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq192-dv128.cu
+similarity index 79%
+rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq192-dv128.cu
+index cc41fa52f..ea117f7e4 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq192-dv128.cu
+@@ -3,4 +3,3 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(192, 128, 4, 16);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 4, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq576-dv512.cu
+new file mode 100644
+index 000000000..f5fd0e236
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 4, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq112-dv112.cu
+new file mode 100644
+index 000000000..45304a756
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq128-dv128.cu
+new file mode 100644
+index 000000000..1f9b782c8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq256-dv256.cu
+new file mode 100644
+index 000000000..ef71be48e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq512-dv512.cu
+new file mode 100644
+index 000000000..362a4f91c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq64-dv64.cu
+new file mode 100644
+index 000000000..e4435d7ac
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq80-dv80.cu
+new file mode 100644
+index 000000000..3140f787f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq96-dv96.cu
+new file mode 100644
+index 000000000..7804c9171
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
+deleted file mode 100644
+index d8e7588cf..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
++++ /dev/null
+@@ -1,11 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 4, 2);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 4, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq112-dv112.cu
+new file mode 100644
+index 000000000..e71de3ce9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq128-dv128.cu
+new file mode 100644
+index 000000000..55db1c7e2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq256-dv256.cu
+new file mode 100644
+index 000000000..a24d5ab93
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq512-dv512.cu
+new file mode 100644
+index 000000000..fb52c1eb4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq576-dv512.cu
+new file mode 100644
+index 000000000..f5b0b6456
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq64-dv64.cu
+new file mode 100644
+index 000000000..70c580253
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq80-dv80.cu
+new file mode 100644
+index 000000000..847e3b06f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq96-dv96.cu
+new file mode 100644
+index 000000000..7d7b3d3ce
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
+deleted file mode 100644
+index 3475dfea0..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 4, 4);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 4, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq112-dv112.cu
+new file mode 100644
+index 000000000..0b1368da8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq128-dv128.cu
+new file mode 100644
+index 000000000..fda596816
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq192-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq192-dv128.cu
+new file mode 100644
+index 000000000..35bd50ccc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq192-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(192, 128, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq256-dv256.cu
+new file mode 100644
+index 000000000..ad9882e2b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq512-dv512.cu
+new file mode 100644
+index 000000000..ea7f7c3e4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq64-dv64.cu
+new file mode 100644
+index 000000000..6bc3a97e6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq80-dv80.cu
+new file mode 100644
+index 000000000..8f99bbc0c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq96-dv96.cu
+new file mode 100644
+index 000000000..56677c380
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
+deleted file mode 100644
+index 859bea5c5..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(192, 128, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 4, 8);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 4, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq112-dv112.cu
+new file mode 100644
+index 000000000..90104ed56
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq128-dv128.cu
+new file mode 100644
+index 000000000..bd774df06
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq256-dv256.cu
+new file mode 100644
+index 000000000..f920ac417
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq64-dv64.cu
+new file mode 100644
+index 000000000..321a9a3ca
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq80-dv80.cu
+new file mode 100644
+index 000000000..f0230098e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq96-dv96.cu
+new file mode 100644
+index 000000000..048cb810d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
+deleted file mode 100644
+index 0d7a9c728..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 64, 1);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 64, 1);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 64, 1);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 64, 1);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 64, 1);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 64, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq112-dv112.cu
+new file mode 100644
+index 000000000..57840660f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq128-dv128.cu
+new file mode 100644
+index 000000000..eb3b1e96f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq256-dv256.cu
+new file mode 100644
+index 000000000..0630010e2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq64-dv64.cu
+new file mode 100644
+index 000000000..f6fb2f870
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq80-dv80.cu
+new file mode 100644
+index 000000000..4c5fc808e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq96-dv96.cu
+new file mode 100644
+index 000000000..b6fa7f572
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
+deleted file mode 100644
+index 9d5a9976f..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
++++ /dev/null
+@@ -1,10 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 8, 1);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 8, 1);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 8, 1);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 8, 1);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 8, 1);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 8, 1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq112-dv112.cu
+new file mode 100644
+index 000000000..38cfe7bff
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq128-dv128.cu
+new file mode 100644
+index 000000000..2a858b2d5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq256-dv256.cu
+new file mode 100644
+index 000000000..80bcb87bb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq512-dv512.cu
+new file mode 100644
+index 000000000..8aa9f3704
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq64-dv64.cu
+new file mode 100644
+index 000000000..ab94deaa2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq80-dv80.cu
+new file mode 100644
+index 000000000..452f91973
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq96-dv96.cu
+new file mode 100644
+index 000000000..4b02df2e2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
+deleted file mode 100644
+index e48e28c4e..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
++++ /dev/null
+@@ -1,11 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 8, 2);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 8, 2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq112-dv112.cu
+new file mode 100644
+index 000000000..bd42d1aef
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq128-dv128.cu
+new file mode 100644
+index 000000000..7b62ae059
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq256-dv256.cu
+new file mode 100644
+index 000000000..1434158c2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq512-dv512.cu
+new file mode 100644
+index 000000000..1cf0df994
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq576-dv512.cu
+new file mode 100644
+index 000000000..2210fd7b3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq576-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(576, 512, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq64-dv64.cu
+new file mode 100644
+index 000000000..a203a9894
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq80-dv80.cu
+new file mode 100644
+index 000000000..953c12462
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq96-dv96.cu
+new file mode 100644
+index 000000000..5ba46bd84
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
+deleted file mode 100644
+index 684cd25ce..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 8, 4);
+-DECL_FATTN_MMA_F16_CASE(576, 512, 8, 4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq112-dv112.cu
+new file mode 100644
+index 000000000..a75eafc0b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq112-dv112.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(112, 112, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq128-dv128.cu
+new file mode 100644
+index 000000000..7febb14d5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq128-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(128, 128, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq192-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq192-dv128.cu
+new file mode 100644
+index 000000000..c49223db8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq192-dv128.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(192, 128, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq256-dv256.cu
+new file mode 100644
+index 000000000..3c0b0a2ed
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq256-dv256.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(256, 256, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq512-dv512.cu
+new file mode 100644
+index 000000000..c3eb5e6fa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq512-dv512.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(512, 512, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq64-dv64.cu
+new file mode 100644
+index 000000000..40e150c0a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq64-dv64.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(64, 64, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq80-dv80.cu
+new file mode 100644
+index 000000000..23ed7746e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq80-dv80.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(80, 80, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq96-dv96.cu
+new file mode 100644
+index 000000000..c12f30159
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq96-dv96.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-mma-f16.cuh"
++
++DECL_FATTN_MMA_F16_CASE(96, 96, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
+deleted file mode 100644
+index c975ce6b9..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-mma-f16.cuh"
+-
+-DECL_FATTN_MMA_F16_CASE(64, 64, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(80, 80, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(96, 96, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(112, 112, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(128, 128, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(192, 128, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(256, 256, 8, 8);
+-DECL_FATTN_MMA_F16_CASE(512, 512, 8, 8);
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index d7cd27167..75dafd7ee 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -80,26 +80,32 @@ for ncols in [8, 16, 32, 64]:
+         if ncols2 > ncols:
+             continue
+         ncols1 = ncols // ncols2
+-        with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
+-            f.write(SOURCE_FATTN_MMA_START)
+-
+-            for head_size_kq in HEAD_SIZES_KQ:
+-                if head_size_kq == 40:
+-                    continue
+-                if head_size_kq == 72:
+-                    continue
+-                # Skip compilation of unused ncols2 values for niche head sizes:
+-                if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
+-                    continue
+-                if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
+-                    continue
+-                if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
+-                    continue
+-                if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
+-                    continue
+-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
+-                    continue
+-                head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
++
++        # One translation unit per (ncols1, ncols2, head size) instead of one per
++        # (ncols1, ncols2).  The set of emitted template instantiations is exactly the
++        # same; only their grouping changes, so this is build-time only (the native-KV
++        # arm chain in fattn-mma-f16.cuh duplicates the whole WMMA kernel per KV type,
++        # which made the 8-case files ~200 s each and the backend build one-file-bound).
++        # CMake globs template-instances/fattn-mma*.cu, so no CMake change is needed.
++        for head_size_kq in HEAD_SIZES_KQ:
++            if head_size_kq == 40:
++                continue
++            if head_size_kq == 72:
++                continue
++            # Skip compilation of unused ncols2 values for niche head sizes:
++            if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
++                continue
++            if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
++                continue
++            if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
++                continue
++            if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
++                continue
++            if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
++                continue
++            head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
++            with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
++                f.write(SOURCE_FATTN_MMA_START)
+                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
+ 
+ for type in TYPES_MMQ:
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index a6a6b7271..f3ef92ef3 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -61,9 +61,15 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
+ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
+ 
+ file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
++# The 512-head flash-attn MMA instances are by far the longest single compiles (~130 s each);
++# list them first so make's FIFO dispatch starts them at t=0 instead of leaving them as the tail
++# of the build (the same as the generated per-head/per-type split -- this is build order only).
++file(GLOB   SRCS_FA_HEAVY "../ggml-cuda/template-instances/fattn-mma*-dkq512-*.cu")
++list(INSERT GGML_SOURCES_ROCM 0 ${SRCS_FA_HEAVY})
+ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
++list(REMOVE_ITEM SRCS ${SRCS_FA_HEAVY})
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+ file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-- 
+2.55.0
+

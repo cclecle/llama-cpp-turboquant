@@ -1,0 +1,194 @@
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index b15af7104..1b9e63516 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -44,16 +44,42 @@ static __global__ void indexer_topk_radix_init(indexer_topk_radix_state * states
+     }
+ }
+ 
+-// value(c) for row r: score[cell_blk(c, s), t, s] + additive(c, t, s)
++// value(c) for row r: score[cell_blk(c, s), t, s] + bias(b, t, s) + additive(c, t, s)
++// the per-block bias is already folded into score unless extra.blk_idx is set, and the
++// per-cell additive is the mask (or the bias when blk_bias is off) unless extra.cell_pos is
++struct indexer_topk_extra {
++    const int * cell_pos;   // I32 [n_kv, n_stream], -1 for an empty or foreign cell
++    const int * q_pos;      // I32 [n_tps, n_stream]
++    const int * blk_idx;    // I32 [n_blocks, n_stream], -1 incomplete, INT32_MAX for the spare
++    const int * blk_tail;   // I32 [n_tps, n_stream]
++};
++
+ template<typename kv_t>
+ static __device__ __forceinline__ float indexer_topk_value(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         int c, int t, int s,
+         int n_blocks, int n_tps, int n_kv) {
+     const int b = cell_blk[c + s*n_kv];
+-    const float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++    float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++
++    if (extra.blk_idx != nullptr) {
++        // the block's first-cell position against this token's tail start: the tail is the
++        // incomplete block and is always visible.  a foreign block needs no -inf here - the
++        // visibility below drops every one of its cells, and -inf + -inf is still -inf, so
++        // the values (and the selection) stay identical.
++        const int bi = extra.blk_idx[b + s*n_blocks];
++        sc += bi < 0 ? -INFINITY : (bi >= extra.blk_tail[t + s*n_tps] ? 1e9f : 0.0f);
++    }
++
++    if (extra.cell_pos != nullptr) {
++        // same predicate as set_input_kq_mask_impl: empty, foreign and future cells are -inf
++        const int cp = extra.cell_pos[c + s*n_kv];
++        return sc + (cp >= 0 && cp <= extra.q_pos[t + s*n_tps] ? 0.0f : -INFINITY);
++    }
++
+     return sc + (float) additive[c + t*n_kv + s*n_kv*n_tps];
+ }
+ 
+@@ -62,6 +88,7 @@ static __global__ void indexer_topk_radix_histogram(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         int * __restrict__ block_histograms,
+         int ncols, int n_tps, int n_blocks, int n_kv,
+@@ -86,7 +113,7 @@ static __global__ void indexer_topk_radix_histogram(
+          col < ncols;
+          col += blocks_per_row * BLOCK_SIZE) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         if ((key & state.prefix_mask) == state.prefix) {
+             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+         }
+@@ -148,6 +175,7 @@ static __global__ void indexer_topk_count(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         int * __restrict__ g_cnt, int * __restrict__ e_cnt,
+         int ncols, int n_tps, int n_blocks, int n_kv,
+@@ -163,7 +191,7 @@ static __global__ void indexer_topk_count(
+     int g = 0, e = 0;
+     if (col < ncols) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         g = (key >  states[row].prefix) ? 1 : 0;
+         e = (key == states[row].prefix) ? 1 : 0;
+     }
+@@ -226,6 +254,7 @@ static __global__ void indexer_topk_deterministic_write(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         const int * __restrict__ g_base, const int * __restrict__ e_base,
+         int * __restrict__ dst,
+@@ -242,7 +271,7 @@ static __global__ void indexer_topk_deterministic_write(
+     int g = 0, e = 0;
+     if (col < ncols) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         g = (key >  states[row].prefix) ? 1 : 0;
+         e = (key == states[row].prefix) ? 1 : 0;
+     }
+@@ -279,6 +308,7 @@ template<typename kv_t>
+ static void indexer_topk_radix_cuda(
+         ggml_cuda_pool & pool,
+         const float * score, const int * cell_blk, const kv_t * additive,
++        const indexer_topk_extra extra,
+         int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
+         cudaStream_t stream) {
+     constexpr int BLOCK_SIZE = 256;
+@@ -297,7 +327,7 @@ static void indexer_topk_radix_cuda(
+     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+         indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
+             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-                score, cell_blk, additive, states, histograms,
++                score, cell_blk, additive, extra, states, histograms,
+                 ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
+         indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+@@ -318,12 +348,12 @@ static void indexer_topk_radix_cuda(
+     int * e_base = eb_alloc.get();
+ 
+     indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_cnt, e_cnt,
++            score, cell_blk, additive, extra, states, g_cnt, e_cnt,
+             ncols, n_tps, n_blocks, n_kv, cbpr);
+     indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
+             g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
+     indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_base, e_base, dst,
++            score, cell_blk, additive, extra, states, g_base, e_base, dst,
+             ncols, n_tps, n_blocks, n_kv, k, cbpr);
+ }
+ 
+@@ -331,18 +361,31 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const ggml_tensor * score    = dst->src[0];
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
++    const ggml_tensor * cell_pos = dst->src[3];
++    const ggml_tensor * q_pos    = dst->src[4];
++    const ggml_tensor * blk_idx  = dst->src[5];
++    const ggml_tensor * blk_tail = dst->src[6];
+     const float * score_d    = (const float *) score->data;
+     const int   * cell_blk_d = (const int  *) cell_blk->data;
+     int *         dst_d      = (int *) dst->data;
+     cudaStream_t  stream     = ctx.stream();
+ 
++    const indexer_topk_extra extra = {
++        cell_pos != nullptr ? (const int *) cell_pos->data : nullptr,
++        q_pos    != nullptr ? (const int *) q_pos->data    : nullptr,
++        blk_idx  != nullptr ? (const int *) blk_idx->data  : nullptr,
++        blk_tail != nullptr ? (const int *) blk_tail->data : nullptr,
++    };
++
+     GGML_ASSERT(score->type == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
++    GGML_ASSERT(additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(score));
+     GGML_ASSERT(ggml_is_contiguous(cell_blk));
+-    GGML_ASSERT(ggml_is_contiguous(additive));
++    GGML_ASSERT(additive == nullptr || ggml_is_contiguous(additive));
++    GGML_ASSERT(cell_pos == nullptr || (ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos)));
++    GGML_ASSERT(blk_idx  == nullptr || (ggml_is_contiguous(blk_idx)  && ggml_is_contiguous(blk_tail)));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int n_blocks = score->ne[0];
+@@ -353,11 +396,12 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int k        = dst->ne[0];
+     ggml_cuda_pool & pool = ctx.pool();
+ 
+-    if (additive->type == GGML_TYPE_F16) {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++    if (additive == nullptr || additive->type == GGML_TYPE_F16) {
++        indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
++                additive != nullptr ? (const half *) additive->data : nullptr, extra,
+                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
+     } else {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
+                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
+     }
+ }
+@@ -369,8 +413,10 @@ bool ggml_cuda_indexer_top_k_supported(int device, const ggml_tensor * dst) {
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
+ 
++    // the additive is optional: the compact position/bias srcs derive it in-kernel
+     return score->type == GGML_TYPE_F32 &&
+         cell_blk->type == GGML_TYPE_I32 &&
+-        (additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32) &&
++        (additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32) &&
++        (additive != nullptr || dst->src[3] != nullptr || dst->src[5] != nullptr) &&
+         dst->type == GGML_TYPE_I32;
+ }

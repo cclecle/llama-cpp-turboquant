@@ -1,0 +1,23 @@
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 5854a27e9..26ee97b1c 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -40,6 +40,8 @@ struct llama_cparams {
+     bool offload_kqv;
+     bool flash_attn;
+     bool auto_fa;
++    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
++    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+     bool auto_fgdn;
+@@ -55,6 +57,9 @@ struct llama_cparams {
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+     bool op_offload;
+     bool kv_unified;
++
++    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
++    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
+     bool pipeline_parallel;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

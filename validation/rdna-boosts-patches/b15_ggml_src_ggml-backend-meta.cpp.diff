@@ -1,0 +1,36 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 106b2b726..da82173be 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -795,7 +795,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // K/V by kv-head, result by head); idx and mask are mirrored.
+     auto handle_flash_attn_qsa = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        // src4 (mask) plus the optional derived-visibility keys are replicated when present; a
++        // null src slot (the mask on the derived path) carries no split state
++        for (size_t i = 4; i < 7; i++) {
++            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
++                    src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
++        }
+ 
+         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+@@ -1032,10 +1037,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 split_state = handle_flash_attn_qsa(src_ss);
+             } break;
+             case GGML_OP_INDEXER_TOPK: {
+-                // like TOP_K: the row (tps, stream) is the independent unit
+-                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                // like TOP_K: the row (tps, stream) is the independent unit.  every src is
++                // mirrored: the cell map plus the optional derived position/bias compact srcs
++                for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                    if (tensor->src[i] != nullptr) {
++                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                    }
++                }
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+             } break;
+             case GGML_OP_INDEXER_SCORE: {

@@ -1,0 +1,637 @@
+From eff1868f585573141d3ab383be2251c1619160c1 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sat, 29 Aug 2026 08:14:24 -0500
+Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
+ Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu    |   5 +-
+ ggml/src/ggml-cuda/mmq-vec-dot.cuh |  17 +-
+ ggml/src/ggml-cuda/mmvq.cu         |  70 ++++++--
+ ggml/src/ggml-cuda/vecdotq.cuh     | 277 +++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp         |  32 +++-
+ 5 files changed, 377 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0ceb7a8f7..edc6c7544 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5054,13 +5054,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+ 
++    // op timing instruments each node with stream events, which is not possible during capture
++    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
++
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+index 0620c12e5..0e99f7b97 100644
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -340,6 +340,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+         }
+ 
++        // Row scale pair (d, m) is invariant over the j0 loop; load it once per element.
++        float2 dmA_reg[ntx][tile_C::ne];
++#pragma unroll
++        for (int n = 0; n < ntx; ++n) {
++#pragma unroll
++            for (int l = 0; l < tile_C::ne; ++l) {
++                const int i = i0 + n*tile_A::I + tile_C::get_i(l);
++                dmA_reg[n][l] = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
++            }
++        }
++
+ #pragma unroll
+         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+             tile_B B;
+@@ -355,10 +366,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ 
+ #pragma unroll
+                 for (int l = 0; l < tile_C::ne; ++l) {
+-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+-                    float2 dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
+-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
++                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA_reg[n][l].x*dsB.x*C.x[l];
++                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA_reg[n][l].y*dsB.y;
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 914b19f3a..666a96422 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -37,7 +37,20 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
+ 
+ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+ 
+-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
++// The wide-VDR MoE expert entry points (mul_mat_vec_q_moe) are a RDNA4/RDNA3_0
++// (gfx12xx / gfx1100) optimisation.  Every other target -- notably RDNA3_5
++// (gfx115x), where the wide chunk never verified -- uses the dense VDR, so the
++// MoE expert matmul reduces exactly like the rest of that arch.  Scope it here,
++// once, for both selectors below: a per-quant gate is how the Q4_K/Q6_K arms
++// (the Q4_K_M expert types) once leaked onto gfx1151.
++#if !(defined(RDNA4) || defined(RDNA3_0))
++#define GGML_CUDA_MMVQ_MOE_DENSE 1
++#endif
++
++static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, bool moe = false) {
++#ifdef GGML_CUDA_MMVQ_MOE_DENSE
++    moe = false;
++#endif
+     switch (type) {
+         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
+         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
+@@ -45,14 +58,14 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
+         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
+-        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
++        case GGML_TYPE_Q8_0:    return moe ? vec_dot_q8_0_q8_1_moe : vec_dot_q8_0_q8_1;
+         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
+         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+-        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+-        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
++        case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1;
++        case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1;
++        case GGML_TYPE_Q6_K:    return moe ? vec_dot_q6_K_q8_1_vdr2 : vec_dot_q6_K_q8_1;
+         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
+         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
+@@ -66,7 +79,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+     }
+ }
+ 
+-static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
++static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, bool moe = false) {
++#ifdef GGML_CUDA_MMVQ_MOE_DENSE
++    moe = false;
++#endif
+     switch (type) {
+         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
+@@ -74,14 +90,14 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
+-        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
++        case GGML_TYPE_Q8_0:    return moe ? VDR_Q8_0_Q8_1_MMVQ_MOE : VDR_Q8_0_Q8_1_MMVQ;
+         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
+         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+-        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+-        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+-        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
++        case GGML_TYPE_Q4_K:    return moe ? VDR_Q4_K_Q8_1_MMVQ_MOE : VDR_Q4_K_Q8_1_MMVQ;
++        case GGML_TYPE_Q5_K:    return moe ? VDR_Q5_K_Q8_1_MMVQ_MOE : VDR_Q5_K_Q8_1_MMVQ;
++        case GGML_TYPE_Q6_K:    return moe ? VDR_Q6_K_Q8_1_MMVQ_MOE : VDR_Q6_K_Q8_1_MMVQ;
+         case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
+         case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
+         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
+@@ -99,6 +115,7 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_GCN,
+     MMVQ_PARAMETERS_RDNA2,
+     MMVQ_PARAMETERS_RDNA3_0,
++    MMVQ_PARAMETERS_RDNA3_5,
+     MMVQ_PARAMETERS_RDNA4,
+     MMVQ_PARAMETERS_GB10
+ };
+@@ -108,7 +125,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_RDNA4;
+ #elif defined(RDNA3_0)
+     return MMVQ_PARAMETERS_RDNA3_0;
+-#elif defined(RDNA2) || defined(RDNA3_5)
++#elif defined(RDNA3_5)
++    return MMVQ_PARAMETERS_RDNA3_5;
++#elif defined(RDNA2)
+     return MMVQ_PARAMETERS_RDNA2;
+ #elif defined(GCN) || defined(CDNA)
+     return MMVQ_PARAMETERS_GCN;
+@@ -128,7 +147,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+         return MMVQ_PARAMETERS_RDNA3_0;
+     }
+-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++        return MMVQ_PARAMETERS_RDNA3_5;
++    }
++    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+         return MMVQ_PARAMETERS_RDNA2;
+     }
+     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
+@@ -271,7 +293,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+         case GGML_TYPE_Q3_K:    return 4;
+         case GGML_TYPE_Q4_0:    return 7;
+         case GGML_TYPE_Q4_1:    return 7;
+-        case GGML_TYPE_Q4_K:    return 4;
++        case GGML_TYPE_Q4_K:    return 7;
+         case GGML_TYPE_Q5_0:    return 7;
+         case GGML_TYPE_Q5_1:    return 7;
+         case GGML_TYPE_Q5_K:    return 5;
+@@ -516,6 +538,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         }
+         return 1;
+     }
++    if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
++        // gfx1151 (Strix Halo iGPU): nwarps=1 (the RDNA2 table) underutilizes the
++        // wave32 datapath on the large-K decode matmuls; nwarps=8 (the RDNA3_0
++        // table) over-parallelizes the small ones. Swept 2025-08: nwarps=2 wins
++        // (~+0.6% decode on Qwen3.6-35B-A3B Q8_0), nwarps=4 regresses.
++        // Apply to the whole mmvq range (ncols_dst 1..8), not just decode: the
++        // speculative verify batch (n_draft+1 tokens) must use the same nwarps
++        // as decode so its per-row dot-product accumulation is bit-identical.
++        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++            switch (type) {
++                case GGML_TYPE_Q8_0:
++                    return 2;
++                default:
++                    return 1;
++            }
++        }
++        return 1;
++    }
+     if (table_id == MMVQ_PARAMETERS_TURING) {
+         if (ncols_dst == 1) {
+             switch (type) {
+@@ -904,10 +944,10 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+-    constexpr int vdr = get_vdr_mmvq(type);
++    constexpr int vdr = get_vdr_mmvq(type, true);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, true);
+ 
+     // fuse gate, bias, scales, and glu_op into the up projection
+     bool use_gate = false;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index f2a6f2009..9bad90846 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -243,6 +243,16 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+ #define VDR_Q8_0_Q8_1_MMVQ 2
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
++// MoE expert kernel (mul_mat_vec_q_moe) VDR: that kernel is one warp per token,
++// so it has none of the multi-column register pressure that made VDR=4 lose the
++// dense mmvq verify widths (the issue #30 regression).  VDR=4 was measured on
++// gfx1200/gfx1201 (RX 9000): decode -10..-33% on the compute-bound shapes,
++// neutral on the DRAM-bound lm_head; RDNA3_0 (gfx1100-gfx1103, RX 7900 XTX)
++// verified 2026-08-28 (tg128 123.74 -> 127.7x, PPL near-lossless, byte-identical).
++// The wide chunk is selected only on RDNA4/RDNA3_0 -- mmvq.cu scopes it in
++// get_vec_dot_q_cuda()/get_vdr_mmvq(); every other arch keeps the dense VDR.
++#define VDR_Q8_0_Q8_1_MMVQ_MOE 4
++
+ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
+     const int * v, const int * u, const T & d8_0, const T & d8_1) {
+ 
+@@ -502,6 +512,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+ }
+ 
+ #define VDR_Q4_K_Q8_1_MMVQ 2
++#define VDR_Q4_K_Q8_1_MMVQ_MOE 4
+ #define VDR_Q4_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -529,6 +540,34 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
+ }
+ 
++// VDR=4 variant: processes two adjacent 16-element chunks (32 elements).
++// Both chunks share the q8_1 block pair, the two sub-scales, the two mins and
++// the d8 values, so the loads are amortized over twice the dp4a work of the
++// VDR=2 kernel.
++static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq4(
++    const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
++    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
++
++    float sumf_d = 0.0f;
++    float sumf_m = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < 2*QR4_K; ++i) {
++        const int v0i = (v[2*(i>>1)]     >> (4*(i&1))) & 0x0F0F0F0F;
++        const int v1i = (v[2*(i>>1) + 1] >> (4*(i&1))) & 0x0F0F0F0F;
++
++        const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
++        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
++
++        sumf_d += d8[i&1] * (dot1 * sc[i&1]);
++        sumf_m += d8[i&1] * (dot2 * m[i&1]);  // multiply constant part of q4_K with sum of q8_1 values
++    }
++
++    const float2 dm4f = __half22float2(dm4);
++
++    return dm4f.x*sumf_d - dm4f.y*sumf_m;
++}
++
+ // contiguous v/x + u/y values
+ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+@@ -558,6 +597,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+ }
+ 
+ #define VDR_Q5_K_Q8_1_MMVQ 2
++#define VDR_Q5_K_Q8_1_MMVQ_MOE 4
+ #define VDR_Q5_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -592,6 +632,41 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
+     return dm5f.x*sumf_d - dm5f.y*sumf_m;
+ }
+ 
++// VDR=4 variant: processes two adjacent 16-element chunks (32 elements).
++// Both chunks share the q8_1 block pair, the two sub-scales, the two mins and
++// the d8 values, so the loads are amortized over twice the dp4a work of the
++// VDR=2 kernel.
++static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq4(
++    const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const uint8_t * __restrict__ sc,
++    const uint8_t * __restrict__ m, const half2 & dm5, const float * __restrict__ d8) {
++
++    float sumf_d = 0.0f;
++    float sumf_m = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < 2*QR5_K; ++i) {
++        const int vl0i = (vl[2*(i>>1)]     >> (4*(i&1))) & 0x0F0F0F0F;
++        const int vl1i = (vl[2*(i>>1) + 1] >> (4*(i&1))) & 0x0F0F0F0F;
++
++        const int vh0i = ((vh[2*(i>>1)]     >> (i&1)) << 4) & 0x10101010;
++        const int vh1i = ((vh[2*(i>>1) + 1] >> (i&1)) << 4) & 0x10101010;
++
++        const int v0i = vl0i | vh0i;
++        const int v1i = vl1i | vh1i;
++
++        const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
++        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
++
++        sumf_d += d8[i&1] * (dot1 * sc[i&1]);
++        sumf_m += d8[i&1] * (dot2 * m[i&1]);
++
++    }
++
++    const float2 dm5f = __half22float2(dm5);
++
++    return dm5f.x*sumf_d - dm5f.y*sumf_m;
++}
++
+ // contiguous v/x + u/y values
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+@@ -621,6 +696,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+ }
+ 
+ #define VDR_Q6_K_Q8_1_MMVQ 1
++#define VDR_Q6_K_Q8_1_MMVQ_MOE 2
+ #define VDR_Q6_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -646,6 +722,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+     return d*sumf;
+ }
+ 
++// VDR=2 variant: processes two adjacent 8-element chunks (16 elements).
++// Both chunks share the q8_1 block pair, the two sub-scales and the d8 values,
++// so the loads are amortized over twice the dp4a work of the VDR=1 kernel.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
++    const int & vl0, const int & vl1, const int & vh0, const int & vh1,
++    const int * __restrict__ u, const int8_t * __restrict__ scales,
++    const float & d, const float * __restrict__ d8) {
++
++    float sumf = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < 2*QR6_K; ++i) {
++        const int sc = scales[4*(i&1)];
++
++        const int vl = (i < QR6_K) ? vl0 : vl1;
++        const int vh = (i < QR6_K) ? vh0 : vh1;
++
++        const int vil = (vl >> (4*(i&1))) & 0x0F0F0F0F;
++
++        const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
++
++        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
++
++        sumf += d8[i&1] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
++    }
++
++    return d*sumf;
++}
++
+ // contiguous v/x + u/y values
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
+@@ -865,6 +970,32 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
+     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+ }
+ 
++// MoE expert kernel (mul_mat_vec_q_moe) entry point for q8_0 experts: same body
++// as the generic above, but with the per-kernel MoE VDR (the dense selectors
++// keep the upstream VDR=2 generic `vec_dot_q8_0_q8_1`).
++template <int vdr>
++static __device__ __forceinline__ float vec_dot_q8_0_q8_1_moe_impl(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
++
++    int v[vdr];
++    int u[vdr];
++
++#pragma unroll
++    for (int i = 0; i < vdr; ++i) {
++        v[i] = get_int_b2(bq8_0->qs, iqs + i);
++        u[i] = get_int_b4(bq8_1->qs, iqs + i);
++    }
++
++    return vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, bq8_0->d, __low2half(bq8_1->ds));
++}
++
++static __device__ __forceinline__ float vec_dot_q8_0_q8_1_moe(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++    return vec_dot_q8_0_q8_1_moe_impl<VDR_Q8_0_Q8_1_MMVQ_MOE>(vbq, bq8_1, kbx, iqs);
++}
++
+ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -965,6 +1096,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+ }
+ 
++// VDR=4 entry point: iqs must be a multiple of 4 (the mmvq kernel strides kqs
++// by VDR). Processes 32 elements per call, splitting the ql/u loads over two
++// 16-element chunks that share the q8_1 block pair, the sub-scale/min pair and
++// the d8 values.
++static __device__ __forceinline__ float vec_dot_q4_K_q8_1_vdr4(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
++
++    int v[4];
++    int u[4*QR4_K];
++    float d8[2*QR4_K];
++
++    // iqs is in 0,4..28. The two 16-element chunks at iqs and iqs+2 land in the
++    // same (iqs/4, (iqs%4)/2) cell, so bq8_offset and the scale pair are shared.
++    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
++    const int i8 = (iqs/2) % 4;
++
++    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * i8);
++    v[0] = q4[0];
++    v[1] = q4[4];
++    v[2] = q4[1];
++    v[3] = q4[5];
++
++    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
++    uint16_t aux[2];
++    const int j = bq8_offset/2;
++    if (j < 2) {
++        aux[0] = scales[j+0] & 0x3f3f;
++        aux[1] = scales[j+2] & 0x3f3f;
++    } else {
++        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
++        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++    }
++    const uint8_t * sc = (const uint8_t *)aux;
++    const uint8_t * m  = sc + 2;
++
++    // i8 is even, so i8 and i8+1 are adjacent int32 groups in each q8_1 block
++    d8[0] = __low2float(bq8_1[bq8_offset + 0].ds);
++    d8[1] = __low2float(bq8_1[bq8_offset + 1].ds);
++
++#pragma unroll
++    for (int i = 0; i < 2*QR4_K; ++i) {
++        const block_q8_1 * bq8i = bq8_1 + bq8_offset + (i&1);
++
++        const int * q8 = (const int *)bq8i->qs + i8 + (i>>1);
++        u[2*i+0] = q8[0];
++        u[2*i+1] = q8[4];
++    }
++
++    return vec_dot_q4_K_q8_1_impl_vmmq4(v, u, sc, m, bq4_K->dm, d8);
++}
++
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -1016,6 +1200,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+ }
+ 
++// VDR=4 entry point: iqs must be a multiple of 4 (the mmvq kernel strides kqs
++// by VDR). Processes 32 elements per call, splitting the ql/qh/u loads over two
++// 16-element chunks that share the q8_1 block pair, the sub-scale/min pair and
++// the d8 values.
++static __device__ __forceinline__ float vec_dot_q5_K_q8_1_vdr4(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
++
++    int   vl[4];
++    int   vh[4];
++    int    u[4*QR5_K];
++    float d8[2*QR5_K];
++
++    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
++    const int i8 = (iqs/2) % 4;
++
++    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * i8);
++    const int * qh = (const int *)(bq5_K->qh + 4 * i8);
++
++    vl[0] = ql[0];
++    vl[1] = ql[4];
++    vl[2] = ql[1];
++    vl[3] = ql[5];
++
++    vh[0] = qh[0] >> bq8_offset;
++    vh[1] = qh[4] >> bq8_offset;
++    vh[2] = qh[1] >> bq8_offset;
++    vh[3] = qh[5] >> bq8_offset;
++
++    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
++    uint16_t aux[2];
++    const int j = bq8_offset/2;
++    if (j < 2) {
++        aux[0] = scales[j+0] & 0x3f3f;
++        aux[1] = scales[j+2] & 0x3f3f;
++    } else {
++        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
++        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++    }
++    const uint8_t * sc = (const uint8_t *)aux;
++    const uint8_t * m  = sc + 2;
++
++    d8[0] = __low2float(bq8_1[bq8_offset + 0].ds);
++    d8[1] = __low2float(bq8_1[bq8_offset + 1].ds);
++
++#pragma unroll
++    for (int i = 0; i < 2*QR5_K; ++i) {
++        const block_q8_1 * bq8i = bq8_1 + bq8_offset + (i&1);
++
++        const int * q8 = (const int *)bq8i->qs + i8 + (i>>1);
++        u[2*i+0] = q8[0];
++        u[2*i+1] = q8[4];
++    }
++
++    return vec_dot_q5_K_q8_1_impl_vmmq4(vl, vh, u, sc, m, bq5_K->dm, d8);
++}
++
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -1042,6 +1284,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
+ 
++// VDR=2 entry point: iqs must be even (the mmvq kernel strides kqs by VDR).
++// Processes 16 elements per call, splitting the ql/qh/u loads over two chunks.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr2(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++
++    // both chunks share these offsets: iqs+1 lands in the same (iqs/16, (iqs%16)/8) cell
++    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_idx = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
++
++    const int vl0 = get_int_b4(bq6_K->ql, iqs);
++    const int vl1 = get_int_b4(bq6_K->ql, iqs + 1);
++    const int vh0 = get_int_b2(bq6_K->qh, vh_idx) >> vh_shift;
++    const int vh1 = get_int_b2(bq6_K->qh, vh_idx + 1) >> vh_shift;
++
++    const int8_t * scales = bq6_K->scales + scale_offset;
++
++    int    u[2*QR6_K];
++    float d8[QR6_K];
++
++    // iqs is even, so iqs%QI8_1 and (iqs%QI8_1)+1 are adjacent int32 groups in the block
++    const int i8 = iqs % QI8_1;
++    u[0] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8);
++    u[1] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8);
++    u[2] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8 + 1);
++    u[3] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8 + 1);
++    d8[0] = __low2float(bq8_1[bq8_offset + 0].ds);
++    d8[1] = __low2float(bq8_1[bq8_offset + 2].ds);
++
++    return vec_dot_q6_K_q8_1_impl_mmvq_vdr2(vl0, vl1, vh0, vh1, u, scales, bq6_K->d, d8);
++}
++
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c46cf9f5d..a9ba0faad 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11436,9 +11436,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++
++    // same shapes, Q4_K/Q5_K decode (n=1, mmvq) and prefill (mmq) rows:
++    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++        for (int bs : {16, 128, 512}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs, 5120, {1, 1}, {1, 1})); // prefill
++        }
++    }
++
+     // qwen3-30b-a3b
+-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
++    for (int bs : {1, 4, 5, 6, 7, 8, 32, 64, 128, 256, 512}) {
++        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
+                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
+                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
+@@ -11446,8 +11470,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
+-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
++    for (int bs : {1, 4, 5, 6, 7, 8, 32, 64, 128, 256, 512}) {
++        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
+                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
+                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
+-- 
+2.55.0
+
