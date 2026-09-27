@@ -629,10 +629,12 @@ const void * ggml_cuda_tiered_expert(const ggml_tensor * t, int64_t expert) {
 
 namespace {
 
+// off by default: the copies of all cold experts fill the PCIe link that kernel dispatch and the all-reduce also use,
+// and move about twice the bytes the in-place reads of the routed experts do (v19 study, step 28)
 bool stage_enabled(int64_t n_tokens) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_STAGE");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) != 0;
     }();
     static const int64_t min_tokens = [] {
         const char * env = getenv("GGML_CUDA_MOE_STAGE_MIN_TOKENS");

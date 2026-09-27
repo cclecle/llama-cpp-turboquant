@@ -432,6 +432,7 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 24 | FA RDNA config sweep (256/256/16 cols) | baseline best; a dedicated sparse decode kernel parked |
 | 25 | ubatch 2048 / 4096 (user's decision) | prefill 1,386 (+20%) at 30.75 GB; 4096 OOM |
 | 26-27 | prefill staging of cold experts, one area | expert matmuls 10.5 -> 4.7 s per GPU, but copies (~26 GB/s) not hidden: prefill 1,152 -> 1,030 |
+| 28 | staging with 2 and 3 areas | 1,030 / 1,027 vs 1,152 (off): more areas change nothing; staging stays off (see below) |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb).
 
@@ -439,3 +440,15 @@ Prefill anatomy (32k prompt, ub 1024, per GPU of ~24.7 s busy): mul_mat_q 12.3 s
 cold experts' PCIe reads), hipBLAS F32 GEMMs 2.9 s (router 1.0 ms/call at 2.7 TFLOPS on an 8x8-tile kernel, hc_inject
 216 us, gated delta net alpha/beta, indexer scores), dense FA 1.9 s, gated delta net 1.2 s, RCCL 0.95 s, mm_ids_helper
 0.94 s (3 calls per layer with the same ids; each of its 512 blocks scans every route).
+
+Why the prefill staging loses at any area count (step 27 trace, `stage_trace.py`, per GPU): in the middle of the
+prefill every layer's copies (7.3 ms) start right after the previous down projection and finish before they are
+needed, with no idle gap above 0.3 ms. The loss is elsewhere. Per ubatch the GPU idles 160 ms (12 ms with staging off)
+in sub-millisecond gaps spread over every layer, and the small kernels run slower (quantize_mmq_q8_1 0.48 -> 1.25 s,
+rms_norm 0.64 -> 0.98 s, RCCL 0.95 -> 1.78 s). The DMA fills the PCIe link for about half of each layer, and everything
+else that crosses it waits: the dispatch packets and kernel arguments (host memory) and the GPU-to-GPU all-reduce.
+It also moves more bytes than the in-place reads: 12.3 s of copies per GPU for all cold experts, against a 5.8 s
+in-place penalty for the routed ones only. Upper bound even if the side effects vanished: the 5.8 s. Staging stays in
+the tree with `GGML_CUDA_MOE_STAGE` default off. Levers left for prefill: fewer passes over the cold experts (larger
+ubatch, R9V prefills in 4096-token chunks) and fewer cold bytes (hot set), both limited by VRAM, hence step 29.
+

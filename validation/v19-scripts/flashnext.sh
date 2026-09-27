@@ -11,6 +11,7 @@
 # FN_ENV: env assignments for the llama servers of this run; FN_TAG: suffix for the result label;
 # FN_UB: override the rung's ubatch (and raise the batch to at least it); FN_ARGS: another args file;
 # FN_LD: LD_LIBRARY_PATH for a copied build (llama-cpp-mine-<name>/build3/bin copied out of a tree).
+# FN_LOAD_ONLY=1: load the server and stop it again (no benchmark), e.g. to read its load log.
 cd /mnt/gguf/r9v/bench
 BACKENDS=${1:-v16 v18 r9v}
 FN_ENV=${FN_ENV:-X=0}; FN_TAG=${FN_TAG:-}
@@ -72,7 +73,9 @@ for b in $BACKENDS; do
     up=$(wait_up $URL 1200)
   fi
   echo "$b load: $up s"
-  if [[ $up =~ ^[0-9]+$ ]]; then
+  if [[ $up =~ ^[0-9]+$ ]] && [ "${FN_LOAD_ONLY:-0}" = 1 ]; then
+    :
+  elif [[ $up =~ ^[0-9]+$ ]]; then
     BENCH_SAVE_TEXT=$b$FN_TAG.answer.txt python3 openai_bench.py $URL $MODEL prompt-32k.txt $b$FN_TAG results.jsonl 2048 ${FN_WARM:-2}
   else
     tail -30 $b$FN_TAG.log
