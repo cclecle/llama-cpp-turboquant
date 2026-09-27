@@ -12216,6 +12216,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // qwen4exp verify mat-vecs (5 columns, q8_0, one device of the tensor split): attn_qkv, attn_gate, attn_q,
+    // ssm_out / attn_output, shared expert up / down, hyper-connection up / down
+    for (const auto & mk : std::vector<std::array<int64_t, 2>>{
+            {5120, 2560}, {3072, 2560}, {6144, 2560}, {2560, 3072}, {640, 2560}, {2560, 640}, {10240, 320}, {320, 10240}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 5, mk[1], {1, 1}, {1, 1}));
+    }
+
     // F32 GEMMs of the qwen4exp prefill (router, hyper-connection projection, QSA indexer scores); GGML_CUDA_SGEMM=0 for hipBLAS
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,   512, 1024,  2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,    24, 1024, 10240, {1, 1}, {1, 1}));

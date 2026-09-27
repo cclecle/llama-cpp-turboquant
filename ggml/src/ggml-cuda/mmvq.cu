@@ -6,6 +6,9 @@
 #include "vecdotq.cuh"
 
 #include <algorithm>
+#include <mutex>
+#include <set>
+#include <string>
 #include <cinttypes>
 #include <cstdint>
 #include <type_traits>
@@ -1249,8 +1252,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const char * env = getenv("GGML_CUDA_MMVQ_TALL_K"); // 0: one warp per row as before
         return env == nullptr || atoi(env) != 0;
     }();
+    // GGML_CUDA_MMVQ_TALL_K_ROWS / _KBLOCKS: the row count below which, and the K blocks from which, a verify batch
+    // gets 4 warps per row (2048 / 128)
+    static const int64_t tall_k_rows = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_TALL_K_ROWS");
+        return env ? (int64_t) atoll(env) : (int64_t) 2048;
+    }();
+    static const int tall_k_kblocks = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_TALL_K_KBLOCKS");
+        return env ? atoi(env) : 128;
+    }();
     const bool tall_k = tall_k_enabled && table_id == MMVQ_PARAMETERS_RDNA4 && !has_ids &&
-        (int64_t) nrows_x*nchannels_dst*nsamples_dst < 2048 && blocks_per_row_x >= 128;
+        (int64_t) nrows_x*nchannels_dst*nsamples_dst < tall_k_rows && blocks_per_row_x >= tall_k_kblocks;
 
     const auto launch_multi = [&](auto ncols_tag) {
         constexpr int  c_ncols_dst = decltype(ncols_tag)::value;
@@ -1586,6 +1599,24 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // GGML_CUDA_MMV_NAMES=1: log each distinct mat-vec once (weight name, type, shape, columns), to map a trace's
+    // mat-vec groups to matrices
+    static const bool log_names = [] {
+        const char * env = getenv("GGML_CUDA_MMV_NAMES");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (log_names) {
+        static std::mutex mtx;
+        static std::set<std::string> seen;
+        const std::string key = std::string(src0->name) + "|" + ggml_type_name(src0->type) + "|" + std::to_string(ne00) + "x" +
+            std::to_string(ne01) + "x" + std::to_string(ne02) + "|cols " + std::to_string(ne11) + "|ch " + std::to_string(ne12) +
+            (ids ? "|ids" : "") + (fusion ? "|fused" : "");
+        std::lock_guard<std::mutex> lock(mtx);
+        if (seen.insert(key).second) {
+            GGML_LOG_WARN("mmv: %s\n", key.c_str());
+        }
+    }
 
     cudaStream_t stream = ctx.stream();
 
