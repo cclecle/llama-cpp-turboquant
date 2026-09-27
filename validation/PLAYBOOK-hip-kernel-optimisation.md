@@ -153,6 +153,15 @@ Rules that follow:
 - **Then the text itself is a correctness test.** A change that should not alter the math (for example staged
   uploads) must reproduce the reference text byte for byte.
 
+- **Staging host-resident weights into VRAM for prefill** (steps 26-28, cold MoE experts).
+  - From VRAM the expert matmuls ran 2.2× faster: 10.5 → 4.7 s per GPU.
+  - But a DMA of all cold experts of a layer moves more bytes than in-place reads, which fetch only the experts the
+    ubatch routes to. The cold ones are the least routed.
+  - hipMemcpyAsync from pinned memory reached only ~26 GB/s per GPU with both GPUs copying (host-memory-bound).
+  - With one staging area, the copy of layer L+1 must fit between layer L's expert matmuls and layer L+1's, which is
+    too short on the light layers. Measure the copy rate and the window before designing. Several areas widen the
+    window; staging only the likely-routed experts shrinks the bytes.
+
 ## 8. Cross-GPU synchronisation
 
 - **A direct-P2P AllReduce kernel** (flags in peer VRAM, `__threadfence_system`, spin with `s_sleep`) costs ~9 us when
