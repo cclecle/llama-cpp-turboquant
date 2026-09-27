@@ -435,6 +435,7 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 28 | staging with 2 and 3 areas | 1,030 / 1,027 vs 1,152 (off): more areas change nothing; staging stays off (see below) |
 | 29 | `GGML_ALLOC_PEAK` probe | ub 4096 asked 10.1 GiB/GPU: 7 GiB = 14 device copies of the KQ mask, 2 GiB indexer score + relu |
 | 30 | `ggml_qsa_expand_heads`, mask as is, shared zeros | compute buffer ub 1024 2,533 -> 909 MiB, ub 4096 10,130 -> 3,633 MiB; ub 1024 46.4 -> 46.0 ms/step, prefill 1,178, text identical; **ub 4096 fits: prefill 1,542 at 30.1 GB** |
+| 31 | mm_ids_helper 8 loads ahead; F32 GEMM library; sparse prefill attention | 1,178 -> 1,193, text identical; rocBLAS Tensile (`ROCBLAS_USE_HIPBLASLT=0`) +1% (text changes); `LLAMA_QSA_SPARSE=1024` +4.5% (text changes) |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb).
 
@@ -468,4 +469,9 @@ Result: ub 1024 compute buffer 2,533 -> 909 MiB, peak VRAM 27.8 -> 26.2 GB per c
 peak, prefill 1,422); ub 4096 3,633 MiB (30.1 GB peak, prefill 1,542, was OOM). What is left at ub 4096: the score
 mul_mat (1 GiB), the expanded per-cell scores (1 GiB, read only by the top-k), the mask copy (512 MiB), the block
 bias (256 MiB).
+
+Prefill F32 GEMMs (step 31, `stage_trace.py --kernels`): every one runs a hipBLASLt kernel with an 8x8 or 16x16 macro
+tile. The router (M 512, N 1024, K 2560) takes 1.0 ms per call at 2.7 TFLOPS, 1.49 s per GPU per 32k prefill; the
+skinny hyper-connection GEMMs (M <= 8 and M = 24, long K) take 216 and 66 us per call, 0.8 s per GPU. rocBLAS's own
+Tensile kernels are no better (+1%), so these need our own kernels.
 
