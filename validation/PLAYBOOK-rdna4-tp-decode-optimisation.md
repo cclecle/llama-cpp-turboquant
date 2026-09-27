@@ -4,8 +4,9 @@ Lessons from the v19 campaign (Qwen3.8-Flash-Next against R9V, 2026-09-26), writ
 and later campaigns. The measurements and the chronology are in `STUDY-2026-09-26-flashnext-r9v.md` (section 11);
 this file is the part that should outlive that study.
 
-Result so far: same-config decode **68.0 → 51.6 ms per speculative step (-24%)**, prefill +6.8%, perplexity unchanged.
-R9V (vLLM fork) does the same step in 41 ms.
+Result so far: same-config decode **68.0 → 47.6 ms per speculative step (-30%)** at step 16, prefill +10%. Decode is
+deterministic since step 14 (same text on every load), and repeat loads now agree to ±0.1 ms. R9V (vLLM fork) does
+the same step in 41 ms.
 
 ## 1. Measure the right thing
 
@@ -26,6 +27,10 @@ R9V (vLLM fork) does the same step in 41 ms.
 - **Rounding:** fused kernels change rounding, and a top-k selection turns rounding-level score changes into different
   kept blocks. Expect perplexity to move by ~0.3% (well inside ±0.025) and treat that as noise, not as a bug.
 - **Profilers add ~9-12 ms per step,** mostly to idle time. Compare traced with traced, and busy time with busy time.
+- **Look at the individual loads before calling a regression.** Step 11 looked 3 ms slower: its first run followed a
+  36 s cold load, and the next A/B showed no effect.
+- **Check the text for determinism.** Since step 14, the same build generates the same text on every load. A change
+  that should not alter the math must keep it byte for byte, and two loads of any build must agree.
 
 ## 2. Read a trace before believing a hypothesis
 
@@ -88,6 +93,13 @@ Analyses that paid off (the code is in the study log; they are short python over
   output head is split by vocabulary rows. So there is no in-graph argmax or top-k over logits under `-sm tensor`. That
   blocks both an unrolled multi-draft graph and R9V's coarse draft head (rank with 2 of 10 Q6_K blocks, rescore exactly)
   until the meta backend gains a cross-device top-k merge.
+- **Under `-sm tensor` the scheduler called `graph_optimize` on the meta backend, which had none.** So the CUDA
+  fusions that need allocation dependencies (the MoE weighted sum) were refused by the overlap check. The meta backend
+  now asks each device backend (reg proc `ggml_backend_graph_add_alloc_deps`) on its own graph.
+- **ROCm 7.14 (R9V's), warm:** decode 1-2 ms per step slower, prefill +3%. The earlier "7.14 halves prefill" was a
+  cold page cache. `build-v19-rocm714.sh` builds with it through a symlink to R9V's image.
+- **The HIP runtime knobs** `ROC_ACTIVE_WAIT_TIMEOUT` and `HIP_FORCE_DEV_KERNARG`: no effect. Non-coherent cold experts
+  (`GGML_CUDA_UVA_NONCOHERENT`): no effect.
 - **The P2P AllReduce hybrid (`GGML_CUDA_AR_HYBRID`) lost to RCCL** once the split was even: 37.6 vs 31 us per call.
   Keep RCCL unless re-measured.
 

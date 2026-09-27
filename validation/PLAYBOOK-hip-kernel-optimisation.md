@@ -95,7 +95,7 @@ Rules that follow:
   - Mind the alignment: q8_0 blocks are 34 bytes, 2-byte aligned (`get_int_b2`).
   - Copy with the widest load the source alignment allows.
 
-## 6. Reuse and fusion patterns that worked
+## 6. Reuse and fusion patterns (what worked, and what did not)
 
 - **Quantise shared activations once:** see `ggml_backend_cuda_context::q8_1_reuse` for the safety rules (root tensor,
   pure views, per pass, main stream, grow-only buffers). 668 → 549 quantize kernels per step.
@@ -105,16 +105,36 @@ Rules that follow:
   - Then confirm with a trace that the standalone kernels disappeared.
 - **Multi-column fused GLU mat-vec:** the kernel already looped over columns. Removing the launcher restriction, for
   one type to limit compile time, fused the shared expert of every verify batch.
-- **MoE expert reuse** (R9V `reuse3v2`):
-  - one block per (token, slot) route, and the first route of an expert computes all of its routes;
-  - no LDS staging; each lane decodes a weight block into registers and dots it with every matching activation.
-  - R9V found that LDS staging with two barriers per K step cost more than it saved on VRAM experts.
-  - Whether the compiler folds the repeated `vec_dot` weight loads is a **hypothesis to check in the ISA** (R9V wrote
-    explicit per-type decoders instead).
+- **MoE expert reuse** (R9V `reuse3v2`, one block per route, the first route of an expert computes all of its
+  routes): **measured, and it lost** (steps 11-12).
+  - The compiler did fold the repeated weight loads (checked in the ISA: one weight load per K step).
+  - Behind a per-route branch, each route's activation loads waited in turn. The short-K down projection got 29%
+    slower.
+  - Without the branch, the accumulators for 8 routes × 2 rows × gate/up pushed IQ3_S to 256 VGPRs plus a spill
+    (the old kernel uses 32). The MoE went from 15.5 to 22.4 ms per step.
+  - Rule: reusing one weight load for N consumers inside a warp multiplies the accumulator registers by N. Read the
+    VGPR count before measuring. One warp per route with many warps in flight hides the (PCIe) latency better.
 - **Top-k over a large vocabulary on the CPU:** one pass in 64-entry chunks, skipping a chunk whose max cannot enter the
   current top-k. Almost every chunk is skipped: ~0.1 ms for 248k entries, instead of sorting a candidate array.
 
-## 7. Cross-GPU synchronisation
+## 7. Determinism
+
+- **Atomic-counter compaction reorders its output from run to run.** The HIP radix top-k wrote its list through
+  `atomicAdd` positions, so the list order changed, and so did which tied elements were kept.
+  - Any order-sensitive consumer then turns this into different floats. Here it was the sparse FA, which accumulates
+    its cells in list order.
+  - With greedy decoding, that became a different text on every load, diverging after about 15 tokens.
+- **Detect it by comparing greedy texts across loads.** `openai_bench.py` saves them as `<label>.answer.txt`. Identical
+  timings on two loads do not prove identical texts; compare md5s.
+- **Fix: ordered compaction.** Warp ballot plus popcount within a warp, a scan of the per-warp counts across warps,
+  and write positions in column order. Ties take the lowest index.
+  - The new kernel also replaced 11 launches with 1: -3.2 ms per step.
+- **A deterministic pipeline makes A/B testing tighter.** Two loads of one build now agree to 0.1 ms per step, where
+  load-to-load noise used to be ±6%.
+- **Then the text itself is a correctness test.** A change that should not alter the math (for example staged
+  uploads) must reproduce the reference text byte for byte.
+
+## 8. Cross-GPU synchronisation
 
 - **A direct-P2P AllReduce kernel** (flags in peer VRAM, `__threadfence_system`, spin with `s_sleep`) costs ~9 us when
   both GPUs arrive together.
@@ -124,7 +144,40 @@ Rules that follow:
 - **To find the cause,** pair the collective kernels of both GPUs by order and compare their start times and the GPU
   time of the preceding work (the analysis is in the other playbook).
 
-## 8. Compile time and binary size
+## 9. Reading the ISA and the resource use
+
+- **The trace gives the resources per launch.** The rocprofv3 kernel trace has columns `VGPR_Count`, `SGPR_Count`,
+  `Scratch_Size` and `LDS_Block_Size`. Scratch > 0 means spills.
+- **Disassembly:**
+  1. `roc-obj-ls <lib>` lists the code objects;
+  2. `roc-obj-extract -o . <uri>` extracts each one;
+  3. `grep -l <kernel>` picks the object that contains the kernel;
+  4. `llvm-objdump -d --no-show-raw-insn` disassembles it.
+- **Counting per kernel symbol:**
+  - `global_load`, `v_dot`, `s_cbranch`, `scratch_` per kernel symbol are enough to check a fold, a branch structure
+    or a spill (the analysis scripts of steps 11-12 are in the study log).
+  - A load inside a per-route conditional block is a serialized latency.
+
+## 10. The host side of a decode pass
+
+- **Trace the host.** `decode-profile.sh DP_HIP=1` adds `--hip-runtime-trace`. `hostgap_anatomy.py` then charges each
+  GPU idle gap to the host HIP call running during it, or to host code.
+- **Where 8.4 ms of idle per step went (step 14):**
+  - 4.0 ms host code;
+  - 3.1 ms inside `hipStreamSynchronize`;
+  - 0.43 ms in `hipMemcpyAsync`;
+  - 0.33 ms in `hipGraphInstantiate`.
+- **The decode thread made 314 `hipStreamSynchronize` calls per step.** Most were input uploads: the CUDA buffer
+  `set_tensor` does a copy then syncs the per-thread stream, about 22 µs each, and under `-sm tensor` every input goes
+  to each GPU in turn. That was about 20 per MTP draft pass, 0.5 ms of a 1.7 ms pass.
+- **The fix: staged uploads.** A pinned ring and an upload stream per device. The graph waits on an event, and the
+  upload stream waits for the device's last graphs, all on the GPU.
+- **The scheduler syncs the target of every split input** (`ggml_backend_synchronize`) because the meta backend has
+  no events. Give a backend events, or expect a host round trip per split input.
+- **The sequence view** (`apiseq` in the study log: HIP calls in order, runs collapsed) shows the pattern of one pass
+  at a glance.
+
+## 11. Compile time and binary size
 
 - **`mmvq.cu` is one big translation unit;** every added template variant lengthens the build.
   - Scope new variants to the types that need them (`type == GGML_TYPE_Q8_0` in `if constexpr`).
@@ -132,7 +185,7 @@ Rules that follow:
 - **A change to `ggml.h` (a new op) or to `common.cuh` rebuilds the whole HIP backend** (~10-25 min on the rig). Batch
   such changes.
 
-## 9. Tuning method
+## 12. Tuning method
 
 1. Take a trace of the real workload (`decode-profile.sh`) and its per-step bill (`torchtrace_anatomy.py`).
 2. For the top kernels, compute the achieved bandwidth (or FLOP rate) and read the template arguments.
