@@ -1551,28 +1551,31 @@ static ggml_backend_cuda_context::q8_1_reuse_entry * ggml_cuda_q8_1_reuse_entry(
     return entry;
 }
 
-void * ggml_cuda_q8_1_reuse_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const ggml_tensor * as) {
+ggml_cuda_q8_1_out ggml_cuda_q8_1_reuse_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const ggml_tensor * as) {
+    ggml_cuda_q8_1_out out;
     if (ctx.curr_stream_no != 0 || !ggml_cuda_q8_1_reuse_enabled() || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
             t->ne[0] % QK8_1 != 0) {
-        return nullptr;
+        return out;
     }
-    // the consumer's view of t, which keys the entry: all of t from its start, contiguous, and with rows whose q8_1
-    // blocks are those of t in the same order (the same row width, or no row padding in either)
+    // the consumer's view of t keys the entry and gives the rows of the copy: all of t from its start, contiguous
     size_t offs = 0;
     for (const ggml_tensor * v = as; v != t; v = v->view_src) {
         if (v->view_src == nullptr) {
-            return nullptr;
+            return out;
         }
         offs += v->view_offs;
     }
     if (offs != 0 || !ggml_is_contiguous(as) || ggml_nelements(as) != ggml_nelements(t) || ggml_nrows(as) > MMVQ_MAX_BATCH_SIZE ||
-            (as->ne[0] != t->ne[0] && (as->ne[0] % MATRIX_ROW_PADDING != 0 || t->ne[0] % MATRIX_ROW_PADDING != 0))) {
-        return nullptr;
+            as->ne[0] % QK8_1 != 0) {
+        return out;
     }
     const size_t q8_1_size = ggml_nrows(as) * GGML_PAD(as->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
     bool inserted = false;
     // an entry that already exists for t is overwritten: t is being written again
-    return ggml_cuda_q8_1_reuse_entry(ctx, as, q8_1_size, inserted)->bufs.back();
+    out.ptr        = ggml_cuda_q8_1_reuse_entry(ctx, as, q8_1_size, inserted)->bufs.back();
+    out.ne0        = as->ne[0];
+    out.row_blocks = (int) (GGML_PAD(as->ne[0], MATRIX_ROW_PADDING)/QK8_1);
+    return out;
 }
 
 void ggml_cuda_mul_mat_vec_q(

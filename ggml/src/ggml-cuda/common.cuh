@@ -1606,6 +1606,19 @@ struct ggml_backend_cuda_context {
     } q8_1_reuse;
 };
 
+// Where a producer writes the q8_1 copy of its contiguous output for the mat-vecs that follow (see
+// ggml_cuda_q8_1_reuse_produce): element e goes to block (e / ne0)*row_blocks + (e % ne0)/QK8_1, the rows being the
+// consumer's (ne0 values, padded to row_blocks blocks). ptr == nullptr: no copy to write.
+struct ggml_cuda_q8_1_out {
+    void *  ptr        = nullptr;
+    int64_t ne0        = 0;
+    int     row_blocks = 0;
+};
+
+static __device__ __forceinline__ block_q8_1 * ggml_cuda_q8_1_out_block(const ggml_cuda_q8_1_out & o, const int64_t e) {
+    return (block_q8_1 *) o.ptr + (e / o.ne0)*o.row_blocks + (e % o.ne0)/QK8_1;
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;

@@ -262,7 +262,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 template <float (*op)(float), typename T>
 static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
-        block_q8_1 * q8_out, const int q8_row_blocks) {
+        const ggml_cuda_q8_1_out q8) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -277,28 +277,27 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     ggml_cuda_pdl_sync();
     const T v = (T)(op((float)x[j0]) * (float)g[j1]);
     dst[i] = v;
-    // q8_out (F32 only): the q8_1 copy for the mat-vecs that follow (n % 32 == 0: a warp holds one block of one row)
+    // q8 (F32 only): the q8_1 copy for the mat-vecs that follow (rows of a multiple of 32: a warp holds one block)
     if constexpr (std::is_same_v<T, float>) {
-        if (q8_out) {
-            quantize_q8_1_warp32(v, q8_out + (i / n)*q8_row_blocks + (i % n)/QK8_1, (i % n) % QK8_1);
+        if (q8.ptr) {
+            quantize_q8_1_warp32(v, ggml_cuda_q8_1_out_block(q8, i), i % QK8_1);
         }
     } else {
-        GGML_UNUSED_VARS(q8_out, q8_row_blocks);
+        GGML_UNUSED(q8);
     }
 }
 
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream,
-        block_q8_1 * q8_out = nullptr) {
+        const ggml_cuda_q8_1_out & q8 = {}) {
     static_assert(CUDA_GLU_BLOCK_SIZE % QK8_1 == 0, "whole q8_1 blocks per warp");
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1,
-        q8_out, (int) (GGML_PAD(n, MATRIX_ROW_PADDING)/QK8_1));
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1, q8);
 }
 
 template <float (*op)(float)>
-void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out = nullptr) {
+void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_q8_1_out & q8 = {}) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     void * src0_d = src0->data;
@@ -348,7 +347,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream,
-            (block_q8_1 *) q8_out);
+            q8);
     }
 }
 
@@ -366,7 +365,7 @@ bool ggml_cuda_glu_q8_supported(const ggml_tensor * dst) {
     }
 }
 
-void ggml_cuda_op_glu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out) {
+void ggml_cuda_op_glu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_q8_1_out & q8_out) {
     GGML_ASSERT(ggml_cuda_glu_q8_supported(dst));
     switch (ggml_get_glu_op(dst)) {
         case GGML_GLU_OP_REGLU:       ggml_cuda_op_unary_gated<op_relu>(ctx, dst, q8_out);       break;
@@ -691,7 +690,8 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 /* fused unary + mul */
 
 template <float (*op)(float)>
-static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+        const ggml_cuda_q8_1_out & q8) {
     // unary_node: UNARY op applied to unary_node->src[0]
     // mul_node:   MUL(a, b) where one of a/b is unary_node
     // Output goes to mul_node->data
@@ -723,20 +723,23 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     } else {
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                              (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+                             unary_stride / sizeof(float), other_stride / sizeof(float), stream, q8);
     }
 }
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+        const ggml_cuda_q8_1_out & q8) {
+    // q8 is written by the F32 path only: the caller asks for it only then
+    GGML_ASSERT(q8.ptr == nullptr || mul_node->type == GGML_TYPE_F32);
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:
-            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
+            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node, q8);
             break;
         case GGML_UNARY_OP_SIGMOID:
-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
+            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node, q8);
             break;
         case GGML_UNARY_OP_SOFTPLUS:
-            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
+            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node, q8);
             break;
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
@@ -747,7 +750,7 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 template <float (*op)(float)>
 static __global__ void scale_unary_scale_f32(const float * x, float * dst, const float s0, const float b0,
-        const float s1, const float b1, const int64_t k, block_q8_1 * q8_out, const int64_t ncols, const int q8_row_blocks) {
+        const float s1, const float b1, const int64_t k, const ggml_cuda_q8_1_out q8) {
     const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
@@ -756,21 +759,18 @@ static __global__ void scale_unary_scale_f32(const float * x, float * dst, const
 
     const float v = op(x[i]*s0 + b0)*s1 + b1;
     dst[i] = v;
-    // q8_out: the q8_1 copy for the mat-vecs that follow (ncols % 32 == 0: a warp holds one block of one row)
-    if (q8_out) {
-        const int64_t row = i / ncols;
-        const int64_t col = i - row*ncols;
-        quantize_q8_1_warp32(v, q8_out + row*q8_row_blocks + col/QK8_1, col % QK8_1);
+    // q8: the q8_1 copy for the mat-vecs that follow (rows of a multiple of 32: a warp holds one block)
+    if (q8.ptr) {
+        quantize_q8_1_warp32(v, ggml_cuda_q8_1_out_block(q8, i), i % QK8_1);
     }
 }
 
 template <float (*op)(float)>
 static void scale_unary_scale_f32_cuda(const float * x, float * dst, const float s0, const float b0,
-        const float s1, const float b1, const int64_t k, block_q8_1 * q8_out, const int64_t ncols, cudaStream_t stream) {
+        const float s1, const float b1, const int64_t k, const ggml_cuda_q8_1_out & q8, cudaStream_t stream) {
     static_assert(CUDA_NEG_BLOCK_SIZE % QK8_1 == 0, "whole q8_1 blocks per warp");
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
-    scale_unary_scale_f32<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, s0, b0, s1, b1, k,
-        q8_out, ncols, (int) (GGML_PAD(ncols, MATRIX_ROW_PADDING)/QK8_1));
+    scale_unary_scale_f32<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, s0, b0, s1, b1, k, q8);
 }
 
 bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tensor * unary) {
@@ -780,7 +780,7 @@ bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale0, const ggml_tens
         ggml_is_contiguous(scale0->src[0]) && ggml_is_contiguous(scale0) && ggml_is_contiguous(unary);
 }
 
-void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1, void * q8_out) {
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale0, ggml_tensor * unary, ggml_tensor * scale1, const ggml_cuda_q8_1_out & q8) {
     const ggml_tensor * src = scale0->src[0];
     ggml_tensor       * dst = scale1 ? scale1 : unary;
 
@@ -800,12 +800,10 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
 
     switch (ggml_get_unary_op(unary)) {
         case GGML_UNARY_OP_SILU:
-            scale_unary_scale_f32_cuda<op_silu>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k,
-                (block_q8_1 *) q8_out, dst->ne[0], stream);
+            scale_unary_scale_f32_cuda<op_silu>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, q8, stream);
             break;
         case GGML_UNARY_OP_SIGMOID:
-            scale_unary_scale_f32_cuda<op_sigmoid>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k,
-                (block_q8_1 *) q8_out, dst->ne[0], stream);
+            scale_unary_scale_f32_cuda<op_sigmoid>((const float *) src->data, (float *) dst->data, s0, b0, s1, b1, k, q8, stream);
             break;
         default:
             GGML_ABORT("Unsupported unary op for fused scale+unary");

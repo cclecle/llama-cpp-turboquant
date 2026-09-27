@@ -118,8 +118,7 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sd0,
         int64_t sd1,
         float   scale,
-        block_q8_1 * q8_out,
-        int     q8_row_blocks) {
+        const ggml_cuda_q8_1_out q8) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -147,9 +146,9 @@ static __global__ void dsv4_hc_pre_f32(
 
     const float v = scale * sum;
     dst[i0*sd0 + it*sd1] = v;
-    // q8_out: the q8_1 copy for the mat-vecs that follow (contiguous dst, n_embd % 32 == 0: a warp holds one block)
-    if (q8_out) {
-        quantize_q8_1_warp32(v, q8_out + it*q8_row_blocks + i0/QK8_1, i0 % QK8_1);
+    // q8: the q8_1 copy for the mat-vecs that follow (contiguous dst, n_embd % 32 == 0: a warp holds one block)
+    if (q8.ptr) {
+        quantize_q8_1_warp32(v, ggml_cuda_q8_1_out_block(q8, ir), i0 % QK8_1);
     }
 }
 
@@ -245,7 +244,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
-void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out) {
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_q8_1_out & q8) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
@@ -277,7 +276,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale, (block_q8_1 *) q8_out, (int) (GGML_PAD(n_embd, MATRIX_ROW_PADDING)/QK8_1));
+            scale, q8);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

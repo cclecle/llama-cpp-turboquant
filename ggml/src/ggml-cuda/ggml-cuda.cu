@@ -3899,13 +3899,13 @@ static bool ggml_cuda_fused_scale_unary_enabled() {
 // The q8_1 copy of nodes[i_out] for the quantized mat-vecs that follow it (within a few nodes), for its producer to
 // write with its output (ggml_cuda_q8_1_reuse_produce), or nullptr. Removes the quantize kernel of each of those
 // inputs (Qwen3.8-Flash-Next: ~195 of 484 per verify pass). GGML_CUDA_FUSE_Q8_1=0: the mat-vecs quantize.
-static void * ggml_cuda_q8_1_for_consumers(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i_out) {
+static ggml_cuda_q8_1_out ggml_cuda_q8_1_for_consumers(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i_out) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FUSE_Q8_1");
         return env == nullptr || atoi(env) != 0;
     }();
     if (!enabled) {
-        return nullptr;
+        return {};
     }
     const ggml_tensor * t = cgraph->nodes[i_out];
     for (int j = i_out + 1; j < cgraph->n_nodes && j <= i_out + 24; ++j) {
@@ -3922,7 +3922,7 @@ static void * ggml_cuda_q8_1_for_consumers(ggml_backend_cuda_context * cuda_ctx,
             return ggml_cuda_q8_1_reuse_produce(*cuda_ctx, t, n->src[1]);
         }
     }
-    return nullptr;
+    return {};
 }
 
 // The consecutive GGML_OP_CPY nodes from nodes[i] (views and no-ops between them skipped) that ggml_cuda_cpy_multi
@@ -3999,7 +3999,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // the copy is registered, since a registered copy must be written (-1: node i computed alone)
     if ((node->op == GGML_OP_DSV4_HC_PRE && node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % QK8_1 == 0) ||
             (node->op == GGML_OP_GLU && ggml_cuda_glu_q8_supported(node))) {
-        if (void * q8 = ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i)) {
+        const ggml_cuda_q8_1_out q8 = ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i);
+        if (q8.ptr) {
             if (node->op == GGML_OP_DSV4_HC_PRE) {
                 ggml_cuda_op_dsv4_hc_pre(*cuda_ctx, node, q8);
             } else {
@@ -4762,7 +4763,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        // the gate of every attention / gated delta net output (o * sigmoid(g)) feeds the output projection
+        const ggml_cuda_q8_1_out q8 = cgraph->nodes[i + 1]->type == GGML_TYPE_F32 ?
+            ggml_cuda_q8_1_for_consumers(cuda_ctx, cgraph, i + 1) : ggml_cuda_q8_1_out{};
+        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], q8);
         return 1;
     }
 
