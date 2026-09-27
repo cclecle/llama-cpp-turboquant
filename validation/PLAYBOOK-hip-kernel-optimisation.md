@@ -114,6 +114,25 @@ Rules that follow:
     (the old kernel uses 32). The MoE went from 15.5 to 22.4 ms per step.
   - Rule: reusing one weight load for N consumers inside a warp multiplies the accumulator registers by N. Read the
     VGPR count before measuring. One warp per route with many warps in flight hides the (PCIe) latency better.
+- **Let the producer write the consumer's quantized input** (`GGML_CUDA_FUSE_Q8_1`, steps 19-24).
+  - A mat-vec quantizes its F32 input to q8_1 in a separate kernel, about 480 per verify pass here.
+  - An elementwise or row producer (a norm, a gate, the hyper-connection mix) holds the values in registers anyway.
+    It can write the q8_1 block too: 32 consecutive values per warp, then a warp max/sum.
+  - Registering the copy in the q8_1 reuse cache under the consumer's key makes the mat-vec skip its quantize kernel.
+  - Three rules make it exact:
+    1. one shared device function for the block math, so the bytes are the same whoever writes them;
+    2. write in the consumer's row geometry: element e at block (e / w)·row_blocks + (e % w)/32, which is exact for
+       any reshape with rows of a multiple of 32;
+    3. decide that the producer can write before registering the copy, since a registered copy nobody writes is
+       garbage for the mat-vec.
+  - Result: 484 → ~146 quantize kernels per pass.
+  - The ones that remain follow a mat-vec, the MoE or the AllReduce: there, no single warp holds a whole block.
+- **Runs of identical copies in one launch** (`ggml_cuda_cpy_multi`). The rollback tails of a state are one copy per
+  speculative slot: same layout, different offsets. One launch with blockIdx.y = the copy works when no destination
+  overlaps another copy's source or destination. Skip the view nodes that sit between them in the graph.
+- **Find the producer from the trace, not from the op names.** A "GLU" kernel turned out to be the fused
+  sigmoid·mul output gate (`unary_gated_op_kernel<op_sigmoid>` from `ggml_cuda_op_unary_mul`). Print the kernels
+  before and after, with their grid sizes (the `gluctx` query in the study log).
 - **Top-k over a large vocabulary on the CPU:** one pass in 64-entry chunks, skipping a chunk whose max cannot enter the
   current top-k. Almost every chunk is skipped: ~0.1 ms for 248k entries, instead of sorting a candidate array.
 

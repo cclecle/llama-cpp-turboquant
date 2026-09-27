@@ -131,6 +131,13 @@ Analyses that paid off (the code is in the study log; they are short python over
   - Cold experts sit in uncached host memory, so every duplicate read crosses PCIe again. Verify batches here repeat 32%
     of their routes (35% of the cold ones).
 
+- **The hot-expert set is the biggest decode lever once the kernels are fixed** (step 21).
+  - Cold experts are read from host memory over PCIe and dominate the MoE.
+  - 44 GiB instead of 36.7 GiB of expert bytes in VRAM: 46.7 → 40.8 ms per step and prefill +12%, at 31.6 of 32.6
+    GB per card.
+  - `moe_hotset.py --budget-gib` sizes it. The budget is a rung decision (the user's), and the text stays
+    byte-identical since placement changes no math.
+
 ## 5. Process traps (remote rig from Windows)
 
 - **Don't pipe Python through a bash heredoc to edit C++** (`\n` became a real newline in a string literal, and quoting
