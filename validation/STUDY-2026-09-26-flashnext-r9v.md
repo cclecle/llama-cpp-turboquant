@@ -443,6 +443,8 @@ Same-config ms per speculative step (step_ms.py, 2 loads per arm, today's hot se
 | 39 | GPU draft sampling under the tensor split (`set_sampler` guard lifted) | the sampler meets vocabulary-split logits: meta backend asserts; host samples show the CPU sampler costs nothing (55/60 in synchronize); dropped |
 | 40-42 | verify mat-vecs by name; 4 waves per row for more of them | at 5 columns ~55% of DRAM bandwidth, but 4 waves per row lose in real decode (45.3 -> 47.1 / 48.6 ms/step); perf loops mislead (8 MB matrices stay in the 64 MB infinity cache) |
 | 43 | flash-decoding over the QSA lists (lane = 8 dims, 12 warp reductions per cell) | 1 query 30.6 vs 40.7 us, 5 queries 75.6 vs 57.1 us (mma); per-block fixed cost + per-cell reductions; dropped |
+| 45 | prefill anatomy at ub 4096 (per GPU, 18.4 s window, 15.4 s busy) | MoE experts 4.1 s, dense MMQ 1.5, GDN 1.26, sgemm 1.05, RCCL 1.0, mm_ids_helper 0.86, FA 0.82, quantize 0.76, HC post/pre 0.74/0.54, rms_norm 0.67 |
+| 46 | mm_ids_helper over 8 waves per expert | ub 1024 1,358 -> 1,372, **ub 4096 1,854 -> 1,924 t/s**, texts identical |
 
 Every step since 14 checks the generated text md5 (reference 8a0ec2a9ccd2816c6250db15e16181eb up to step 31; from step 32, with our F32 GEMM, 0c8460b131f6183795627bea73282ee2; from step 34, with sparse prefill FA, 15c95895521e9ee4fc6aa67dc23f6ff1: both texts are coherent and diverge 868 characters in).
 
