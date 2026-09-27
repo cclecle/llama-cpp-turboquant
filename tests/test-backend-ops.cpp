@@ -11328,6 +11328,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 4096, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 7, n, 10240, {2, 1}, {1, 1}));
     }
+    // F32 mat-vecs (the qwen4exp MoE router and hyper-connection mixers): several rows per block (and a row count
+    // that leaves a partial block), and wider blocks for fewer rows than CUs
+    for (int64_t n : { 1, 5, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 514, n, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4,   n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 24,  n, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1,   n, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 3,   n, 1026,  {1, 1}, {1, 1}));
+    }
     for (bool strided : { false, true }) {
         test_cases.emplace_back(new test_rms_norm_scale({128, 16, 5, 1}, strided));
         test_cases.emplace_back(new test_rms_norm_scale({2048, 3, 2, 1}, strided));

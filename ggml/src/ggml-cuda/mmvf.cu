@@ -383,6 +383,84 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+// F32 weights, c_rows rows per block: each loaded activation serves c_rows rows (the MoE router, 2560 -> 512, re-read
+// its 5 activation columns once per row: 5x the weight bytes through L2). Per row it keeps the per-thread K stride
+// and the two-stage reduction of mul_mat_vec_f at the same block size, so the results are bit-identical.
+template <int ncols_dst, int block_size, int c_rows>
+__launch_bounds__(block_size, 1)
+static __global__ void mul_mat_vec_f32_rows(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int nrows, const int stride_row, const int stride_col_y2, const int stride_col_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = block_size / warp_size;
+    static_assert(nwarps <= warp_size, "one reduction warp");
+
+    const int row0 = blockIdx.x*c_rows;
+    const int tid  = threadIdx.x;
+
+    const float2 * x2 = (const float2 *) x;
+    const float2 * y2 = (const float2 *) y;
+
+    int row_offs[c_rows];
+#pragma unroll
+    for (int r = 0; r < c_rows; ++r) {
+        row_offs[r] = min(row0 + r, nrows - 1)*stride_row/2; // a clamped row is computed, not written
+    }
+
+    float sumf[c_rows][ncols_dst] = {{0.0f}};
+
+    ggml_cuda_pdl_sync();
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        float2 tmpy[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmpy[j] = y2[j*stride_col_y2 + col2];
+        }
+#pragma unroll
+        for (int r = 0; r < c_rows; ++r) {
+            const float2 tmpx = x2[row_offs[r] + col2];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                ggml_cuda_mad(sumf[r][j], tmpx.x, tmpy[j].x);
+                ggml_cuda_mad(sumf[r][j], tmpx.y, tmpy[j].y);
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+
+    __shared__ float buf[c_rows*ncols_dst][warp_size];
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+#pragma unroll
+    for (int r = 0; r < c_rows; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float s = warp_reduce_sum<warp_size>(sumf[r][j]);
+            if (nwarps > 1) {
+                if (lane == 0) {
+                    buf[r*ncols_dst + j][warp] = s;
+                }
+            } else if (lane == 0 && row0 + r < nrows) {
+                dst[j*stride_col_dst + row0 + r] = s;
+            }
+        }
+    }
+    if (nwarps == 1) {
+        return;
+    }
+    __syncthreads();
+    // as mul_mat_vec_f: the first warp sums the warp partials, lanes past the last warp add zeros
+    for (int v = warp; v < c_rows*ncols_dst; v += nwarps) {
+        float s = lane < nwarps ? buf[v][lane] : 0.0f;
+        s = warp_reduce_sum<warp_size>(s);
+        const int r = v / ncols_dst;
+        const int j = v % ncols_dst;
+        if (lane == 0 && row0 + r < nrows) {
+            dst[j*stride_col_dst + row0 + r] = s;
+        }
+    }
+}
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -453,6 +531,42 @@ void launch_mul_mat_vec_f_cuda(
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
+
+    // F32 weights on a plain launch (Qwen3.8-Flash-Next: the MoE router and the hyper-connection mixers): many rows
+    // take several rows per block (mul_mat_vec_f32_rows, bit-identical), and fewer rows than CUs take a wider block
+    // (10240 -> 4 ran as 4 blocks of 256 threads, 6.5 us for 160 KB)
+    if constexpr (std::is_same_v<T, float> && !is_multi_token_id) {
+        static const bool tune = [] {
+            const char * env = getenv("GGML_CUDA_MMVF_F32_TUNE"); // 0: one block of up to 256 threads per row
+            return env == nullptr || atoi(env) != 0;
+        }();
+        const int  nsm   = ggml_cuda_info().devices[device].nsm;
+        const bool plain = tune && ids == nullptr && !has_fusion && nchannels_dst == 1 && nsamples_or_ntokens == 1;
+        if (plain && block_size_best == 256 && nrows >= 4*nsm) {
+            constexpr int rows = 4;
+            const ggml_cuda_kernel_launch_params launch_params = {dim3((nrows + rows - 1)/rows), dim3(256), 0, stream};
+            ggml_cuda_kernel_launch(mul_mat_vec_f32_rows<ncols_dst, 256, rows>, launch_params,
+                x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst);
+            return;
+        }
+        if (plain && nrows < nsm && ncols/2 > 256) {
+            const bool wide = ncols/2 >= 1024;
+            const dim3 block_dims_wide(wide ? 1024 : 512, 1, 1);
+            if (wide) {
+                mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 1024, is_multi_token_id>
+                    (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims_wide, block_nums, nbytes_shared, ids_stride, stream);
+            } else {
+                mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 512, is_multi_token_id>
+                    (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims_wide, block_nums, nbytes_shared, ids_stride, stream);
+            }
+            return;
+        }
+    }
+
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
         case   32: {
