@@ -2789,6 +2789,19 @@ extern "C" {
             struct ggml_tensor  * blk,
             struct ggml_tensor  * add);
 
+    // the same from the raw per-head indexer scores: the block score is relu(score) summed over the heads, head 0
+    // first, plus bias, so that no [n_blocks, n_head, n_tokens] relu output or head-sum tensor is built
+    //   score: [n_blocks, n_head, n_tokens, ns] F32
+    //   add:   [n_kv, n_tokens, ns] or [n_kv, n_tokens, 1, ns] (the attention mask as it is)
+    //   bias:  [n_blocks, n_tokens, ns]         F32, or NULL
+    //   res[j, t, s] = ((relu(score[b, 0, t, s]) + ... + relu(score[b, n_head - 1, t, s])) + bias[b, t, s]) + add[j, t, s]
+    GGML_API struct ggml_tensor * ggml_qsa_expand_heads(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blk,
+            struct ggml_tensor  * add,
+            struct ggml_tensor  * bias);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

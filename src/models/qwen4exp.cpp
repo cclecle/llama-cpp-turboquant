@@ -902,32 +902,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-
-    // the heads sit side by side on ne[1] and there are only a few of them
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
-    }
-
-    score = summed;
-    cb(score, "indexer_score", il);
-
-    // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
-        score = ggml_add(ctx0, score, inp->bias);
-    }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = nullptr;
 
     if (qwen4exp_qsa_fused()) {
-        // the per-cell term is the attention mask (f16 under flash attention), or else the whole bias
-        expanded = ggml_qsa_expand(ctx0, score, inp->cell_blk,
-                blk_bias ? ggml_reshape_3d(ctx0, kq_mask, n_kv, n_tps, n_stream) : inp->bias);
+        // the relu, the head sum, the block bias and the per-cell term in one op, in the order of the unfused graph.
+        // the per-cell term is the attention mask (f16 under flash attention) as it is: a per-layer reshape of it
+        // was a new tensor, which the scheduler copied to the device once per layer (13 x 512 MiB at ubatch 4096)
+        expanded = ggml_qsa_expand_heads(ctx0, score, inp->cell_blk,
+                blk_bias ? kq_mask : inp->bias, blk_bias ? inp->bias : nullptr);
     } else {
+        score = ggml_relu(ctx0, score);
+
+        // the heads sit side by side on ne[1] and there are only a few of them
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+        cb(score, "indexer_score", il);
+
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        if (blk_bias) {
+            score = ggml_add(ctx0, score, inp->bias);
+        }
+
         expanded = ggml_get_rows(ctx0,
                 ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
         expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
@@ -1058,9 +1061,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
     // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // this will be our source of zero values for unmasking top k mask elements; the layers of one width share it
+    ggml_tensor * zeros = nullptr;
+    const auto zit = qsa_zeros.find(top_k_3d->ne[0]);
+    if (zit != qsa_zeros.end()) {
+        zeros = zit->second;
+    } else {
+        zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+        qsa_zeros.emplace(top_k_3d->ne[0], zeros);
+    }
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])

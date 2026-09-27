@@ -11547,10 +11547,18 @@ void ggml_compute_forward_qsa_expand(
     const ggml_tensor * score = dst->src[0];
     const ggml_tensor * blk   = dst->src[1];
     const ggml_tensor * add   = dst->src[2];
+    const ggml_tensor * bias  = dst->src[3];
 
-    const int64_t n_kv = dst->ne[0];
-    const int64_t n_tk = dst->ne[1];
-    const int64_t ns   = dst->ne[2];
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_tk   = dst->ne[1];
+    const int64_t ns     = dst->ne[2];
+    const int64_t n_head = ggml_get_op_params_i32(dst, 0);
+
+    // score: [n_blocks, n_tk, ns], or [n_blocks, n_head, n_tk, ns] summed here
+    const size_t sc_t = n_head > 0 ? score->nb[2] : score->nb[1];
+    const size_t sc_s = n_head > 0 ? score->nb[3] : score->nb[2];
+    // the attention mask keeps its streams on ne[3]
+    const size_t ad_s = add->ne[2] == 1 && add->ne[3] > 1 ? add->nb[3] : add->nb[2];
 
     const int64_t nr = n_tk*ns;
     const int64_t dr = (nr + params->nth - 1)/params->nth;
@@ -11562,13 +11570,29 @@ void ggml_compute_forward_qsa_expand(
         const int64_t t = ir - s*n_tk;
 
         const int32_t * b  = (const int32_t *) ((const char *) blk->data + s*blk->nb[1]);
-        const float   * sc = (const float *) ((const char *) score->data + t*score->nb[1] + s*score->nb[2]);
-        const char    * ad = (const char *) add->data + t*add->nb[1] + s*add->nb[2];
+        const char    * sc = (const char *) score->data + t*sc_t + s*sc_s;
+        const float   * bi = bias ? (const float *) ((const char *) bias->data + t*bias->nb[1] + s*bias->nb[2]) : nullptr;
+        const char    * ad = (const char *) add->data + t*add->nb[1] + s*ad_s;
         float         * y  = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const float a = add->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) ad)[j]) : ((const float *) ad)[j];
-            y[j] = sc[b[j]] + a;
+            float v;
+            if (n_head > 0) {
+                // the relu and the head order of ggml_relu + ggml_add, so the sums are the same
+                v = 0.0f;
+                for (int64_t h = 0; h < n_head; ++h) {
+                    const float x = ((const float *) (sc + h*score->nb[1]))[b[j]];
+                    const float r = x > 0.f ? x : 0.f;
+                    v = h == 0 ? r : v + r;
+                }
+            } else {
+                v = ((const float *) sc)[b[j]];
+            }
+            if (bi) {
+                v = v + bi[b[j]];
+            }
+            y[j] = v + a;
         }
     }
 }

@@ -122,12 +122,15 @@ void ggml_cuda_op_qsa_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // ggml_qsa_expand: one thread per cell
+// n_head > 0 (ggml_qsa_expand_heads): the block score is relu(score) summed over the heads here, in the order and with
+// the relu of ggml_relu + ggml_add, then plus the optional per-block bias, so the result matches the unfused graph
 template <typename T_add>
 static __global__ void qsa_expand_kernel(
         const float * __restrict__ score, const int32_t * __restrict__ blk, const T_add * __restrict__ add,
-        float * __restrict__ dst, const int n_kv,
-        const int64_t s_score1, const int64_t s_score2, const int64_t s_blk1,
-        const int64_t s_add1, const int64_t s_add2, const int64_t s_dst1, const int64_t s_dst2) {
+        const float * __restrict__ bias, float * __restrict__ dst, const int n_kv, const int n_head,
+        const int64_t s_score_h, const int64_t s_score_t, const int64_t s_score_s, const int64_t s_blk1,
+        const int64_t s_add1, const int64_t s_add2, const int64_t s_bias1, const int64_t s_bias2,
+        const int64_t s_dst1, const int64_t s_dst2) {
     const int j = blockIdx.x*blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     const int s = blockIdx.z;
@@ -138,19 +141,36 @@ static __global__ void qsa_expand_kernel(
 
     const int b = blk[s*s_blk1 + j];
 
-    dst[s*s_dst2 + t*s_dst1 + j] = score[s*s_score2 + t*s_score1 + b] + ggml_cuda_cast<float>(add[s*s_add2 + t*s_add1 + j]);
+    const float * sc = score + s*s_score_s + t*s_score_t + b;
+
+    float v;
+    if (n_head > 0) {
+        v = fmaxf(sc[0], 0);
+        for (int h = 1; h < n_head; ++h) {
+            v = v + fmaxf(sc[h*s_score_h], 0);
+        }
+    } else {
+        v = sc[0];
+    }
+    if (bias) {
+        v = v + bias[s*s_bias2 + t*s_bias1 + b];
+    }
+
+    dst[s*s_dst2 + t*s_dst1 + j] = v + ggml_cuda_cast<float>(add[s*s_add2 + t*s_add1 + j]);
 }
 
 void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * score = dst->src[0];
     const ggml_tensor * blk   = dst->src[1];
     const ggml_tensor * add   = dst->src[2];
+    const ggml_tensor * bias  = dst->src[3];
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
 
-    const int n_kv = dst->ne[0];
-    const int n_tk = dst->ne[1];
-    const int ns   = dst->ne[2];
+    const int n_kv   = dst->ne[0];
+    const int n_tk   = dst->ne[1];
+    const int ns     = dst->ne[2];
+    const int n_head = ggml_get_op_params_i32(dst, 0);
 
     GGML_ASSERT(n_tk <= 65535 && ns <= 65535);
 
@@ -162,23 +182,30 @@ void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     cudaStream_t stream = ctx.stream();
 
-    const int64_t s_score1 = score->nb[1]/sizeof(float);
-    const int64_t s_score2 = score->nb[2]/sizeof(float);
-    const int64_t s_blk1   = blk->nb[1]/sizeof(int32_t);
-    const int64_t s_add1   = add->nb[1]/ts_add;
-    const int64_t s_add2   = add->nb[2]/ts_add;
-    const int64_t s_dst1   = dst->nb[1]/sizeof(float);
-    const int64_t s_dst2   = dst->nb[2]/sizeof(float);
+    // score: [n_blocks, n_tk, ns], or [n_blocks, n_head, n_tk, ns] with the heads summed here
+    const int64_t s_score_h = score->nb[1]/sizeof(float);
+    const int64_t s_score_t = (n_head > 0 ? score->nb[2] : score->nb[1])/sizeof(float);
+    const int64_t s_score_s = (n_head > 0 ? score->nb[3] : score->nb[2])/sizeof(float);
+    const int64_t s_blk1    = blk->nb[1]/sizeof(int32_t);
+    const int64_t s_add1    = add->nb[1]/ts_add;
+    // the attention mask keeps its streams on ne[3]
+    const int64_t s_add2    = (add->ne[2] == 1 && add->ne[3] > 1 ? add->nb[3] : add->nb[2])/ts_add;
+    const int64_t s_bias1   = bias ? bias->nb[1]/sizeof(float) : 0;
+    const int64_t s_bias2   = bias ? bias->nb[2]/sizeof(float) : 0;
+    const int64_t s_dst1    = dst->nb[1]/sizeof(float);
+    const int64_t s_dst2    = dst->nb[2]/sizeof(float);
+
+    const float * bias_d = bias ? (const float *) bias->data : nullptr;
 
     if (add->type == GGML_TYPE_F16) {
         qsa_expand_kernel<half><<<block_nums, block_dims, 0, stream>>>(
-            (const float *) score->data, (const int32_t *) blk->data, (const half *) add->data, (float *) dst->data, n_kv,
-            s_score1, s_score2, s_blk1, s_add1, s_add2, s_dst1, s_dst2);
+            (const float *) score->data, (const int32_t *) blk->data, (const half *) add->data, bias_d, (float *) dst->data,
+            n_kv, n_head, s_score_h, s_score_t, s_score_s, s_blk1, s_add1, s_add2, s_bias1, s_bias2, s_dst1, s_dst2);
     } else {
         GGML_ASSERT(add->type == GGML_TYPE_F32);
         qsa_expand_kernel<float><<<block_nums, block_dims, 0, stream>>>(
-            (const float *) score->data, (const int32_t *) blk->data, (const float *) add->data, (float *) dst->data, n_kv,
-            s_score1, s_score2, s_blk1, s_add1, s_add2, s_dst1, s_dst2);
+            (const float *) score->data, (const int32_t *) blk->data, (const float *) add->data, bias_d, (float *) dst->data,
+            n_kv, n_head, s_score_h, s_score_t, s_score_s, s_blk1, s_add1, s_add2, s_bias1, s_bias2, s_dst1, s_dst2);
     }
     CUDA_CHECK(cudaGetLastError());
 }

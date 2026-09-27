@@ -2432,6 +2432,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // the zero source of the dense QSA mask, one per top-k width: a copy per layer stayed alive from the start of
+        // the graph (a leaf) to its layer
+        std::map<int64_t, ggml_tensor *> qsa_zeros;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

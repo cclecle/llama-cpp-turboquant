@@ -6735,33 +6735,67 @@ struct ggml_tensor * ggml_qsa_pool(
     return result;
 }
 
-// ggml_qsa_expand
+// ggml_qsa_expand, ggml_qsa_expand_heads
+// op_params[0]: the heads the op sums (0: score already is the block score)
+
+static struct ggml_tensor * ggml_qsa_expand_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blk,
+        struct ggml_tensor  * add,
+        struct ggml_tensor  * bias,
+        bool                  heads) {
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(score->nb[0] == sizeof(float));
+    GGML_ASSERT(heads || score->ne[3] == 1);
+
+    const int64_t n_head = heads ? score->ne[1] : 0;
+    const int64_t n_tok  = heads ? score->ne[2] : score->ne[1];
+    const int64_t ns     = heads ? score->ne[3] : score->ne[2];
+
+    GGML_ASSERT(blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(blk));
+    GGML_ASSERT(blk->ne[1] == ns && blk->ne[2] == 1 && blk->ne[3] == 1);
+
+    // the streams on ne[2], or on ne[3] as the attention mask has them
+    GGML_ASSERT(add->type == GGML_TYPE_F32 || add->type == GGML_TYPE_F16);
+    GGML_ASSERT(add->nb[0] == ggml_type_size(add->type));
+    GGML_ASSERT(add->ne[0] == blk->ne[0] && add->ne[1] == n_tok);
+    GGML_ASSERT((add->ne[2] == ns && add->ne[3] == 1) || (add->ne[2] == 1 && add->ne[3] == ns));
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32 && bias->nb[0] == sizeof(float));
+        GGML_ASSERT(bias->ne[0] == score->ne[0] && bias->ne[1] == n_tok && bias->ne[2] == ns && bias->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, blk->ne[0], n_tok, ns);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_head);
+
+    result->op     = GGML_OP_QSA_EXPAND;
+    result->src[0] = score;
+    result->src[1] = blk;
+    result->src[2] = add;
+    result->src[3] = bias;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_qsa_expand(
         struct ggml_context * ctx,
         struct ggml_tensor  * score,
         struct ggml_tensor  * blk,
         struct ggml_tensor  * add) {
-    GGML_ASSERT(score->type == GGML_TYPE_F32);
-    GGML_ASSERT(score->nb[0] == sizeof(float));
-    GGML_ASSERT(score->ne[3] == 1);
+    return ggml_qsa_expand_impl(ctx, score, blk, add, NULL, false);
+}
 
-    GGML_ASSERT(blk->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(blk));
-    GGML_ASSERT(blk->ne[1] == score->ne[2] && blk->ne[2] == 1 && blk->ne[3] == 1);
-
-    GGML_ASSERT(add->type == GGML_TYPE_F32 || add->type == GGML_TYPE_F16);
-    GGML_ASSERT(add->nb[0] == ggml_type_size(add->type));
-    GGML_ASSERT(add->ne[0] == blk->ne[0] && add->ne[1] == score->ne[1] && add->ne[2] == score->ne[2] && add->ne[3] == 1);
-
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, blk->ne[0], score->ne[1], score->ne[2]);
-
-    result->op     = GGML_OP_QSA_EXPAND;
-    result->src[0] = score;
-    result->src[1] = blk;
-    result->src[2] = add;
-
-    return result;
+struct ggml_tensor * ggml_qsa_expand_heads(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blk,
+        struct ggml_tensor  * add,
+        struct ggml_tensor  * bias) {
+    return ggml_qsa_expand_impl(ctx, score, blk, add, bias, true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

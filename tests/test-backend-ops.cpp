@@ -8186,6 +8186,63 @@ struct test_qsa_pool : public test_case {
     }
 };
 
+// GGML_OP_QSA_EXPAND from the raw per-head scores (ggml_qsa_expand_heads)
+struct test_qsa_expand_heads : public test_case {
+    const ggml_type type_add;
+    const int64_t n_blocks;
+    const int64_t n_head;
+    const int64_t n_tok;
+    const int64_t ns;
+    const int64_t n_kv;
+    const bool bias;  // the per-block bias
+    const bool mask;  // add shaped like the attention mask, [n_kv, n_tok, 1, ns]
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_add, n_blocks, n_head, n_tok, ns, n_kv, bias, mask);
+    }
+
+    test_qsa_expand_heads(ggml_type type_add = GGML_TYPE_F16, int64_t n_blocks = 1025, int64_t n_head = 4, int64_t n_tok = 5,
+            int64_t ns = 1, int64_t n_kv = 4096, bool bias = true, bool mask = true)
+        : type_add(type_add), n_blocks(n_blocks), n_head(n_head), n_tok(n_tok), ns(ns), n_kv(n_kv), bias(bias), mask(mask) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_blocks, n_head, n_tok, ns);
+        ggml_set_name(score, "score");
+
+        ggml_tensor * blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+        ggml_set_name(blk, "blk");
+
+        ggml_tensor * add = mask ? ggml_new_tensor_4d(ctx, type_add, n_kv, n_tok, 1, ns) : ggml_new_tensor_3d(ctx, type_add, n_kv, n_tok, ns);
+        ggml_set_name(add, "add");
+
+        ggml_tensor * b = nullptr;
+        if (bias) {
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, ns);
+            ggml_set_name(b, "bias");
+        }
+
+        ggml_tensor * out = ggml_qsa_expand_heads(ctx, score, blk, add, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(5678);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "blk") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & x : data) {
+                    x = (int32_t) (gen() % n_blocks);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_QSA_EXPAND
 struct test_qsa_expand : public test_case {
     const ggml_type type_add;
@@ -11361,6 +11418,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_expand(type_add, 1025,    5, 1, 4096));
         test_cases.emplace_back(new test_qsa_expand(type_add,  257,    8, 2, 1024));
         test_cases.emplace_back(new test_qsa_expand(type_add,  512, 1024, 1, 2048));
+        test_cases.emplace_back(new test_qsa_expand_heads(type_add, 1025, 4,    5, 1, 4096, true,  true));
+        test_cases.emplace_back(new test_qsa_expand_heads(type_add,  257, 4,    8, 2, 1024, true,  true));
+        test_cases.emplace_back(new test_qsa_expand_heads(type_add,  257, 3,    8, 2, 1024, false, false));
+        test_cases.emplace_back(new test_qsa_expand_heads(type_add,  512, 4, 1024, 1, 2048, true,  true));
+        test_cases.emplace_back(new test_qsa_expand_heads(type_add,  512, 1,   64, 1, 2048, false, true));
     }
 
     // single-query decode, head 256, 9-16 Q heads per K/V head, q8_0 (the qwen4exp MTP head under a tensor split)
@@ -11609,6 +11671,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_qsa_pool(GGML_TYPE_Q8_0, 128, 32768, 4, 8192, 1, true));
     test_cases.emplace_back(new test_qsa_expand(GGML_TYPE_F16, 8193, 5, 1, 32768));
+    test_cases.emplace_back(new test_qsa_expand_heads(GGML_TYPE_F16, 8192, 4,    5, 1, 32768, true, true));
+    test_cases.emplace_back(new test_qsa_expand_heads(GGML_TYPE_F16, 8192, 4, 1024, 1, 32768, true, true));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
