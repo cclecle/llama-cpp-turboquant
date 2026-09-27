@@ -792,6 +792,117 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// Staged uploads. Small writes into compute buffers (the graph inputs: token positions, masks, cell and block
+// indices; about 20 per decode pass on each device under -sm tensor) were a copy and a stream synchronize each,
+// ~22 us of GPU idle apiece: half a millisecond of every MTP draft pass. They now go through a pinned ring on one
+// upload stream per device, without a host wait. The upload stream first waits (on the GPU) for the graphs already
+// submitted on the device, which may still read the destination; the next graph, and the copies on the other streams
+// that read device memory, wait (on the GPU) for the uploads. GGML_CUDA_STAGED_UPLOAD=0: the blocking copies.
+struct ggml_cuda_staged_uploads {
+    std::mutex   mutex;
+    bool         failed = false;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  ev_up  = nullptr;             // after the uploads, as of recorded_seq
+    cudaEvent_t  ev_war = nullptr;             // scratch: the graphs an upload has to wait for
+    char       * ring   = nullptr;
+    size_t       head   = 0;
+    uint64_t     seq          = 0;             // uploads so far
+    uint64_t     recorded_seq = 0;             // uploads covered by ev_up
+    std::vector<cudaStream_t> computed;        // streams that ran graphs since the last upload
+    std::unordered_map<cudaStream_t, uint64_t> seen; // uploads each consumer stream has waited for
+};
+
+static ggml_cuda_staged_uploads g_staged_uploads[GGML_CUDA_MAX_DEVICES];
+
+static constexpr size_t GGML_CUDA_STAGED_UPLOAD_MAX = 4u << 20;
+static constexpr size_t GGML_CUDA_STAGED_RING_SIZE  = 64u << 20;
+
+static bool ggml_cuda_staged_upload_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_STAGED_UPLOAD");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// n rows of size bytes, stride_src apart, to dst (stride_dst apart) through the ring; false: the caller copies
+static bool ggml_cuda_staged_upload(ggml_backend_buffer_t buffer, int device, char * dst, size_t stride_dst,
+        const char * src, size_t stride_src, size_t size, size_t n) {
+    const size_t total = size*n;
+    if (!ggml_cuda_staged_upload_enabled() || total == 0 || total > GGML_CUDA_STAGED_UPLOAD_MAX ||
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    // hipMemcpy2DAsync collapses when a pitch is not a multiple of 4
+    const bool contiguous = n == 1 || stride_dst == size;
+    if (!contiguous && (stride_dst % 4 != 0 || size % 4 != 0)) {
+        return false;
+    }
+    ggml_cuda_staged_uploads & u = g_staged_uploads[device];
+    std::lock_guard<std::mutex> lock(u.mutex);
+    if (u.failed) {
+        return false;
+    }
+    if (u.ring == nullptr) {
+        if (cudaMallocHost((void **) &u.ring, GGML_CUDA_STAGED_RING_SIZE) != cudaSuccess) {
+            (void) cudaGetLastError();
+            u.ring   = nullptr;
+            u.failed = true;
+            GGML_LOG_WARN("%s: no pinned staging ring for device %d, uploads stay synchronous\n", __func__, device);
+            return false;
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&u.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&u.ev_up,  cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&u.ev_war, cudaEventDisableTiming));
+    }
+    size_t off = GGML_PAD(u.head, 256);
+    if (off + total > GGML_CUDA_STAGED_RING_SIZE) {
+        // the earlier copies out of the ring must be done before it is overwritten
+        CUDA_CHECK(cudaStreamSynchronize(u.stream));
+        off = 0;
+    }
+    for (cudaStream_t cs : u.computed) {
+        CUDA_CHECK(cudaEventRecord(u.ev_war, cs));
+        CUDA_CHECK(cudaStreamWaitEvent(u.stream, u.ev_war, 0));
+    }
+    u.computed.clear();
+    for (size_t i = 0; i < n; ++i) {
+        memcpy(u.ring + off + i*size, src + i*stride_src, size);
+    }
+    if (contiguous) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, u.ring + off, total, cudaMemcpyHostToDevice, u.stream));
+    } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, stride_dst, u.ring + off, size, size, n, cudaMemcpyHostToDevice, u.stream));
+    }
+    u.head = off + total;
+    u.seq++;
+    return true;
+}
+
+// the work queued next on stream sees every staged upload of the device; graph: the stream runs a graph next
+static void ggml_cuda_staged_upload_fence(int device, cudaStream_t stream, bool graph) {
+    if (!ggml_cuda_staged_upload_enabled()) {
+        return;
+    }
+    ggml_cuda_staged_uploads & u = g_staged_uploads[device];
+    std::lock_guard<std::mutex> lock(u.mutex);
+    if (u.stream == nullptr) {
+        return;
+    }
+    uint64_t & seen = u.seen[stream];
+    if (seen != u.seq) {
+        if (u.recorded_seq != u.seq) {
+            CUDA_CHECK(cudaEventRecord(u.ev_up, u.stream));
+            u.recorded_seq = u.seq;
+        }
+        CUDA_CHECK(cudaStreamWaitEvent(stream, u.ev_up, 0));
+        seen = u.seq;
+    }
+    if (graph && std::find(u.computed.begin(), u.computed.end(), stream) == u.computed.end()) {
+        u.computed.push_back(stream);
+    }
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -800,6 +911,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -812,6 +924,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_staged_upload(buffer, ctx->device, (char *) tensor->data + offset, size, (const char *) data, size, size, 1)) {
+        return;
+    }
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -824,6 +940,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -839,6 +956,11 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_staged_upload(buffer, ctx->device, (char *) tensor->data + offset, stride_tensor,
+            (const char *) data, stride_data, size, n_copies)) {
+        return;
+    }
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
 
     // hipMemcpy2DAsync H2D runs at ~21-26 GB/s when both pitches are multiples of 4 and at
     // ~0.06 GB/s when either one is not; the width and the row count do not matter. The
@@ -873,6 +995,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -886,6 +1009,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        ggml_cuda_staged_upload_fence(src_ctx->device, cudaStreamPerThread, false);
+        ggml_cuda_staged_upload_fence(dst_ctx->device, cudaStreamPerThread, false);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -911,6 +1036,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_staged_upload_fence(ctx->device, cudaStreamPerThread, false);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -2686,6 +2812,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_staged_upload_fence(cuda_ctx->device, cuda_ctx->stream(), false);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2726,6 +2853,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // device -> device copy
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+
+    ggml_cuda_staged_upload_fence(cuda_ctx_src->device, cuda_ctx_src->stream(), false);
 
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
@@ -4773,6 +4902,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    // before any capture: the inputs staged for this graph, and later uploads wait for it
+    ggml_cuda_staged_upload_fence(cuda_ctx->device, cuda_ctx->stream(), true);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
