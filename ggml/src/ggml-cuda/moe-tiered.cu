@@ -1047,9 +1047,16 @@ void ggml_cuda_tiered_cache_step(const ggml_tensor * t, const ggml_tensor * ids,
     }();
     if (stats_every > 0) {
         static std::atomic<int64_t> n_steps{0};
+#ifdef GGML_USE_HIP
+        hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &cap));
+        const bool capturing = cap != hipStreamCaptureStatusNone;
+#else
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
-        if (++n_steps % stats_every == 0 && cap == cudaStreamCaptureStatusNone) {
+        const bool capturing = cap != cudaStreamCaptureStatusNone;
+#endif
+        if (++n_steps % stats_every == 0 && !capturing) {
             cache_ctrl c;
             CUDA_CHECK(cudaMemcpyAsync(&c, g.d_ctrl, sizeof(c), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
