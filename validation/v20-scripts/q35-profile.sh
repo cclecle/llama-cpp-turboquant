@@ -18,7 +18,8 @@ until curl -sf -o /dev/null http://127.0.0.1:8090/health; do
   sleep 2; kill -0 $SRV 2>/dev/null || { echo "server died"; tail -20 $out/server.log; exit 1; }
   [ $(( $(date +%s) - t0 )) -gt 1500 ] && { echo timeout; kill -TERM -- -$SRV; exit 1; }
 done
-echo "loaded in $(( $(date +%s) - t0 )) s"
+echo "loaded in $(( $(date +%s) - t0 )) s; VRAM used per card: $(rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, 'NR>1 && NR<4 {printf "%.2f GB ", $3/1e9}')"
+grep -aE 'tiered experts on|moe cache|failed|error' $out/server.log | head -6
 python3 - $n > $out/body.json <<'PY'
 import json, sys
 text = open('prompt-32k.txt', errors='ignore').read()
