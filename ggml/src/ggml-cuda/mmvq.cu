@@ -1717,6 +1717,11 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.gate_table = ggml_cuda_tiered_table(fusion->gate);
         GGML_ASSERT((fusion_local.x_table == nullptr) == (fusion_local.gate_table == nullptr));
     }
+    if (fusion_local.x_table) {
+        // expert cache (off unless GGML_CUDA_MOE_CACHE_SLOTS): refill the layer's slots from these routes before its
+        // first expert matmul reads the table; acts on ffn_up_exps (alone or fused with the gate), no-op otherwise
+        ggml_cuda_tiered_cache_step(src0, ids, stream);
+    }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {

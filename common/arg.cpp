@@ -2468,6 +2468,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOT_EXPERTS"));
     add_opt(common_arg(
+        {"--moe-cache-slots"}, "N",
+        "expert cache for the <device>_TIERED buffer type: N VRAM slots per layer and device that hold copies of\n"
+        "cold experts, refilled least recently used first from the routes of decode and verify batches, on the GPU\n"
+        "(default: 0 = off). the slots come out of the VRAM the hot experts could use",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_CUDA_MOE_CACHE_SLOTS", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
+    add_opt(common_arg(
         {"--moe-hybrid-vram"}, "auto|MiB",
         "VRAM the class-1 experts may use, in total across devices (default: auto = every free byte\n"
         "beyond --moe-hybrid-reserve). prefer --moe-hybrid-experts, which says the same thing in the\n"

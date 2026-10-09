@@ -17,10 +17,20 @@
 #include <vector>
 
 // See moe-tiered.cuh. VRAM layout of a tiered expert tensor (its allocation starts at tensor->data):
-//   [hot experts, n_hot*nb[2]] [zeroed row padding] [pad to 16] [table: n_expert device addresses]
+//   [hot experts, n_hot*nb[2]] [cache slots, n_cache*nb[2]] [zeroed row padding] [pad to 16]
+//   [table: n_expert device addresses] [original table: the same addresses without the cache]
 // and its cold experts in one pinned mapped host block: [cold experts, n_cold*nb[2]] [zeroed row padding].
 
 namespace {
+
+// expert cache slots per tiered tensor with cold experts (GGML_CUDA_MOE_CACHE_SLOTS, 0 = no cache)
+int cache_slots_env() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SLOTS");
+        return env != nullptr ? std::max(0, atoi(env)) : 0;
+    }();
+    return n;
+}
 
 struct hot_lists {
     bool disabled = false;                         // GGML_CUDA_MOE_TIERED=0: every expert cold
@@ -86,8 +96,10 @@ struct tiered_layout {
     std::vector<int32_t> hot;
     int64_t n_expert     = 0;
     size_t  expert_bytes = 0;
+    size_t  n_cache      = 0;   // expert cache slots after the hot experts
     size_t  pad          = 0;   // row padding after the last expert of a block (MATRIX_ROW_PADDING)
     size_t  table_off    = 0;
+    size_t  orig_off     = 0;
     size_t  vram_size    = 0;
     size_t  cold_size    = 0;
 };
@@ -113,17 +125,29 @@ tiered_layout get_layout(const ggml_tensor * t) {
     }
     const size_t n_hot  = l.hot.size();
     const size_t n_cold = (size_t) l.n_expert - n_hot;
-    l.table_off = GGML_PAD(n_hot*l.expert_bytes + (n_hot ? l.pad : 0), 16);
-    l.vram_size = l.table_off + (size_t) l.n_expert*sizeof(void *);
+    if (!h.disabled && layer >= 0 && n_cold > 0) {
+        l.n_cache = std::min((size_t) cache_slots_env(), n_cold);
+    }
+    const size_t n_vram = n_hot + l.n_cache;
+    l.table_off = GGML_PAD(n_vram*l.expert_bytes + (n_vram ? l.pad : 0), 16);
+    l.orig_off  = l.table_off + (size_t) l.n_expert*sizeof(void *);
+    l.vram_size = l.orig_off  + (l.n_cache ? (size_t) l.n_expert*sizeof(void *) : 0);
     l.cold_size = n_cold ? n_cold*l.expert_bytes + l.pad : 0;
     return l;
 }
 
+struct cache_group;
+
 struct tiered_tensor {
     const void ** d_table = nullptr;          // in the tensor's VRAM allocation
-    std::vector<const void *> h_table;        // host copy of the device addresses
+    const void ** d_orig  = nullptr;          // the table without the cache (expert cache only)
+    std::vector<const void *> h_table;        // host copy of the device addresses (never the cache's)
     std::vector<int32_t> slot;                // expert -> hot slot (>= 0) or -1 - cold slot
     char *  hot_dev      = nullptr;
+    char *  cache_dev    = nullptr;           // n_cache slots after the hot experts
+    size_t  n_cache      = 0;
+    cache_group * group  = nullptr;           // the expert cache of this tensor's layer and device
+    bool    cache_trigger = false;            // ffn_up_exps / ffn_gate_up_exps: runs the cache step of its layer
     char *  cold_host    = nullptr;
     char *  cold_dev     = nullptr;
     size_t  expert_bytes = 0;
@@ -139,6 +163,178 @@ struct tiered_tensor {
     char * host(int64_t e)          const { return cold_host + (size_t) (-1 - slot[e])*expert_bytes; }
     char * dev(int64_t e)           const { return (char *) h_table[e]; }
 };
+
+// Expert cache (GGML_CUDA_MOE_CACHE_SLOTS, R9V's cache80/192 prepare on our tables). Per layer and device, n_slots
+// VRAM slots hold copies of cold experts; the cold copy stays the expert's home. A cached expert's table entry points
+// at its slot, every other entry equals the original table. For decode and verify batches, before the layer's first
+// expert matmul, two kernels on the compute stream: the planner stamps the slots of the routed cached experts with the
+// step counter, picks the most routed cold expert that is not cached, and the least recently used slot not routed in
+// this step (empty first); the fill kernel copies that expert from mapped host memory into the slot for every tensor of
+// the layer and its last block publishes the new table entries (the evicted expert's entries go back to the original).
+// The matmuls that follow in the stream read the expert from VRAM in the same step. Fixed pointers and unconditional
+// launches: graph capture stays valid. At most one fill per layer and step; the copy reads the bytes the in-place read
+// of a missed expert would have read anyway.
+struct cache_ctrl {
+    uint32_t counter;          // planner calls
+    int32_t  fill_expert;      // -1: no fill in this step
+    int32_t  fill_slot;
+    int32_t  fill_old;         // the expert the slot held, -1 if it was empty
+    uint32_t done_blocks;      // fill kernel: blocks done (the last one publishes)
+    uint32_t unused;
+    unsigned long long stats[6]; // calls, routes, hot routes, cache hits, cold misses, fills
+};
+
+struct cache_member_dev {
+    const void **        table;
+    const void * const * orig;
+    char *               cache;
+    size_t               expert_bytes;
+};
+
+struct cache_members {
+    cache_member_dev m[4];
+    int              n;
+};
+
+struct cache_group {
+    int          layer   = -1;
+    int          n_slots = 0;
+    std::vector<tiered_tensor *> members;
+    int32_t *    d_tags  = nullptr;  // slot -> expert, -1 empty
+    uint32_t *   d_stamp = nullptr;  // slot -> step counter of its last use
+    cache_ctrl * d_ctrl  = nullptr;
+};
+
+constexpr int cache_plan_threads = 256; // also the most routes (n_used x n_tokens) a step may have
+
+__global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_used, const int n_routes, const int64_t ids_s1,
+        const void * const * table, const void * const * orig, const char * cold_lo, const char * cold_hi,
+        const char * cache, const size_t expert_bytes, int32_t * tags, uint32_t * stamp, const int n_slots, cache_ctrl * ctrl) {
+    __shared__ int32_t            s_miss[cache_plan_threads];
+    __shared__ unsigned int       s_best;   // routes << 16 | (0xffff - first route) of the best missed expert
+    __shared__ unsigned long long s_victim; // (last use + 1) << 32 | slot; 0 << 32 for an empty slot
+    __shared__ unsigned int       s_hot, s_hit, s_cold;
+
+    const int      tid     = threadIdx.x;
+    const uint32_t counter = ctrl->counter + 1;
+    if (tid == 0) {
+        s_best   = 0;
+        s_victim = ~0ull;
+        s_hot = s_hit = s_cold = 0;
+    }
+    __syncthreads();
+
+    int32_t miss = -1;
+    if (tid < n_routes) {
+        const int32_t e   = ids[(tid / n_used)*ids_s1 + tid % n_used];
+        const char *  cur = (const char *) table[e];
+        const char *  org = (const char *) orig[e];
+        if (cur != org) {
+            stamp[(cur - cache)/expert_bytes] = counter;
+            atomicAdd(&s_hit, 1u);
+        } else if (org >= cold_lo && org < cold_hi) {
+            miss = e;
+            atomicAdd(&s_cold, 1u);
+        } else {
+            atomicAdd(&s_hot, 1u);
+        }
+    }
+    s_miss[tid] = miss;
+    __syncthreads();
+
+    if (miss >= 0) {
+        int count = 0;
+        int first = tid;
+        for (int r = 0; r < n_routes; ++r) {
+            if (s_miss[r] == miss) {
+                count++;
+                first = r < first ? r : first;
+            }
+        }
+        if (first == tid) {
+            atomicMax(&s_best, ((unsigned int) count << 16) | (0xffffu - (unsigned int) tid));
+        }
+    }
+    for (int s = tid; s < n_slots; s += blockDim.x) {
+        if (tags[s] < 0) {
+            atomicMin(&s_victim, (unsigned long long) s);
+        } else if (stamp[s] < counter) {
+            atomicMin(&s_victim, ((unsigned long long) (stamp[s] + 1) << 32) | (unsigned long long) s);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int32_t fe = -1, fs = -1, fo = -1;
+        if (s_best != 0 && s_victim != ~0ull) {
+            fe = s_miss[0xffff - (s_best & 0xffff)];
+            fs = (int32_t) (s_victim & 0xffffffffull);
+            fo = tags[fs];
+            stamp[fs] = counter;
+        }
+        ctrl->fill_expert = fe;
+        ctrl->fill_slot   = fs;
+        ctrl->fill_old    = fo;
+        ctrl->counter     = counter;
+        ctrl->stats[0]   += 1;
+        ctrl->stats[1]   += n_routes;
+        ctrl->stats[2]   += s_hot;
+        ctrl->stats[3]   += s_hit;
+        ctrl->stats[4]   += s_cold;
+        ctrl->stats[5]   += fe >= 0;
+    }
+}
+
+__global__ void k_moe_cache_fill(const cache_members mem, int32_t * tags, cache_ctrl * ctrl) {
+    const int32_t fe = ctrl->fill_expert;
+    if (fe < 0) {
+        return;
+    }
+    const int32_t fs = ctrl->fill_slot;
+    const size_t  i0 = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t  di = (size_t) gridDim.x*blockDim.x;
+    for (int k = 0; k < mem.n; ++k) {
+        const cache_member_dev & m = mem.m[k];
+        const char * src = (const char *) m.orig[fe];
+        char *       dst = m.cache + (size_t) fs*m.expert_bytes;
+        if ((((uintptr_t) src | (uintptr_t) dst | m.expert_bytes) & 15) == 0) {
+            const size_t n = m.expert_bytes/16;
+            for (size_t j = i0; j < n; j += di) {
+                ((int4 *) dst)[j] = ((const int4 *) src)[j];
+            }
+        } else {
+            for (size_t j = i0; j < m.expert_bytes; j += di) {
+                dst[j] = src[j];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(&ctrl->done_blocks, 1u) == gridDim.x - 1) {
+        __threadfence();
+        const int32_t fo = ctrl->fill_old;
+        for (int k = 0; k < mem.n; ++k) {
+            const cache_member_dev & m = mem.m[k];
+            if (fo >= 0) {
+                m.table[fo] = m.orig[fo];
+            }
+            m.table[fe] = m.cache + (size_t) fs*m.expert_bytes;
+        }
+        tags[fs]          = fe;
+        ctrl->done_blocks = 0;
+        ctrl->fill_expert = -1;
+        __threadfence();
+    }
+}
+
+// back to an empty cache: every table entry the original one
+void cache_group_reset(const cache_group & g) {
+    CUDA_CHECK(cudaMemset(g.d_tags,  0xff, g.n_slots*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(g.d_stamp, 0,    g.n_slots*sizeof(uint32_t)));
+    cache_ctrl c = {};
+    c.fill_expert = -1;
+    CUDA_CHECK(cudaMemcpy(g.d_ctrl, &c, sizeof(c), cudaMemcpyHostToDevice));
+}
 
 // Prefill staging (see ggml_cuda_tiered_table_prefill). The tiered tensors of every device, and per device the
 // staging area, its copy stream and the layer it holds.
@@ -219,8 +415,15 @@ struct tiered_buffer_context {
     int    device;
     void * dev_ptr;
     std::vector<std::unique_ptr<tiered_tensor>> tensors;
+    std::map<int, std::unique_ptr<cache_group>> groups; // expert cache per layer
 
     ~tiered_buffer_context() {
+        ggml_cuda_set_device(device);
+        for (auto & it : groups) {
+            CUDA_CHECK(cudaFree(it.second->d_tags));
+            CUDA_CHECK(cudaFree(it.second->d_stamp));
+            CUDA_CHECK(cudaFree(it.second->d_ctrl));
+        }
         {
             // the prefill staging may still copy from these cold blocks: stop it and forget these tensors first
             stage_state & st = g_stage[device];
@@ -321,8 +524,8 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
             memset(info->cold_host + (l.n_expert - info->n_hot)*l.expert_bytes, 0, l.pad);
         }
     }
-    if (info->n_hot && l.pad) {
-        CUDA_CHECK(cudaMemset(info->hot_dev + info->n_hot*l.expert_bytes, 0, l.pad));
+    if ((info->n_hot + l.n_cache) && l.pad) {
+        CUDA_CHECK(cudaMemset(info->hot_dev + (info->n_hot + l.n_cache)*l.expert_bytes, 0, l.pad));
     }
 
     info->slot.assign(l.n_expert, 0);
@@ -341,6 +544,28 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
                                               : info->cold_dev + (size_t) (-1 - info->slot[e])*l.expert_bytes;
     }
     CUDA_CHECK(cudaMemcpy(info->d_table, info->h_table.data(), l.n_expert*sizeof(void *), cudaMemcpyHostToDevice));
+
+    if (l.n_cache > 0 && info->layer >= 0) {
+        info->n_cache   = l.n_cache;
+        info->cache_dev = info->hot_dev + info->n_hot*l.expert_bytes;
+        info->d_orig    = (const void **) ((char *) tensor->data + l.orig_off);
+        CUDA_CHECK(cudaMemcpy(info->d_orig, info->h_table.data(), l.n_expert*sizeof(void *), cudaMemcpyHostToDevice));
+        info->cache_trigger = strstr(tensor->name, "ffn_up_exps") != nullptr || strstr(tensor->name, "ffn_gate_up_exps") != nullptr;
+        auto & g = ctx->groups[info->layer];
+        if (!g) {
+            g = std::make_unique<cache_group>();
+            g->layer   = info->layer;
+            g->n_slots = (int) l.n_cache;
+            CUDA_CHECK(cudaMalloc((void **) &g->d_tags,  g->n_slots*sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc((void **) &g->d_stamp, g->n_slots*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc((void **) &g->d_ctrl,  sizeof(cache_ctrl)));
+            cache_group_reset(*g);
+        }
+        // one slot index means one expert in every tensor of the layer: same hot list, same cold count
+        GGML_ASSERT(g->n_slots == (int) l.n_cache && g->members.size() < 4);
+        g->members.push_back(info.get());
+        info->group = g.get();
+    }
 
     g_hot_bytes [ctx->device] += info->n_hot*l.expert_bytes;
     g_cold_bytes[ctx->device] += (l.n_expert - info->n_hot)*l.expert_bytes;
@@ -512,6 +737,12 @@ void tiered_clear(ggml_backend_buffer_t buffer, uint8_t value) {
         }
         // the clear wiped the tables along with the data
         CUDA_CHECK(cudaMemcpy(t->d_table, t->h_table.data(), t->n_expert*sizeof(void *), cudaMemcpyHostToDevice));
+        if (t->d_orig) {
+            CUDA_CHECK(cudaMemcpy(t->d_orig, t->h_table.data(), t->n_expert*sizeof(void *), cudaMemcpyHostToDevice));
+        }
+    }
+    for (auto & it : ctx->groups) {
+        cache_group_reset(*it.second); // the cached copies are gone
     }
 }
 
@@ -784,6 +1015,49 @@ void ggml_cuda_tiered_prefill_launched(const ggml_tensor * t, int64_t n_tokens, 
         }
         CUDA_CHECK(cudaEventRecord(st.ev_staged[a], st.stream));
         st.area_layer[a] = layer;
+    }
+}
+
+void ggml_cuda_tiered_cache_step(const ggml_tensor * t, const ggml_tensor * ids, cudaStream_t stream) {
+    const tiered_tensor * info = tiered_info(t);
+    if (info == nullptr || info->group == nullptr || !info->cache_trigger || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_routes = ids->ne[0]*ids->ne[1];
+    if (n_routes <= 0 || n_routes > cache_plan_threads || ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1) {
+        return; // prefill: the matmuls read the cold experts in place (or staged)
+    }
+    const cache_group & g = *info->group;
+    cache_members mem = {};
+    for (const tiered_tensor * m : g.members) {
+        mem.m[mem.n++] = { m->d_table, m->d_orig, m->cache_dev, m->expert_bytes };
+    }
+    k_moe_cache_plan<<<1, cache_plan_threads, 0, stream>>>((const int32_t *) ids->data, (int) n_used, (int) n_routes,
+        ids->nb[1]/sizeof(int32_t), info->d_table, info->d_orig, info->cold_dev, info->cold_dev + info->cold_size,
+        info->cache_dev, info->expert_bytes, g.d_tags, g.d_stamp, g.n_slots, g.d_ctrl);
+    k_moe_cache_fill<<<128, 256, 0, stream>>>(mem, g.d_tags, g.d_ctrl);
+    CUDA_CHECK(cudaGetLastError());
+
+    // GGML_CUDA_MOE_CACHE_STATS=N: every N cache steps of layer-0-or-first group, the totals over this group (syncs:
+    // only outside graph capture, so use with GGML_CUDA_DISABLE_GRAPHS=1)
+    static const int64_t stats_every = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_STATS");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+    if (stats_every > 0) {
+        static std::atomic<int64_t> n_steps{0};
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (++n_steps % stats_every == 0 && cap == cudaStreamCaptureStatusNone) {
+            cache_ctrl c;
+            CUDA_CHECK(cudaMemcpyAsync(&c, g.d_ctrl, sizeof(c), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const double r = c.stats[1] ? (double) c.stats[1] : 1.0;
+            GGML_LOG_WARN("moe cache: layer %d on %s%d, %d slots: %llu steps, %.1f routes/step; hot %.1f%%, cache hits %.1f%%,"
+                " cold %.1f%%; %llu fills (%.2f/step)\n", g.layer, GGML_CUDA_NAME, info->device, g.n_slots, c.stats[0], r/(c.stats[0] ? c.stats[0] : 1),
+                100.0*c.stats[2]/r, 100.0*c.stats[3]/r, 100.0*c.stats[4]/r, c.stats[5], (double) c.stats[5]/(c.stats[0] ? c.stats[0] : 1));
+        }
     }
 }
 

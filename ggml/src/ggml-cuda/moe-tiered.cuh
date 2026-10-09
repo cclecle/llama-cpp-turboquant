@@ -8,8 +8,8 @@
 // layer in the file named by GGML_CUDA_MOE_HOT_FILE, lines "blk.<layer> <id> <id> ...") compacted in VRAM, all
 // others compacted in pinned host memory mapped into the device address space and read in place over the bus.
 // A device-side table of the n_expert base addresses follows the hot experts in the tensor's VRAM allocation;
-// the MUL_MAT_ID kernels read it instead of computing data + expert*nb[2]. The addresses never change after
-// load, so CUDA/HIP graphs stay valid. GGML_CUDA_MOE_TIERED=0 makes every expert cold (the same placement as the
+// the MUL_MAT_ID kernels read it instead of computing data + expert*nb[2]. The table's own address never changes
+// after load (only the expert cache below rewrites entries, on the GPU), so CUDA/HIP graphs stay valid. GGML_CUDA_MOE_TIERED=0 makes every expert cold (the same placement as the
 // _UVA buffer type), for an A/B with identical arguments. Under -sm tensor each device shard keeps all experts
 // (the expert dim is never split), so the same hot list applies to every shard.
 
@@ -24,6 +24,14 @@ const void * ggml_cuda_tiered_expert(const ggml_tensor * t, int64_t expert);
 
 // 1 if the expert is in VRAM, 0 if it is in mapped host memory, -1 if t is not a tiered expert tensor
 int ggml_cuda_tiered_is_hot(const ggml_tensor * t, int64_t expert);
+
+// Expert cache (GGML_CUDA_MOE_CACHE_SLOTS=S, 0 = off, the default; set by --moe-cache-slots): S VRAM slots per layer
+// and device next to the hot experts hold copies of cold experts, refilled least recently used first from the routes of
+// decode and verify batches (at most 256 routes), on the GPU, inside the graph. Call before the first expert matmul of
+// a layer's step on every tiered expert tensor: it acts on the layer's ffn_up_exps (or ffn_gate_up_exps) and is a no-op
+// otherwise. The cold copy stays the expert's home (an exception to the one-placement rule approved for this cache).
+// GGML_CUDA_MOE_CACHE_STATS=N: hit rates every N steps (synchronous; with GGML_CUDA_DISABLE_GRAPHS=1).
+void ggml_cuda_tiered_cache_step(const ggml_tensor * t, const ggml_tensor * ids, cudaStream_t stream);
 
 // Prefill staging (GGML_CUDA_MOE_STAGE=1: on, off by default; GGML_CUDA_MOE_STAGE_MIN_TOKENS: the smallest ubatch,
 // 256; GGML_CUDA_MOE_STAGE_AREAS: staging areas, 2). The cold experts stay in host memory; for a MUL_MAT_ID of at least
