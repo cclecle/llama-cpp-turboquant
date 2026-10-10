@@ -4,7 +4,7 @@
 # the slot's context as host KV). Each group of 7 arguments is one candidate: its args are the production :XS rung's
 # (Qwen3.5_XS.args: the router's spawn, the [*] block included) with --cpu-moe / moe-hybrid replaced by ROCm0_TIERED +
 # the hot set of that budget (route counts q35-imatrix.gguf), then flashnext.sh like a client: prompt caching on, the
-# preset's sampling, the 32k prompt, 2,048 tokens. Prints the peak VRAM per card, prefill and decode, loadavg.
+# preset's sampling, warm-up 1 (a repeat of the prompt would hit the cache), the 32k prompt, 2,048 tokens. Prints the peak VRAM per card, prefill and decode, loadavg.
 # Needs the v20 build (host KV under -sm tensor crashed on v19; the cache). Production stays stopped.
 cd /mnt/gguf/r9v/bench
 T=/opt/llamacpp/tmp-v20
@@ -37,7 +37,7 @@ print('\n'.join(x for x in out if x != ''))
 PY
   E="X=0"; [ "$slots" != 0 ] && E="GGML_CUDA_MOE_CACHE_SLOTS=$slots"
   echo "### $tag: ${np}x$((ctx / np)) (c $ctx), host kv $kv/slot, ub $ub, hot ${G} GiB, cache $slots; loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
-  BENCH_CACHE_PROMPT=1 BENCH_SERVER_SAMPLING=1 FN_CTX=$ctx FN_UB=$ub FN_ENV="$E" FN_ARGS=rung-$tag.args FN_TAG=-s8-$tag \
+  FN_WARM=1 BENCH_CACHE_PROMPT=1 BENCH_SERVER_SAMPLING=1 FN_CTX=$ctx FN_UB=$ub FN_ENV="$E" FN_ARGS=rung-$tag.args FN_TAG=-s8-$tag \
     bash flashnext.sh v20dev 2>&1 | grep -E 'load:|died|memory:'
   python3 step_ms.py v20dev-s8-$tag results.jsonl | head -1
 done
