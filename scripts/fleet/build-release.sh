@@ -2,11 +2,19 @@
 # build-release.sh <N> : configure and build /opt/llamacpp/llama-cpp-mine-vN/build3 on the box with the production
 # options. Unpack the release tarball there first (git archive of the branch). Then compare CMakeCache.txt against the
 # running release with a FULL diff - a filtered grep proves nothing.
+# ROCM=<dir>: build against another ROCm tree than the apt-installed /opt/rocm-7.2.4, e.g. a TheRock tarball unpacked to
+# /opt/rocm-10.1 (clang under llvm/bin). Check afterwards that RUNPATH and ldd resolve the HIP libraries to that tree:
+# ld.so.conf points at 7.2.4.
 set -eu
 V=${1:?release number}; cd /opt/llamacpp/llama-cpp-mine-v$V
+ROCM_ARGS=(-DCMAKE_HIP_COMPILER=/opt/rocm-7.2.4/lib/llvm/bin/clang++)
+if [ -n "${ROCM:-}" ]; then
+  export ROCM_PATH=$ROCM HIP_PATH=$ROCM HIP_PLATFORM=amd PATH=$ROCM/bin:$ROCM/llvm/bin:$PATH
+  ROCM_ARGS=(-DCMAKE_HIP_COMPILER=$ROCM/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=$ROCM -DROCM_PATH=$ROCM)
+fi
 cmake -B build3 -DCMAKE_BUILD_TYPE=Release \
   -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
-  -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.4/lib/llvm/bin/clang++ \
+  "${ROCM_ARGS[@]}" \
   -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_HIP_RCCL=ON \
   -DGGML_HIP_NO_VMM=ON -DGGML_HIP_GRAPHS=ON -DGGML_HIP_MMQ_MFMA=ON \
   -DGGML_CUDA_NCCL=ON -DGGML_SCHED_MAX_COPIES=4 -DGGML_CCACHE=ON -DGGML_NATIVE=ON \
@@ -14,3 +22,7 @@ cmake -B build3 -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=ON
 nice -n 5 cmake --build build3 --config Release -j 24 2>&1 | tee build.log | grep -E 'error:|\*\*\* \[|Built target llama-server' || true
 echo "errors: $(grep -cE 'error:|\*\*\* \[' build.log)"
+if [ -n "${ROCM:-}" ]; then
+  readelf -d build3/bin/libggml-hip.so | grep -E 'RUNPATH|RPATH' || true
+  ldd build3/bin/libggml-hip.so | grep -E 'amdhip|hipblas|rocblas|rccl|hsa' || true
+fi
