@@ -5,7 +5,9 @@
 # (Qwen3.5_XS.args: the router's spawn, the [*] block included) with --cpu-moe / moe-hybrid replaced by ROCm0_TIERED +
 # the hot set of that budget (route counts q35-imatrix.gguf), then flashnext.sh like a client: prompt caching on, the
 # preset's sampling, a random first word per request (BENCH_NONCE: no request reuses another's cache), the 32k prompt, 2,048 tokens. Prints the peak VRAM per card, prefill and decode, loadavg.
-# Needs the v20 build (host KV under -sm tensor crashed on v19; the cache). Production stays stopped.
+# S8_SET="--opt value ...": replace those options' values in every candidate (e.g. --spec-draft-n-max 6); S8_RUNS: requests
+# per candidate (BENCH_RUNS, sampled runs are pooled). Needs the v20 build (host KV under -sm tensor crashed on v19; the
+# cache). Production stays stopped.
 cd /mnt/gguf/r9v/bench
 T=/opt/llamacpp/tmp-v20
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
@@ -14,9 +16,10 @@ while [ $# -ge 7 ]; do
   hot=/opt/llamacpp-config/DUALGPU/hot/Qwen3.5-122B-A10B-${G}g-uniform.txt
   [ -f $hot ] || /root/venv/bin/python3 $T/scripts/fleet/moe_hotset.py --model /mnt/gguf/Qwen3.5-122B-A10B-UD-Q5_K_M-00001-of-00003.gguf \
     --counts q35-imatrix.gguf --budget-gib $G --policy uniform --missing nearest -o $hot | tail -1
-  python3 - $np $kv $hot > rung-$tag.args <<'PY'
+  python3 - $np $kv $hot "${S8_SET:-}" > rung-$tag.args <<'PY'
 import sys
-np_, kv, hot = sys.argv[1:4]
+np_, kv, hot, extra = sys.argv[1:5]
+sets = dict(zip(extra.split()[0::2], extra.split()[1::2]))
 a = open('/root/work-20261009-regress/Qwen3.5_XS.args').read().split('\n')
 out, i = [], 0
 while i < len(a):
@@ -27,18 +30,22 @@ while i < len(a):
         i += 2; continue
     if x == '--parallel':
         out += [x, np_]; i += 2; continue
+    if x in sets:
+        out += [x, sets.pop(x)]; i += 2; continue
     if x == '--n-cpu-kv-cells':
         if kv != '0':
             out += [x, kv]
         i += 2; continue
     out.append(x); i += 1
+for k, v in sets.items():  # options the base args do not have
+    out += [k, v]
 out += ['--override-tensor', r'blk\.[0-9]+\.ffn_(gate|up|down)_exps\.weight=ROCm0_TIERED', '--moe-hot-experts', hot]
 print('\n'.join(x for x in out if x != ''))
 PY
   E="X=0"; [ "$slots" != 0 ] && E="GGML_CUDA_MOE_CACHE_SLOTS=$slots"
-  echo "### $tag: ${np}x$((ctx / np)) (c $ctx), host kv $kv/slot, ub $ub, hot ${G} GiB, cache $slots; loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
-  BENCH_NONCE=1 BENCH_CACHE_PROMPT=1 BENCH_SERVER_SAMPLING=1 FN_CTX=$ctx FN_UB=$ub FN_ENV="$E" FN_ARGS=rung-$tag.args FN_TAG=-s8-$tag \
+  echo "### $tag: ${np}x$((ctx / np)) (c $ctx), host kv $kv/slot, ub $ub, hot ${G} GiB, cache $slots ${S8_SET:-}; loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
+  BENCH_RUNS=${S8_RUNS:-1} BENCH_NONCE=1 BENCH_CACHE_PROMPT=1 BENCH_SERVER_SAMPLING=1 FN_CTX=$ctx FN_UB=$ub FN_ENV="$E" FN_ARGS=rung-$tag.args FN_TAG=-s8-$tag \
     bash flashnext.sh v20dev 2>&1 | grep -E 'load:|died|memory:'
-  python3 step_ms.py v20dev-s8-$tag results.jsonl | head -1
+  python3 step_ms.py v20dev-s8-$tag results.jsonl | grep -v '^arm'
 done
 echo S8_DONE
