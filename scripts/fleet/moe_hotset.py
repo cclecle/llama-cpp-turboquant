@@ -2,7 +2,7 @@
 # moe_hotset.py : hot-expert placement file for the <device>_TIERED buffer type (--moe-hot-experts FILE).
 #
 #   moe_hotset.py --model M.gguf --counts SRC [--eval SRC] (--per-layer N | --match-uva N | --budget-gib G)
-#                 [--policy uniform|greedy] -o hot.txt
+#                 [--policy uniform|greedy] [--missing error|cold|nearest] -o hot.txt
 #
 # SRC is where the route counts per (layer, expert) come from:
 #   - an imatrix GGUF written by llama-imatrix (tensors "blk.<l>.ffn_up_exps.weight.counts"),
@@ -70,6 +70,8 @@ def main():
     g.add_argument('--match-uva', type=int)
     g.add_argument('--budget-gib', type=float)
     ap.add_argument('--policy', choices=('uniform', 'greedy'), default='uniform')
+    ap.add_argument('--missing', choices=('error', 'cold', 'nearest'), default='error',
+                    help='layers of the model without route counts: stop, keep all their experts cold, or rank them like the closest counted layer')
     ap.add_argument('-o', '--out', required=True)
     a = ap.parse_args()
 
@@ -77,8 +79,16 @@ def main():
     layers = sorted(eb)
     cnt = load_counts(a.counts)
     missing = [l for l in layers if l not in cnt]
+    if missing and a.missing == 'error':
+        sys.exit('no route counts for layers %s (--missing cold|nearest to place them anyway)' % missing)
+    if missing and a.missing == 'cold':
+        layers = [l for l in layers if l in cnt]  # not in the file: every expert of those layers cold
+    elif missing:
+        counted = sorted(cnt)
+        for l in missing:  # e.g. an MTP layer llama-imatrix never runs: the ranking of the closest counted layer
+            cnt[l] = cnt[min(counted, key=lambda c: (abs(c - l), -c))]
     if missing:
-        sys.exit('no route counts for layers %s' % missing)
+        print('layers without route counts %s: %s' % (missing, a.missing), file=sys.stderr)
 
     if a.per_layer is not None:
         budget = sum(eb[l] * a.per_layer for l in layers)

@@ -10,7 +10,7 @@ systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
 for G in "$@"; do
   hot=hot-q35-${G}g-uniform.txt
   [ -f $hot ] || ${S2_PY:-/root/venv/bin/python3} $T/scripts/fleet/moe_hotset.py --model /mnt/gguf/Qwen3.5-122B-A10B-UD-Q5_K_M-00001-of-00003.gguf \
-    --counts q35-imatrix.gguf --budget-gib $G --policy uniform -o $hot | tail -3
+    --counts q35-imatrix.gguf --budget-gib $G --policy uniform --missing nearest -o $hot | tail -3
   python3 - $hot > q35-tiered-${G}g.args <<'PY'
 import sys
 a = open('q35.args').read().split('\n')
