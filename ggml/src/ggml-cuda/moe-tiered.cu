@@ -16,6 +16,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 // See moe-tiered.cuh. VRAM layout of a tiered expert tensor (its allocation starts at tensor->data):
 //   [hot experts, n_hot*nb[2]] [cache slots, n_cache*nb[2]] [zeroed row padding] [pad to 16]
 //   [table: n_expert device addresses] [original table: the same addresses without the cache]
@@ -628,6 +633,28 @@ struct tiered_writer {
     }
 };
 
+// The loader hands set_tensor pointers into the mmap'd model file. A tiered tensor copies every expert, so a load
+// faults the whole file in one page at a time (Qwen3.5-122B: 87 GB, 200-555 s, the server mostly waiting on I/O). Ask
+// for read-ahead of the whole source range first: the disk streams it. A no-op for memory that is not a mapping.
+void tiered_prefetch(const void * src, size_t size) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TIERED_PREFETCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || size < (1u << 20)) {
+        return;
+    }
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t lo = (uintptr_t) src & ~(page - 1);
+    const uintptr_t hi = (uintptr_t) src + size;
+    (void) madvise((void *) lo, hi - lo, MADV_WILLNEED); // EINVAL / EBADF for non-file memory: nothing to do
+#else
+    GGML_UNUSED(src);
+    GGML_UNUSED(size);
+#endif
+}
+
 void tiered_read(const tiered_tensor & t, size_t off, char * dst, size_t size) {
     while (size > 0) {
         const int64_t e      = off / t.expert_bytes;
@@ -673,6 +700,7 @@ void tiered_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const
         CUDA_CHECK(cudaMemcpy((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice));
         return;
     }
+    tiered_prefetch(data, size);
     tiered_writer w(*t);
     w.write(offset, (const char *) data, size);
     w.flush();
@@ -700,6 +728,9 @@ void tiered_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, co
                 size, cudaMemcpyHostToDevice));
         }
         return;
+    }
+    if (n_copies > 0) {
+        tiered_prefetch(data, (n_copies - 1)*stride_data + size);
     }
     tiered_writer w(*t);
     for (size_t i = 0; i < n_copies; i++) {
