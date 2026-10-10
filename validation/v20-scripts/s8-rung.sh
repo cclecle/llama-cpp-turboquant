@@ -6,16 +6,18 @@
 # the hot set of that budget (route counts q35-imatrix.gguf), then flashnext.sh like a client: prompt caching on, the
 # preset's sampling, a random first word per request (BENCH_NONCE: no request reuses another's cache), the 32k prompt, 2,048 tokens. Prints the peak VRAM per card, prefill and decode, loadavg.
 # S8_SET="--opt value ...": replace those options' values in every candidate (e.g. --spec-draft-n-max 6); S8_RUNS: requests
-# per candidate (BENCH_RUNS, sampled runs are pooled). Needs the v20 build (host KV under -sm tensor crashed on v19; the
+# per candidate (BENCH_RUNS, sampled runs are pooled); S8_ENV: more server env; S8_HOT=census: census hot sets. Needs the v20 build (host KV under -sm tensor crashed on v19; the
 # cache). Production stays stopped.
 cd /mnt/gguf/r9v/bench
 T=/opt/llamacpp/tmp-v20
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
 while [ $# -ge 7 ]; do
   tag=$1 ctx=$2 np=$3 kv=$4 ub=$5 G=$6 slots=$7; shift 7
-  hot=/opt/llamacpp-config/DUALGPU/hot/Qwen3.5-122B-A10B-${G}g-uniform.txt
+  # S8_HOT=census: the hot set from the decode route census (census-AB.txt, greedy); default: llama-imatrix counts, uniform
+  if [ "${S8_HOT:-uniform}" = census ]; then src=census-AB.txt pol=greedy; else src=q35-imatrix.gguf pol=uniform; fi
+  hot=/opt/llamacpp-config/DUALGPU/hot/Qwen3.5-122B-A10B-${G}g-${S8_HOT:-uniform}.txt
   [ -f $hot ] || /root/venv/bin/python3 $T/scripts/fleet/moe_hotset.py --model /mnt/gguf/Qwen3.5-122B-A10B-UD-Q5_K_M-00001-of-00003.gguf \
-    --counts q35-imatrix.gguf --budget-gib $G --policy uniform --missing nearest -o $hot | tail -1
+    --counts $src --budget-gib $G --policy $pol --missing nearest -o $hot | tail -1
   python3 - $np $kv $hot "${S8_SET:-}" > rung-$tag.args <<'PY'
 import sys
 np_, kv, hot, extra = sys.argv[1:5]
@@ -42,8 +44,8 @@ for k, v in sets.items():  # options the base args do not have
 out += ['--override-tensor', r'blk\.[0-9]+\.ffn_(gate|up|down)_exps\.weight=ROCm0_TIERED', '--moe-hot-experts', hot]
 print('\n'.join(x for x in out if x != ''))
 PY
-  E="X=0"; [ "$slots" != 0 ] && E="GGML_CUDA_MOE_CACHE_SLOTS=$slots"
-  echo "### $tag: ${np}x$((ctx / np)) (c $ctx), host kv $kv/slot, ub $ub, hot ${G} GiB, cache $slots ${S8_SET:-}; loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
+  E="X=0 ${S8_ENV:-}"; [ "$slots" != 0 ] && E="GGML_CUDA_MOE_CACHE_SLOTS=$slots ${S8_ENV:-}"
+  echo "### $tag: ${np}x$((ctx / np)) (c $ctx), host kv $kv/slot, ub $ub, hot ${G} GiB, cache $slots ${S8_SET:-} ${S8_ENV:-} hot ${S8_HOT:-uniform}; loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
   BENCH_RUNS=${S8_RUNS:-1} BENCH_NONCE=1 BENCH_CACHE_PROMPT=1 BENCH_SERVER_SAMPLING=1 FN_CTX=$ctx FN_UB=$ub FN_ENV="$E" FN_ARGS=rung-$tag.args FN_TAG=-s8-$tag \
     bash flashnext.sh v20dev 2>&1 | grep -E 'load:|died|memory:'
   python3 step_ms.py v20dev-s8-$tag results.jsonl | grep -v '^arm'
