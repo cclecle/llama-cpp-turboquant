@@ -205,16 +205,30 @@ struct cache_group {
     int          layer   = -1;
     int          n_slots = 0;
     std::vector<tiered_tensor *> members;
+    int64_t      n_expert = 0;
     int32_t *    d_tags  = nullptr;  // slot -> expert, -1 empty
     uint32_t *   d_stamp = nullptr;  // slot -> step counter of its last use
+    uint32_t *   d_miss  = nullptr;  // expert -> step counter of its last cold miss, 0 never (second-touch admission)
     cache_ctrl * d_ctrl  = nullptr;
 };
+
+// Second-touch admission (GGML_CUDA_MOE_CACHE_ADMIT=W, --moe-cache-admit): a cold miss is filled only if the same expert
+// also missed within the last W steps of its layer; 0 (the default) fills the most routed miss of every step. Qwen3.5-122B
+// with 8 slots and every miss admitted filled in 86% of its layer steps (129 us each), the cold experts rarely coming back.
+int cache_admit_window() {
+    static const int w = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ADMIT");
+        return env != nullptr ? std::max(0, atoi(env)) : 0;
+    }();
+    return w;
+}
 
 constexpr int cache_plan_threads = 256; // also the most routes (n_used x n_tokens) a step may have
 
 __global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_used, const int n_routes, const int64_t ids_s1,
         const void * const * table, const void * const * orig, const char * cold_lo, const char * cold_hi,
-        const char * cache, const size_t expert_bytes, int32_t * tags, uint32_t * stamp, const int n_slots, cache_ctrl * ctrl) {
+        const char * cache, const size_t expert_bytes, int32_t * tags, uint32_t * stamp, const int n_slots,
+        uint32_t * miss_stamp, const uint32_t admit_window, cache_ctrl * ctrl) {
     __shared__ int32_t            s_miss[cache_plan_threads];
     __shared__ unsigned int       s_best;   // routes << 16 | (0xffff - first route) of the best missed expert
     __shared__ unsigned long long s_victim; // (last use + 1) << 32 | slot; 0 << 32 for an empty slot
@@ -229,7 +243,8 @@ __global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_u
     }
     __syncthreads();
 
-    int32_t miss = -1;
+    int32_t miss   = -1; // a fill candidate
+    int32_t cold_e = -1; // a cold miss
     if (tid < n_routes) {
         const int32_t e   = ids[(tid / n_used)*ids_s1 + tid % n_used];
         const char *  cur = (const char *) table[e];
@@ -238,14 +253,21 @@ __global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_u
             stamp[(cur - cache)/expert_bytes] = counter;
             atomicAdd(&s_hit, 1u);
         } else if (org >= cold_lo && org < cold_hi) {
-            miss = e;
             atomicAdd(&s_cold, 1u);
+            cold_e = e;
+            // second touch: a candidate only if it also missed within the window (the stamp of this step is written
+            // after the barrier below, so duplicate routes of this step read the previous value)
+            const uint32_t prev = miss_stamp[e];
+            miss = admit_window == 0 || (prev != 0 && counter - prev <= admit_window) ? e : -1;
         } else {
             atomicAdd(&s_hot, 1u);
         }
     }
     s_miss[tid] = miss;
     __syncthreads();
+    if (cold_e >= 0) {
+        miss_stamp[cold_e] = counter;
+    }
 
     if (miss >= 0) {
         int count = 0;
@@ -336,6 +358,7 @@ __global__ void k_moe_cache_fill(const cache_members mem, int32_t * tags, cache_
 void cache_group_reset(const cache_group & g) {
     CUDA_CHECK(cudaMemset(g.d_tags,  0xff, g.n_slots*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(g.d_stamp, 0,    g.n_slots*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(g.d_miss,  0,    g.n_expert*sizeof(uint32_t)));
     cache_ctrl c = {};
     c.fill_expert = -1;
     CUDA_CHECK(cudaMemcpy(g.d_ctrl, &c, sizeof(c), cudaMemcpyHostToDevice));
@@ -427,6 +450,7 @@ struct tiered_buffer_context {
         for (auto & it : groups) {
             CUDA_CHECK(cudaFree(it.second->d_tags));
             CUDA_CHECK(cudaFree(it.second->d_stamp));
+            CUDA_CHECK(cudaFree(it.second->d_miss));
             CUDA_CHECK(cudaFree(it.second->d_ctrl));
         }
         {
@@ -561,8 +585,10 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
             g = std::make_unique<cache_group>();
             g->layer   = info->layer;
             g->n_slots = (int) l.n_cache;
+            g->n_expert = l.n_expert;
             CUDA_CHECK(cudaMalloc((void **) &g->d_tags,  g->n_slots*sizeof(int32_t)));
             CUDA_CHECK(cudaMalloc((void **) &g->d_stamp, g->n_slots*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc((void **) &g->d_miss,  g->n_expert*sizeof(uint32_t)));
             CUDA_CHECK(cudaMalloc((void **) &g->d_ctrl,  sizeof(cache_ctrl)));
             cache_group_reset(*g);
         }
@@ -1067,7 +1093,7 @@ void ggml_cuda_tiered_cache_step(const ggml_tensor * t, const ggml_tensor * ids,
     }
     k_moe_cache_plan<<<1, cache_plan_threads, 0, stream>>>((const int32_t *) ids->data, (int) n_used, (int) n_routes,
         ids->nb[1]/sizeof(int32_t), info->d_table, info->d_orig, info->cold_dev, info->cold_dev + info->cold_size,
-        info->cache_dev, info->expert_bytes, g.d_tags, g.d_stamp, g.n_slots, g.d_ctrl);
+        info->cache_dev, info->expert_bytes, g.d_tags, g.d_stamp, g.n_slots, g.d_miss, (uint32_t) cache_admit_window(), g.d_ctrl);
     k_moe_cache_fill<<<128, 256, 0, stream>>>(mem, g.d_tags, g.d_ctrl);
     CUDA_CHECK(cudaGetLastError());
 

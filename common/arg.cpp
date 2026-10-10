@@ -2478,6 +2478,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
     add_opt(common_arg(
+        {"--moe-cache-admit"}, "W",
+        "expert cache admission: fill a cold expert only if it also missed within the last W steps of its layer\n"
+        "(second touch; default: 0 = fill the most routed miss of every step)",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_CUDA_MOE_CACHE_ADMIT", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_ADMIT"));
+    add_opt(common_arg(
         {"--moe-hybrid-vram"}, "auto|MiB",
         "VRAM the class-1 experts may use, in total across devices (default: auto = every free byte\n"
         "beyond --moe-hybrid-reserve). prefer --moe-hybrid-experts, which says the same thing in the\n"
