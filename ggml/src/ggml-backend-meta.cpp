@@ -576,6 +576,57 @@ static bool ggml_backend_meta_debug_enabled() {
     return enabled;
 }
 
+// Unallocated tensors have no buffer-keyed cache, and a DAG with shared srcs makes the recursion of
+// ggml_backend_meta_get_split_state exponential in depth: they are memoized for the duration of one outermost query.
+static thread_local int ggml_backend_meta_ss_depth = 0;
+static thread_local std::map<std::pair<const ggml_tensor *, bool>, ggml_backend_meta_split_state> ggml_backend_meta_ss_memo;
+
+// whether the split state of a tensor is answered without recursing into its srcs: a host tensor, a memoized
+// unallocated one, or one in its meta buffer's cache (same check as the lookup below)
+static bool ggml_backend_meta_split_state_known(const ggml_tensor * tensor, bool assume_sync) {
+    if (ggml_backend_meta_tensor_is_host(tensor)) {
+        return true;
+    }
+    const std::pair key = std::make_pair(tensor, assume_sync);
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return ggml_backend_meta_ss_memo.count(key) != 0;
+    }
+    const ggml_backend_meta_buffer_context * buf_ctx = (const ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = buf_ctx->split_state_cache.find(key);
+    return it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) == 0;
+}
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync);
+
+// The split state of a tensor recurses through its srcs, as deep as the graph: thousands of ops for a 48-layer model,
+// two stack frames each, which overflowed the stack of the thread that reserves a graph (Qwen3.5-122B, -sm tensor,
+// host KV cells, a 32k prompt after a long answer). Past this depth the srcs not answered yet are evaluated bottom-up
+// with an explicit stack first, so the recursion below sees only answered srcs. Same results, bounded depth.
+static constexpr int ggml_backend_meta_ss_max_depth = 32;
+
+static void ggml_backend_meta_split_state_prewarm(ggml_backend_meta_simple_tensor_container & stc, const ggml_tensor * root) {
+    std::vector<std::pair<const ggml_tensor *, int>> todo; // tensor, next src to visit
+    std::set<const ggml_tensor *> seen;
+    todo.emplace_back(root, 0);
+    while (!todo.empty()) {
+        const ggml_tensor * t = todo.back().first;
+        const int           i = todo.back().second;
+        if (i < GGML_MAX_SRC) {
+            todo.back().second++;
+            const ggml_tensor * s = t->src[i];
+            if (s != nullptr && s != t && seen.insert(s).second && !ggml_backend_meta_split_state_known(s, true)) {
+                todo.emplace_back(s, 0);
+            }
+            continue;
+        }
+        todo.pop_back();
+        if (t != root) {
+            ggml_backend_meta_get_split_state(stc, t, /*assume_sync =*/ true); // its srcs are answered: shallow
+        }
+    }
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
@@ -584,14 +635,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // [TP-CPU-BOUNDARY] tensor->buffer may be a host (CPU) buffer, or null for a not-yet-allocated meta
     // compute tensor reached via src-recursion during graph allocation. Only read the buffer when it is
     // actually a meta buffer; otherwise fall back to the device count recorded on stc.
-    // Unallocated tensors have no buffer-keyed cache, and a DAG with shared srcs makes the recursion
-    // exponential in depth. Memoize them for the duration of one outermost query only.
-    static thread_local int depth = 0;
-    static thread_local std::map<std::pair<const ggml_tensor *, bool>, ggml_backend_meta_split_state> memo;
+    int  & depth = ggml_backend_meta_ss_depth;
+    auto & memo  = ggml_backend_meta_ss_memo;
     struct depth_guard {
-        depth_guard()  { depth++; }
-        ~depth_guard() { if (--depth == 0) { memo.clear(); } }
+        depth_guard()  { ggml_backend_meta_ss_depth++; }
+        ~depth_guard() { if (--ggml_backend_meta_ss_depth == 0) { ggml_backend_meta_ss_memo.clear(); } }
     } guard;
+    if (depth == ggml_backend_meta_ss_max_depth) {
+        ggml_backend_meta_split_state_prewarm(stc, tensor);
+    }
 
     const bool on_meta = (tensor->buffer != nullptr) && ggml_backend_buffer_is_meta(tensor->buffer);
     const size_t n_bufs = on_meta ? ggml_backend_meta_buffer_n_bufs(tensor->buffer) : stc.n_bufs;
