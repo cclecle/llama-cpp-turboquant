@@ -3,13 +3,13 @@
 # 65k, no host KV cells) with --cpu-moe and the moe-hybrid options replaced by tiered experts (every ffn_*_exps on
 # ROCm0_TIERED, the hot set from our own route counts q35-imatrix.gguf, uniform per layer, the given budget over both
 # cards), then q35-profile.sh on v20dev: per-GPU busy, prefill and decode, VRAM after load. Production stays stopped.
-# S2_ENV: env for the server (e.g. GGML_CUDA_MOE_CACHE_SLOTS=16).
+# S2_ENV: env for the server (e.g. GGML_CUDA_MOE_CACHE_SLOTS=16); S2_PY: a python with numpy (moe_hotset.py, /root/venv).
 cd /mnt/gguf/r9v/bench
 T=/opt/llamacpp/tmp-v20
 systemctl stop llamacpp-0 llamacpp-1 llamacpp-both; sleep 3
 for G in "$@"; do
   hot=hot-q35-${G}g-uniform.txt
-  [ -f $hot ] || python3 $T/scripts/fleet/moe_hotset.py --model /mnt/gguf/Qwen3.5-122B-A10B-UD-Q5_K_M-00001-of-00003.gguf \
+  [ -f $hot ] || ${S2_PY:-/root/venv/bin/python3} $T/scripts/fleet/moe_hotset.py --model /mnt/gguf/Qwen3.5-122B-A10B-UD-Q5_K_M-00001-of-00003.gguf \
     --counts q35-imatrix.gguf --budget-gib $G --policy uniform -o $hot | tail -3
   python3 - $hot > q35-tiered-${G}g.args <<'PY'
 import sys
