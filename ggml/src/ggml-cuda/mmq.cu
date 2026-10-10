@@ -335,7 +335,10 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
-    // tiered experts (moe-tiered.cuh): per-expert base addresses, the cold ones staged in VRAM for a prefill ubatch
+    // tiered experts (moe-tiered.cuh): the expert cache step of verify batches too long for mmvq (a no-op unless
+    // GGML_CUDA_MOE_CACHE_SLOTS, src0 is the layer's up tensor and there are at most 256 routes), then the per-expert
+    // base addresses, the cold ones staged in VRAM for a prefill ubatch
+    ggml_cuda_tiered_cache_step(src0, ids, stream);
     args.x_table = (const char * const *) ggml_cuda_tiered_table_prefill(src0, ne12, stream);
 
     if (gate) {

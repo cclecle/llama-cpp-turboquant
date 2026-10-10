@@ -27,7 +27,7 @@ int ggml_cuda_tiered_is_hot(const ggml_tensor * t, int64_t expert);
 
 // Expert cache (GGML_CUDA_MOE_CACHE_SLOTS=S, 0 = off, the default; set by --moe-cache-slots): S VRAM slots per layer
 // and device next to the hot experts hold copies of cold experts, refilled least recently used first from the routes of
-// decode and verify batches (at most 256 routes), on the GPU, inside the graph. Call before the first expert matmul of
+// decode and verify batches (at most 256 routes; mmvq and mmq), on the GPU, inside the graph. Call before the first expert matmul of
 // a layer's step on every tiered expert tensor: it acts on the layer's ffn_up_exps (or ffn_gate_up_exps) and is a no-op
 // otherwise. The cold copy stays the expert's home (an exception to the one-placement rule approved for this cache).
 // GGML_CUDA_MOE_CACHE_STATS=N: hit rates every N steps (synchronous; with GGML_CUDA_DISABLE_GRAPHS=1).
