@@ -2,7 +2,8 @@
 # s3-crash-bt.sh [build, default v19dev] : the Qwen3.5-122B :XS segfault (v19 defaults; not with the campaign switches
 # off) under gdb. The exact :XS production args (Qwen3.5_XS.args: 4 slots, host KV cells, MTP + ngram drafts), two
 # ~32k-token requests from different /root/ppl.txt slices (the crash came at the end of the second prompt), and the
-# backtrace of every thread at the fault. S3_ENV: env for the server. Production stays stopped.
+# backtrace of every thread at the fault. S3_ENV: env for the server; S3_TOKENS: tokens per answer (2048, as when it
+# crashed: with 512 it did not). Production stays stopped.
 cd /mnt/gguf/r9v/bench
 b=${1:-v19dev}
 B=/opt/llamacpp/llama-cpp-mine-$b/build3/bin
@@ -16,13 +17,13 @@ env ${S3_ENV:-X=0} HIP_VISIBLE_DEVICES=0,1 LD_LIBRARY_PATH=$B setsid gdb -batch 
 G=$!
 until curl -sf -o /dev/null http://127.0.0.1:8091/health; do sleep 3; kill -0 $G 2>/dev/null || { echo "died at load"; tail $out/gdb.log; exit 1; }; done
 for R in 1 2; do
-  python3 - $R > $out/r$R.json <<'PY'
+  python3 - $R ${S3_TOKENS:-2048} > $out/r$R.json <<'PY'
 import json, sys, urllib.request
 R = int(sys.argv[1])
 c = open('/root/ppl.txt', errors='ignore').read()
 off = 20000 + (R - 1)*150000
 b = {'messages': [{'role': 'user', 'content': c[off:off + 105000] + '\n\nExplain the code above in great detail, file by file and function by function. Be exhaustive and long.'}],
-     'max_tokens': 512, 'temperature': 0, 'cache_prompt': True}
+     'max_tokens': int(sys.argv[2]), 'temperature': 0, 'cache_prompt': True}
 try:
     j = json.load(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8091/v1/chat/completions',
         data=json.dumps(b).encode(), headers={'Content-Type': 'application/json'}), timeout=7200))
