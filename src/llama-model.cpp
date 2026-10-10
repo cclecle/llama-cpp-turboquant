@@ -1834,7 +1834,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // No whole-file prefetch (MAP_POPULATE + WILLNEED) by default: most tensors are copied out of the mapping into
+    // device or pinned buffers, which read their pages once, on demand, with kernel readahead. Populating first read
+    // the file twice when it does not fit next to those buffers (Qwen3.5-122B tiered: 87 GB file, 41 GB pinned cold
+    // experts, 120 GB RAM: 200-600 s loads). LLAMA_MMAP_PREFETCH=1 restores the prefetch.
+    static const bool mmap_prefetch = [] {
+        const char * env = getenv("LLAMA_MMAP_PREFETCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
