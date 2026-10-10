@@ -563,6 +563,19 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    // drop this process's page mappings of [first, last) (whole pages inside it), the range stays mapped: the pages
+    // remain in the page cache as clean unmapped pages the kernel reclaims cheaply, and a later access faults them back
+    void release_fragment(size_t first, size_t last) {
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        if (last <= first) {
+            return;
+        }
+        if (madvise((uint8_t *) addr + first, last - first, MADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: madvise(.., MADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -627,6 +640,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void release_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -657,6 +675,11 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void release_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
 #endif
 
     void * addr;
@@ -671,6 +694,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::release_fragment(size_t first, size_t last) { pimpl->release_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

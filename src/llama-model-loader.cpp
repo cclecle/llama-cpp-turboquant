@@ -1680,6 +1680,17 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // the tensor now lives in its own buffer: drop our mappings of its file pages right away instead of at
+                // the end of the load. A model near the RAM size (Qwen3.5-122B tiered: 94 GB file + a 54 GB pinned
+                // cold block on 123 GB) otherwise keeps every copied page mapped and the load crawls through reclaim
+                // and compaction (6 min 50 s). The pages stay in the page cache. LLAMA_MMAP_RELEASE=0 keeps them.
+                static const bool release = [] {
+                    const char * env = getenv("LLAMA_MMAP_RELEASE");
+                    return env == nullptr || atoi(env) != 0;
+                }();
+                if (release) {
+                    mapping->release_fragment(weight->offs, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);

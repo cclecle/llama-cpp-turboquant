@@ -54,6 +54,8 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    // drop the page mappings of [first, last) without unmapping it (the data stays readable)
+    void release_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
 
