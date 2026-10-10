@@ -209,8 +209,18 @@ struct cache_group {
     int32_t *    d_tags  = nullptr;  // slot -> expert, -1 empty
     uint32_t *   d_stamp = nullptr;  // slot -> step counter of its last use
     uint32_t *   d_miss  = nullptr;  // expert -> step counter of its last cold miss, 0 never (second-touch admission)
+    uint32_t *   d_count = nullptr;  // expert -> routes in decode and verify steps (route census), nullptr if off
     cache_ctrl * d_ctrl  = nullptr;
 };
+
+// Route census (GGML_CUDA_MOE_CENSUS=FILE, --moe-census): the cache planner also counts the routes of every expert of
+// its layer in decode and verify steps; when the model is freed, one line "blk.<layer> <count per expert>" per layer and
+// device is appended to FILE (scripts/fleet/moe_hotset.py --counts FILE). The hot set of Qwen3.5-122B from llama-imatrix
+// counts (the model reading code and docs) served 87% of those routes but 64-81% of its own decode routes.
+const char * census_path() {
+    static const char * p = getenv("GGML_CUDA_MOE_CENSUS");
+    return p != nullptr && p[0] != '\0' ? p : nullptr;
+}
 
 // Second-touch admission (GGML_CUDA_MOE_CACHE_ADMIT=W, --moe-cache-admit): a cold miss is filled only if the same expert
 // also missed within the last W steps of its layer; 0 (the default) fills the most routed miss of every step. Qwen3.5-122B
@@ -228,7 +238,7 @@ constexpr int cache_plan_threads = 256; // also the most routes (n_used x n_toke
 __global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_used, const int n_routes, const int64_t ids_s1,
         const void * const * table, const void * const * orig, const char * cold_lo, const char * cold_hi,
         const char * cache, const size_t expert_bytes, int32_t * tags, uint32_t * stamp, const int n_slots,
-        uint32_t * miss_stamp, const uint32_t admit_window, cache_ctrl * ctrl) {
+        uint32_t * miss_stamp, const uint32_t admit_window, uint32_t * census, cache_ctrl * ctrl) {
     __shared__ int32_t            s_miss[cache_plan_threads];
     __shared__ unsigned int       s_best;   // routes << 16 | (0xffff - first route) of the best missed expert
     __shared__ unsigned long long s_victim; // (last use + 1) << 32 | slot; 0 << 32 for an empty slot
@@ -247,6 +257,9 @@ __global__ void k_moe_cache_plan(const int32_t * __restrict__ ids, const int n_u
     int32_t cold_e = -1; // a cold miss
     if (tid < n_routes) {
         const int32_t e   = ids[(tid / n_used)*ids_s1 + tid % n_used];
+        if (census != nullptr) {
+            atomicAdd(&census[e], 1u);
+        }
         const char *  cur = (const char *) table[e];
         const char *  org = (const char *) orig[e];
         if (cur != org) {
@@ -447,7 +460,33 @@ struct tiered_buffer_context {
 
     ~tiered_buffer_context() {
         ggml_cuda_set_device(device);
+        if (census_path() != nullptr && !groups.empty()) {
+            static std::mutex census_mutex;
+            std::lock_guard<std::mutex> lock(census_mutex);
+            FILE * f = fopen(census_path(), "a");
+            if (f == nullptr) {
+                GGML_LOG_ERROR("%s: cannot append the route census to %s\n", __func__, census_path());
+            }
+            std::vector<uint32_t> h;
+            for (auto & it : groups) {
+                if (f == nullptr || it.second->d_count == nullptr) {
+                    continue;
+                }
+                h.resize(it.second->n_expert);
+                CUDA_CHECK(cudaMemcpy(h.data(), it.second->d_count, h.size()*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                fprintf(f, "blk.%d", it.first);
+                for (uint32_t c : h) {
+                    fprintf(f, " %u", c);
+                }
+                fprintf(f, "\n");
+            }
+            if (f != nullptr) {
+                fclose(f);
+                GGML_LOG_INFO("%s: route census of %zu layers on %s%d appended to %s\n", __func__, groups.size(), GGML_CUDA_NAME, device, census_path());
+            }
+        }
         for (auto & it : groups) {
+            CUDA_CHECK(cudaFree(it.second->d_count));
             CUDA_CHECK(cudaFree(it.second->d_tags));
             CUDA_CHECK(cudaFree(it.second->d_stamp));
             CUDA_CHECK(cudaFree(it.second->d_miss));
@@ -589,6 +628,10 @@ enum ggml_status tiered_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * 
             CUDA_CHECK(cudaMalloc((void **) &g->d_tags,  g->n_slots*sizeof(int32_t)));
             CUDA_CHECK(cudaMalloc((void **) &g->d_stamp, g->n_slots*sizeof(uint32_t)));
             CUDA_CHECK(cudaMalloc((void **) &g->d_miss,  g->n_expert*sizeof(uint32_t)));
+            if (census_path() != nullptr) {
+                CUDA_CHECK(cudaMalloc((void **) &g->d_count, g->n_expert*sizeof(uint32_t)));
+                CUDA_CHECK(cudaMemset(g->d_count, 0, g->n_expert*sizeof(uint32_t)));
+            }
             CUDA_CHECK(cudaMalloc((void **) &g->d_ctrl,  sizeof(cache_ctrl)));
             cache_group_reset(*g);
         }
@@ -1093,7 +1136,7 @@ void ggml_cuda_tiered_cache_step(const ggml_tensor * t, const ggml_tensor * ids,
     }
     k_moe_cache_plan<<<1, cache_plan_threads, 0, stream>>>((const int32_t *) ids->data, (int) n_used, (int) n_routes,
         ids->nb[1]/sizeof(int32_t), info->d_table, info->d_orig, info->cold_dev, info->cold_dev + info->cold_size,
-        info->cache_dev, info->expert_bytes, g.d_tags, g.d_stamp, g.n_slots, g.d_miss, (uint32_t) cache_admit_window(), g.d_ctrl);
+        info->cache_dev, info->expert_bytes, g.d_tags, g.d_stamp, g.n_slots, g.d_miss, (uint32_t) cache_admit_window(), g.d_count, g.d_ctrl);
     k_moe_cache_fill<<<128, 256, 0, stream>>>(mem, g.d_tags, g.d_ctrl);
     CUDA_CHECK(cudaGetLastError());
 

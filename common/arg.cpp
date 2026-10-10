@@ -2487,6 +2487,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_ADMIT"));
     add_opt(common_arg(
+        {"--moe-census"}, "FILE",
+        "route census for the <device>_TIERED expert cache (needs --moe-cache-slots >= 1): count the routes of every\n"
+        "expert in decode and verify steps and append them to FILE when the model is freed, one line\n"
+        "\"blk.<layer> <count per expert>\" per layer and device (scripts/fleet/moe_hotset.py --counts FILE)",
+        [](common_params & params, const std::string & value) {
+            common_set_env("GGML_CUDA_MOE_CENSUS", value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_MOE_CENSUS"));
+    add_opt(common_arg(
         {"--moe-hybrid-vram"}, "auto|MiB",
         "VRAM the class-1 experts may use, in total across devices (default: auto = every free byte\n"
         "beyond --moe-hybrid-reserve). prefer --moe-hybrid-experts, which says the same thing in the\n"

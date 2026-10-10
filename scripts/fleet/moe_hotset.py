@@ -6,7 +6,8 @@
 #
 # SRC is where the route counts per (layer, expert) come from:
 #   - an imatrix GGUF written by llama-imatrix (tensors "blk.<l>.ffn_up_exps.weight.counts"),
-#   - R9V's catalog.json ("ranking.training_counts"; with "heldout:" prefix, "ranking.heldout_counts").
+#   - R9V's catalog.json ("ranking.training_counts"; with "heldout:" prefix, "ranking.heldout_counts"),
+#   - a decode route census (.txt) written by llama-server --moe-census FILE (the routes of real decode traffic).
 # --eval SRC scores the placement on other counts (held-out) and prints the share of routes served from VRAM.
 # Budgets: --per-layer N hot experts in every layer; --match-uva N the VRAM of today's rung with the experts of
 # the first N layers in mapped host memory; --budget-gib G a total (all devices) of expert bytes in VRAM.
@@ -45,6 +46,17 @@ def load_counts(src):
     held = src.startswith('heldout:')
     if held:
         src = src[len('heldout:'):]
+    if src.endswith('.txt'):
+        # a decode route census (llama-server --moe-census FILE): lines "blk.<layer> <count per expert>", one per layer
+        # per device per process, summed (every device of a tensor split sees the same routes: the ranking is the same)
+        out = {}
+        for line in open(src):
+            f = line.split()
+            if not f or not f[0].startswith('blk.'):
+                continue
+            layer, vals = int(f[0][4:]), [float(x) for x in f[1:]]
+            out[layer] = [a + b for a, b in zip(out[layer], vals)] if layer in out else vals
+        return out
     if src.endswith('.json'):
         c = json.load(open(src))
         r = c.get('ranking', c)
