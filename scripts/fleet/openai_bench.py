@@ -12,8 +12,10 @@
 # BENCH_SERVER_SAMPLING=1: send no temperature, so the server's own sampling (the preset's) applies.
 # BENCH_RUNS=N: N measured requests, one result line each (sampled runs differ: pool them).
 # BENCH_CACHE_PROMPT=1: prompt caching on, as clients use it (context checkpoints then run during the prefill;
-#   the repeat then reuses the cache, so use it with warmup 1).
-import json, os, sys, time, urllib.request
+#   the repeat then reuses the cache, so use it with warmup 1, or with BENCH_NONCE=1).
+# BENCH_NONCE=1: a random word before every request's text (warm-up and measured), so no request reuses another's
+#   prompt cache while caching stays on: warmup 2 then warms the page cache and still measures a real prefill.
+import binascii, json, os, sys, time, urllib.request
 
 base, model, prompt_file, label, out = sys.argv[1:6]
 max_tokens = int(sys.argv[6]) if len(sys.argv) > 6 else 2048
@@ -36,6 +38,8 @@ def metrics():
 
 
 def run(text, n):
+    if os.environ.get('BENCH_NONCE') == '1':
+        text = 'w%s %s' % (binascii.hexlify(os.urandom(4)).decode(), text)
     body = {'model': model, 'messages': [{'role': 'user', 'content': text}], 'max_tokens': n, 'temperature': 0,
             'stream': True, 'stream_options': {'include_usage': True}, 'cache_prompt': False}
     if os.environ.get('BENCH_SERVER_SAMPLING') == '1':
