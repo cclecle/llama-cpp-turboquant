@@ -635,12 +635,13 @@ struct tiered_writer {
 
 // The loader hands set_tensor pointers into the mmap'd model file. A tiered tensor copies every expert, so a load
 // faults the whole file in one page at a time (Qwen3.5-122B: 87 GB, 200-555 s, the server mostly waiting on I/O). Ask
-// for read-ahead of the whole source range first: the disk streams it. A no-op for memory that is not a mapping.
+// for read-ahead of the whole source range first (GGML_CUDA_TIERED_PREFETCH=1). A no-op for memory that is not a mapping.
 void tiered_prefetch(const void * src, size_t size) {
 #if defined(__linux__)
     static const bool enabled = [] {
+        // opt-in: load times A/B'd on/off/on/off were 286/185/210/596 s, dominated by the box's page cache state
         const char * env = getenv("GGML_CUDA_TIERED_PREFETCH");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) != 0;
     }();
     if (!enabled || size < (1u << 20)) {
         return;
